@@ -28,7 +28,6 @@ def post_data(url: str, payload: dict):
         timeout=5,
     )
     print("Status:", response.status_code)
-    print("Response:", response.text)
     response.raise_for_status()
     return response.json()
 
@@ -54,9 +53,6 @@ def find_best_template(error_text: str, templates: list[dict], threshold: int = 
 
 
 def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
-    print("Parsed:", parsed)
-    print("Table lines:", table_lines)
-
     error_templates = get_data(
         f"{API_BASE_URL}/exceptionsTemplates/get_templates"
     )
@@ -87,7 +83,6 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
         return None
 
     employee = employee_data[0]
-    print("Employee:", employee)
 
     now = datetime.now()
     now_iso = now.isoformat()
@@ -109,10 +104,7 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
         return None
 
     robot = robot_data[0]
-    print("Robot:", robot)
-
     shift_date, shift_name = get_current_shift()
-    print(shift_date, shift_name)
 
     obj = {
         "workstation_id": None,
@@ -147,8 +139,6 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
 
     saved = post_data(f"{API_BASE_URL}/exceptions/add_exceptions", obj)
     saved_old = post_data(f"{API_BASE_URL}/exceptions/add_old_exceptions", old_obj)
-
-    print(saved_old)
 
     if not saved:
         alert = "⚠️ Failed to save exception to database."
