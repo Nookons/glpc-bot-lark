@@ -190,6 +190,6 @@ def shift_stats_endpoint():
 
 
 if __name__ == "__main__":
-    console.print("[bold green]Webhook запущен :7777[/bold green]")
+    console.print("[bold green]Webhook запущен[/bold green]")
     port = int(os.environ.get("PORT", 7777))
     app.run(host="0.0.0.0", port=port)
