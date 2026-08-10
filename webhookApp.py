@@ -20,9 +20,6 @@ from lark_send import send_text_message
 from sendToDataBase import send_to_data_base
 from datetime import datetime
 
-from dotenv import load_dotenv
-load_dotenv()
-
 console = Console()
 app = Flask(__name__)
 init_db()
