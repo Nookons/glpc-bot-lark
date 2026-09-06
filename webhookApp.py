@@ -246,7 +246,16 @@ def webhook():
         )
 
         if parsed:
+
+            # ------------------------------------------------
+            # Current shift
+            # ------------------------------------------------
+
             shift_date, shift_name = get_current_shift()
+
+            # ------------------------------------------------
+            # Save local error statistics
+            # ------------------------------------------------
 
             save_error(
                 robot=parsed["robot"],
@@ -326,18 +335,28 @@ def webhook():
                 "error_text": parsed["error_text"],
             }
 
+            # ------------------------------------------------
+            # Forward error
+            # ------------------------------------------------
 
             forward_error(
                 parsed,
                 table_lines,
             )
 
+            # ------------------------------------------------
+            # Save to API database
+            # ------------------------------------------------
 
             send_to_data_base(
                 parsed,
                 data_obj,
                 chat_id,
             )
+
+            # ------------------------------------------------
+            # Alert after threshold
+            # ------------------------------------------------
 
             if count >= ERROR_THRESHOLD:
 
@@ -456,6 +475,7 @@ def shift_stats_endpoint():
 # ============================================================
 
 if __name__ == "__main__":
+
     console.print(
         "[bold green]Webhook запущен[/bold green]"
     )

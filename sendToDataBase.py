@@ -21,10 +21,6 @@ API_BASE_URL = os.environ.get(
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
-TEMPLATE_MATCH_THRESHOLD = 60
-WAREHOUSE_CODE = "GLP-C"
-ISSUE_WAREHOUSE_CODE = "C2"
-
 
 # ============================================================
 # GET REQUEST
@@ -47,15 +43,7 @@ def get_data(
 
         return response.json()
 
-    except requests.exceptions.HTTPError as e:
-        print(
-            f"Error fetching data from {url}: {e} | "
-            f"response body: {e.response.text}"
-        )
-
-        return None
-
-    except (requests.exceptions.RequestException, ValueError) as e:
+    except requests.exceptions.RequestException as e:
         print(
             f"Error fetching data from {url}: {e}"
         )
@@ -89,21 +77,9 @@ def post_data(
 
         return response.json()
 
-    except requests.exceptions.HTTPError as e:
-        # Log the response body so validation errors (e.g. 422)
-        # show exactly which field/constraint the API rejected.
+    except requests.exceptions.RequestException as e:
         print(
-            f"Error posting data to {url}: {e} | "
-            f"payload: {payload} | "
-            f"response body: {e.response.text}"
-        )
-
-        return None
-
-    except (requests.exceptions.RequestException, ValueError) as e:
-        print(
-            f"Error posting data to {url}: {e} | "
-            f"payload: {payload}"
+            f"Error posting data to {url}: {e}"
         )
 
         return None
@@ -116,7 +92,7 @@ def post_data(
 def find_best_template(
     error_text: str,
     templates: list[dict],
-    threshold: int = TEMPLATE_MATCH_THRESHOLD,
+    threshold: int = 60,
 ):
     titles = [
         template.get(
@@ -167,22 +143,15 @@ def send_to_data_base(
     )
 
     if not error_templates:
-        alert = (
-            "⚠️ Failed to load exception templates, "
-            "issue was not saved to the database, "
-            "please try again later."
-        )
-
-        send_text_message(
-            chat_id,
-            alert,
-        )
-
         print(
             "Failed to fetch exception templates"
         )
 
         return None
+
+    # ========================================================
+    # FIND BEST TEMPLATE
+    # ========================================================
 
     best_match = find_best_template(
         parsed["error_text"],
@@ -190,17 +159,6 @@ def send_to_data_base(
     )
 
     if not best_match:
-        alert = (
-            "⚠️ Could not match this error to a known template, "
-            "issue was not saved to the database, "
-            "please check the error description."
-        )
-
-        send_text_message(
-            chat_id,
-            alert,
-        )
-
         print(
             "Template not found"
         )
@@ -224,11 +182,11 @@ def send_to_data_base(
         },
     )
 
-    if not employee_data or not isinstance(employee_data, list):
+    if not employee_data:
 
         alert = (
             "⚠️ Can't find employee, "
-            "issue was not saved to the database, "
+            "issue don't save to database, "
             "please check your name and try again."
         )
 
@@ -276,60 +234,27 @@ def send_to_data_base(
     )
 
     # ========================================================
-    # PARSE ROBOT NUMBER
-    # ========================================================
-
-    try:
-        robot_number = int(table_lines["robot"])
-    except (ValueError, TypeError, KeyError):
-        alert = (
-            f"⚠️ Invalid robot number "
-            f"'{table_lines.get('robot')}', "
-            "issue was not saved to the database, "
-            "please check the robot number and try again."
-        )
-
-        send_text_message(
-            chat_id,
-            alert,
-        )
-
-        print(
-            f"Invalid robot number: {table_lines.get('robot')!r}"
-        )
-
-        return None
-
-    # ========================================================
     # FIND ROBOT
     # ========================================================
 
     robot_data = get_data(
         f"{API_BASE_URL}/robots/get_robots_by_number",
         params={
-            "robot_number": robot_number,
-            "warehouse": WAREHOUSE_CODE,
+            "robot_number": int(
+                table_lines["robot"]
+            ),
+            "warehouse": "GLP-C",
             "limit": 1,
         },
     )
 
     if not robot_data:
+
         alert = (
             f"⚠️ Can't find robot "
-            f"#{robot_number}, "
-            "issue was not saved to the database, "
+            f"#{table_lines['robot']}, "
+            "issue don't save to database, "
             "please check the robot number."
-        )
-
-        robot_request_payload = {
-            "robot_number": robot_number,
-            "employee_id": employee["card_id"],
-            "warehouse": WAREHOUSE_CODE,
-        }
-
-        post_data(
-            f"{API_BASE_URL}/exceptions/add_robot_requests",
-            robot_request_payload,
         )
 
         send_text_message(
@@ -361,26 +286,39 @@ def send_to_data_base(
     # NEW EXCEPTION OBJECT
     # ========================================================
 
-    exception_payload = {
+    obj = {
         "workstation_id": None,
+
         "robot_id": robot["id"],
+
         "handle_by": employee["card_id"],
+
         "start_time": now_iso,
+
         "end_time": end_time_iso,
+
         "exception_id": best_match["id"],
+
         "shift_type": shift_name,
+
+        "warehouse": employee["home_warehouse"],
     }
 
     # ========================================================
     # OLD EXCEPTION OBJECT
     # ========================================================
 
-    old_exception_payload = {
+    old_obj = {
         "error_robot": robot["robot_number"],
+
         "add_by": employee["card_id"],
+
         "device_type": robot["robot_type"],
+
         "employee": employee["user_name"],
+
         "error_end_time": end_time_iso,
+
         "error_start_time": now_iso,
 
         "first_column": best_match[
@@ -414,9 +352,12 @@ def send_to_data_base(
         ),
 
         "shift_type": shift_name,
-        "warehouse": WAREHOUSE_CODE,
+
+        "warehouse": "GLP-C",
+
         "issue_data": shift_date,
-        "issue_warehouse": ISSUE_WAREHOUSE_CODE,
+
+        "issue_warehouse": "C2",
     }
 
     # ========================================================
@@ -425,8 +366,21 @@ def send_to_data_base(
 
     saved = post_data(
         f"{API_BASE_URL}/exceptions/add_exceptions",
-        exception_payload,
+        obj,
     )
+
+    # ========================================================
+    # SAVE OLD EXCEPTION
+    # ========================================================
+
+    saved_old = post_data(
+        f"{API_BASE_URL}/exceptions/add_old_exceptions",
+        old_obj,
+    )
+
+    # ========================================================
+    # CHECK RESULT
+    # ========================================================
 
     if not saved:
 
@@ -445,23 +399,6 @@ def send_to_data_base(
         )
 
         return None
-
-    # ========================================================
-    # SAVE OLD EXCEPTION
-    # (only after the new exception was saved successfully,
-    # to avoid the two tables getting out of sync)
-    # ========================================================
-
-    saved_old = post_data(
-        f"{API_BASE_URL}/exceptions/add_old_exceptions",
-        old_exception_payload,
-    )
-
-    if not saved_old:
-        print(
-            "Warning: exception saved to 'exceptions' but "
-            "failed to save to 'old_exceptions'"
-        )
 
     print(
         f"✅ Exception saved successfully "
