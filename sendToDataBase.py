@@ -249,6 +249,16 @@ def send_to_data_base(
     )
 
     if not robot_data:
+        obj = {
+            "robot_number": table_lines['robot'],
+            "employee_id": employee["card_id"],
+            "warehouse": "GLP-C",
+        }
+
+        post_data(
+            f"{API_BASE_URL}/exceptions/add_robot_requests",
+            obj,
+        )
 
         alert = (
             f"⚠️ Can't find robot "
