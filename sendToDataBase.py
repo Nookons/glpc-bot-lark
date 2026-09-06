@@ -149,9 +149,6 @@ def send_to_data_base(
 
         return None
 
-    # ========================================================
-    # FIND BEST TEMPLATE
-    # ========================================================
 
     best_match = find_best_template(
         parsed["error_text"],
@@ -249,12 +246,23 @@ def send_to_data_base(
     )
 
     if not robot_data:
-
         alert = (
             f"⚠️ Can't find robot "
             f"#{table_lines['robot']}, "
             "issue don't save to database, "
             "please check the robot number."
+        )
+
+        obj = {
+            "robot_number": {table_lines['robot']},
+            "employee_id": employee["card_id"],
+            "warehouse": 'GLP-C',
+
+        }
+
+        saved = post_data(
+            f"{API_BASE_URL}/exceptions/add_robot_requests",
+            obj,
         )
 
         send_text_message(
@@ -288,20 +296,13 @@ def send_to_data_base(
 
     obj = {
         "workstation_id": None,
-
         "robot_id": robot["id"],
-
         "handle_by": employee["card_id"],
-
         "start_time": now_iso,
-
         "end_time": end_time_iso,
-
         "exception_id": best_match["id"],
-
         "shift_type": shift_name,
 
-        "warehouse": employee["home_warehouse"],
     }
 
     # ========================================================
@@ -310,15 +311,10 @@ def send_to_data_base(
 
     old_obj = {
         "error_robot": robot["robot_number"],
-
         "add_by": employee["card_id"],
-
         "device_type": robot["robot_type"],
-
         "employee": employee["user_name"],
-
         "error_end_time": end_time_iso,
-
         "error_start_time": now_iso,
 
         "first_column": best_match[
@@ -352,11 +348,8 @@ def send_to_data_base(
         ),
 
         "shift_type": shift_name,
-
         "warehouse": "GLP-C",
-
         "issue_data": shift_date,
-
         "issue_warehouse": "C2",
     }
 
