@@ -47,6 +47,14 @@ def get_data(
 
         return response.json()
 
+    except requests.exceptions.HTTPError as e:
+        print(
+            f"Error fetching data from {url}: {e} | "
+            f"response body: {e.response.text}"
+        )
+
+        return None
+
     except (requests.exceptions.RequestException, ValueError) as e:
         print(
             f"Error fetching data from {url}: {e}"
@@ -81,9 +89,21 @@ def post_data(
 
         return response.json()
 
+    except requests.exceptions.HTTPError as e:
+        # Log the response body so validation errors (e.g. 422)
+        # show exactly which field/constraint the API rejected.
+        print(
+            f"Error posting data to {url}: {e} | "
+            f"payload: {payload} | "
+            f"response body: {e.response.text}"
+        )
+
+        return None
+
     except (requests.exceptions.RequestException, ValueError) as e:
         print(
-            f"Error posting data to {url}: {e}"
+            f"Error posting data to {url}: {e} | "
+            f"payload: {payload}"
         )
 
         return None
