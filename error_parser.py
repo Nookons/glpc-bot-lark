@@ -1,12 +1,25 @@
 import re
-from lark_send import send_text_message
 
-def parse_error_message(text: str, chat_id: str):
+
+def parse_error_message(text: str):
+    """
+    Парсит сообщение вида:
+
+        <error_type>: <error_text>. <robot>
+
+    Например:
+        Unable to drive: Security module failure. 3780
+
+    Возвращает dict {error_type, error_text, robot} или None,
+    если сообщение не подходит под формат.
+
+    Чистая функция без побочных эффектов: сообщение об ошибке
+    в чат отправляет вызывающий код (webhookApp).
+    """
     text = text.strip()
 
     match = re.match(r"^([^:]+):\s*(.+)\.\s*([^.]+)$", text)
     if not match:
-        send_text_message(chat_id, 'The message is not fit to issue pattern. Please check the manual')
         return None
 
     error_type = match.group(1).strip()

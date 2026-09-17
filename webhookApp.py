@@ -20,7 +20,11 @@ from sendToDataBase import (
     count_robot_errors_in_shift,
     shift_stats,
 )
+from shift_report import start_shift_scheduler
+from logging_config import setup_logging
 
+
+logger = setup_logging(__name__)
 
 console = Console()
 app = Flask(__name__)
@@ -236,10 +240,7 @@ def webhook():
         # Parse error
         # ----------------------------------------------------
 
-        parsed = parse_error_message(
-            text,
-            chat_id,
-        )
+        parsed = parse_error_message(text)
 
         if parsed:
 
@@ -269,11 +270,19 @@ def webhook():
                 "error_text": parsed["error_text"],
             }
 
-            send_to_data_base(
+            saved = send_to_data_base(
                 parsed,
                 data_obj,
                 chat_id,
             )
+
+            if not saved:
+                # Причина уже сообщена в чат внутри send_to_data_base.
+                logger.warning(
+                    "Exception not saved, skip forwarding: robot=%s",
+                    parsed["robot"],
+                )
+                return "", 200
 
             # ------------------------------------------------
             # Count robot errors for this shift from server
@@ -344,8 +353,8 @@ def webhook():
 
                 alert = (
                     f"⚠️ Robot {parsed['robot']} "
-                    f"have {count} exceptions"
-                    f". Must be send to maintenance!"
+                    f"has {count} exceptions "
+                    f"this shift. It should be sent to maintenance!"
                 )
 
                 send_text_message(
@@ -361,8 +370,10 @@ def webhook():
 
             send_text_message(
                 chat_id,
-                "Can't parse the text from message, "
-                "please try again",
+                "Can't parse the message. Please use the format:\n"
+                "<issue type>: <description>. <robot number>\n\n"
+                "Example:\n"
+                "Unable to drive: Security module failure. 3780",
             )
 
             return "", 400
@@ -470,6 +481,9 @@ if __name__ == "__main__":
         f"[cyan]Current time: "
         f"{now_warsaw().strftime('%d.%m.%Y %H:%M:%S')}[/cyan]"
     )
+
+    # Отчёт за смену (в конце каждой смены шлёт метрики в целевую группу).
+    start_shift_scheduler()
 
     port = int(
         os.environ.get(

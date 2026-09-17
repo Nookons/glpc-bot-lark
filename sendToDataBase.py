@@ -8,6 +8,10 @@ from rapidfuzz import fuzz, process
 
 from lark_send import send_text_message
 from shift import get_current_shift
+from logging_config import setup_logging
+
+
+logger = setup_logging(__name__)
 
 
 # ============================================================
@@ -65,7 +69,7 @@ def _rest_get(table: str, params: dict = None):
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching from {table}: {e}")
+        logger.error("GET %s failed: %s", table, e)
         return None
 
 
@@ -89,14 +93,14 @@ def _rest_post(table: str, payload: dict):
             timeout=10,
         )
 
-        print(f"POST {table} -> {response.status_code}")
-
         response.raise_for_status()
+
+        logger.info("POST %s -> %s", table, response.status_code)
 
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(f"Error posting data to {table}: {e}")
+        logger.error("POST %s failed: %s", table, e)
         return None
 
 
@@ -206,10 +210,10 @@ def find_best_template(
 
     matched_title, score, index = match
 
-    print(
-        f"Template similarity: "
-        f"{score:.1f}% | "
-        f"'{matched_title}'"
+    logger.info(
+        "Template similarity: %.1f%% | '%s'",
+        score,
+        matched_title,
     )
 
     if score < threshold:
@@ -227,6 +231,12 @@ def send_to_data_base(
     table_lines: dict,
     chat_id: str,
 ):
+    """
+    Записывает исключение в Supabase (exceptions + exceptions_glpc).
+
+    Возвращает результат POST /exceptions (список созданных строк)
+    при успехе, иначе None. Сообщения об ошибках отправляет в чат.
+    """
     # ========================================================
     # GET ERROR TEMPLATES
     # ========================================================
@@ -240,8 +250,12 @@ def send_to_data_base(
     )
 
     if not error_templates:
-        print(
-            "Failed to fetch exception templates"
+        logger.error("Failed to fetch exception templates")
+
+        send_text_message(
+            chat_id,
+            "⚠️ Can't load issue templates right now. "
+            "Please try again in a minute.",
         )
 
         return None
@@ -256,16 +270,23 @@ def send_to_data_base(
     )
 
     if not best_match:
-        print(
-            "Template not found"
+        logger.warning(
+            "Template not found for text: %r",
+            parsed["error_text"],
+        )
+
+        send_text_message(
+            chat_id,
+            "⚠️ Can't recognize the issue description. "
+            "Please check the text and try again.",
         )
 
         return None
 
-    print(
-        f"Template found: "
-        f"{best_match['employee_title']} "
-        f"(id={best_match['id']})"
+    logger.info(
+        "Template found: %s (id=%s)",
+        best_match.get("employee_title"),
+        best_match.get("id"),
     )
 
     # ========================================================
@@ -282,19 +303,16 @@ def send_to_data_base(
 
     if not employee_data:
 
-        alert = (
-            "⚠️ Can't find employee, "
-            "issue don't save to database, "
-            "please check your name and try again."
+        logger.warning(
+            "Employee not found: %r",
+            table_lines["employee"],
         )
 
         send_text_message(
             chat_id,
-            alert,
-        )
-
-        print(
-            "Employee not found"
+            "⚠️ Employee not found. "
+            "The issue was not saved. "
+            "Please check your name and try again.",
         )
 
         return None
@@ -320,11 +338,6 @@ def send_to_data_base(
 
     pretty_datetime = now.strftime(
         "%d.%m.%Y %H:%M:%S"
-    )
-
-    print(
-        f"Exception time: {pretty_datetime} "
-        f"(Europe/Warsaw)"
     )
 
     # ========================================================
@@ -354,20 +367,16 @@ def send_to_data_base(
             obj,
         )
 
-        alert = (
-            f"⚠️ Can't find robot "
-            f"#{table_lines['robot']}, "
-            "issue don't save to database, "
-            "please check the robot number."
+        logger.warning(
+            "Robot not found: #%s",
+            table_lines["robot"],
         )
 
         send_text_message(
             chat_id,
-            alert,
-        )
-
-        print(
-            "Robot not found"
+            f"⚠️ Robot #{table_lines['robot']} not found. "
+            "The issue was not saved. "
+            "Please check the robot number.",
         )
 
         return None
@@ -382,8 +391,12 @@ def send_to_data_base(
         get_current_shift(now)
     )
 
-    print(
-        f"Shift: {shift_date} / {shift_name}"
+    logger.info(
+        "Saving exception: robot=%s employee=%s shift=%s/%s",
+        robot.get("robot_number"),
+        employee.get("user_name"),
+        shift_date,
+        shift_name,
     )
 
     # ========================================================
@@ -488,27 +501,26 @@ def send_to_data_base(
 
     if not saved:
 
-        alert = (
-            "⚠️ Failed to save exception "
-            "to database."
-        )
+        logger.error("Failed to save exception")
 
         send_text_message(
             chat_id,
-            alert,
-        )
-
-        print(
-            "Failed to save exception"
+            "⚠️ Failed to save the issue. "
+            "Please try again.",
         )
 
         return None
 
-    print(
-        f"✅ Exception saved successfully "
-        f"(robot={robot['robot_number']}, "
-        f"time={pretty_datetime}, "
-        f"shift={shift_name})"
+    if not saved_old:
+        logger.warning(
+            "New exception saved, but legacy (exceptions_glpc) failed"
+        )
+
+    logger.info(
+        "Exception saved: robot=%s time=%s shift=%s",
+        robot.get("robot_number"),
+        pretty_datetime,
+        shift_name,
     )
 
     return saved
