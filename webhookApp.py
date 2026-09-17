@@ -11,23 +11,19 @@ from zoneinfo import ZoneInfo
 
 from getUserName import get_user_name
 from donwloadImage import download_image
-from database import (
-    init_db,
-    save_error,
-    count_robot_errors_in_shift,
-    shift_stats,
-)
 from shift import get_current_shift
 from pending_photos import handle_incoming_photo, forward_error
 from error_parser import parse_error_message
 from lark_send import send_text_message
-from sendToDataBase import send_to_data_base
+from sendToDataBase import (
+    send_to_data_base,
+    count_robot_errors_in_shift,
+    shift_stats,
+)
 
 
 console = Console()
 app = Flask(__name__)
-
-init_db()
 
 # ============================================================
 # TIMEZONE
@@ -253,20 +249,6 @@ def webhook():
 
             shift_date, shift_name = get_current_shift()
 
-            # ------------------------------------------------
-            # Save local error statistics
-            # ------------------------------------------------
-
-            save_error(
-                robot=parsed["robot"],
-                error_type=parsed["error_type"],
-                error_text=parsed["error_text"],
-                raw_text=text,
-                chat_id=chat_id,
-                shift_date=shift_date,
-                shift_name=shift_name,
-            )
-
             table.add_row(
                 "🤖 Robot",
                 parsed["robot"],
@@ -278,7 +260,23 @@ def webhook():
             )
 
             # ------------------------------------------------
-            # Count robot errors
+            # Save to server (Supabase)
+            # ------------------------------------------------
+
+            data_obj = {
+                "employee": user_name,
+                "robot": parsed["robot"],
+                "error_text": parsed["error_text"],
+            }
+
+            send_to_data_base(
+                parsed,
+                data_obj,
+                chat_id,
+            )
+
+            # ------------------------------------------------
+            # Count robot errors for this shift from server
             # ------------------------------------------------
 
             count = count_robot_errors_in_shift(
@@ -329,29 +327,13 @@ def webhook():
                 ),
             ]
 
-            data_obj = {
-                "employee": user_name,
-                "robot": parsed["robot"],
-                "error_text": parsed["error_text"],
-            }
-
             # ------------------------------------------------
-            # Forward error
+            # Forward ready message to another chat
             # ------------------------------------------------
 
             forward_error(
                 parsed,
                 table_lines,
-            )
-
-            # ------------------------------------------------
-            # Save to API database
-            # ------------------------------------------------
-
-            send_to_data_base(
-                parsed,
-                data_obj,
-                chat_id,
             )
 
             # ------------------------------------------------

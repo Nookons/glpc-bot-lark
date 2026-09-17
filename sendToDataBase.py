@@ -13,30 +13,51 @@ from shift import get_current_shift
 # ============================================================
 # CONFIG
 # ============================================================
+#
+# Бот больше не ходит через tk-assist-api: новый API убрал эндпоинты
+# записи исключений. Поэтому читаем и пишем напрямую в Supabase
+# (PostgREST) сервисным ключом.
 
-API_BASE_URL = os.environ.get(
-    "API_BASE_URL",
-    "https://tk-assistant-api-production.up.railway.app",
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "https://ljkugtpeboomboobodom.supabase.co",
 )
+
+SUPABASE_SERVICE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_KEY",
+    "",
+)
+
+WAREHOUSE = "GLP-C"
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 
 # ============================================================
-# GET REQUEST
+# POSTGREST HELPERS
 # ============================================================
 
-def get_data(
-    url: str,
-    params: dict = None,
-    headers: dict = None,
-):
+def _headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _rest_get(table: str, params: dict = None):
+    """
+    GET /rest/v1/<table>. Возвращает JSON (список или объект)
+    либо None при ошибке.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
     try:
         response = requests.get(
             url,
+            headers=_headers(),
             params=params,
-            headers=headers,
-            timeout=5,
+            timeout=10,
         )
 
         response.raise_for_status()
@@ -44,45 +65,117 @@ def get_data(
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(
-            f"Error fetching data from {url}: {e}"
-        )
-
+        print(f"Error fetching from {table}: {e}")
         return None
 
 
-# ============================================================
-# POST REQUEST
-# ============================================================
+def _rest_post(table: str, payload: dict):
+    """
+    POST /rest/v1/<table>. Возвращает JSON (созданные строки)
+    либо None при ошибке.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
 
-def post_data(
-    url: str,
-    payload: dict,
-):
+    headers = _headers()
+    # PostgREST по умолчанию отдаёт пустое тело на POST — просим
+    # вернуть созданные строки, чтобы отличать успех от неудачи.
+    headers["Prefer"] = "return=representation"
+
     try:
         response = requests.post(
             url,
+            headers=headers,
             json=payload,
-            headers={
-                "Content-Type": "application/json"
-            },
-            timeout=5,
+            timeout=10,
         )
 
-        print(
-            f"POST {url} -> {response.status_code}"
-        )
+        print(f"POST {table} -> {response.status_code}")
 
         response.raise_for_status()
 
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(
-            f"Error posting data to {url}: {e}"
-        )
-
+        print(f"Error posting data to {table}: {e}")
         return None
+
+
+# ============================================================
+# SHIFT EXCEPTIONS (from Supabase)
+# ============================================================
+
+def get_shift_exceptions(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = WAREHOUSE,
+    limit: int = 1000,
+):
+    """
+    Список исключений за смену из таблицы exceptions_glpc.
+
+    Возвращает None, если запрос не удался.
+    """
+    return _rest_get(
+        "exceptions_glpc",
+        params={
+            "issue_data": f"eq.{shift_date}",
+            "shift_type": f"eq.{shift_name}",
+            "warehouse": f"eq.{warehouse}",
+            "order": "error_start_time.desc",
+            "limit": str(limit),
+        },
+    )
+
+
+def count_robot_errors_in_shift(
+    robot,
+    shift_date: str,
+    shift_name: str,
+):
+    """
+    Количество сохранённых исключений робота за смену.
+    Считаем по таблице exceptions_glpc (источник для отчётов).
+    """
+    data = get_shift_exceptions(shift_date, shift_name)
+
+    if not data:
+        return 0
+
+    robot_str = str(robot)
+
+    return sum(
+        1
+        for exc in data
+        if str(exc.get("error_robot")) == robot_str
+    )
+
+
+def shift_stats(shift_date: str, shift_name: str):
+    """
+    Возвращает (total, {robot: count}, {issue_type: count})
+    за смену из exceptions_glpc.
+    """
+    data = get_shift_exceptions(shift_date, shift_name)
+
+    if not data:
+        return 0, {}, {}
+
+    total = len(data)
+    by_robot = {}
+    by_type = {}
+
+    for exc in data:
+        robot = str(exc.get("error_robot"))
+        by_robot[robot] = by_robot.get(robot, 0) + 1
+
+        issue_type = (
+            exc.get("issue_type")
+            or exc.get("first_column")
+            or "unknown"
+        )
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+
+    return total, by_robot, by_type
 
 
 # ============================================================
@@ -138,8 +231,12 @@ def send_to_data_base(
     # GET ERROR TEMPLATES
     # ========================================================
 
-    error_templates = get_data(
-        f"{API_BASE_URL}/exceptionsTemplates/get_templates"
+    error_templates = _rest_get(
+        "issue_templates",
+        params={
+            "select": "*",
+            "order": "created_at.desc",
+        },
     )
 
     if not error_templates:
@@ -175,10 +272,11 @@ def send_to_data_base(
     # FIND EMPLOYEE
     # ========================================================
 
-    employee_data = get_data(
-        f"{API_BASE_URL}/employees/get_employee_by_name",
+    employee_data = _rest_get(
+        "employees",
         params={
-            "name": table_lines["employee"]
+            "select": "*",
+            "user_name": f"eq.{table_lines['employee']}",
         },
     )
 
@@ -220,10 +318,6 @@ def send_to_data_base(
 
     end_time_iso = end_time.isoformat()
 
-    pretty_date = now.strftime(
-        "%Y-%m-%d"
-    )
-
     pretty_datetime = now.strftime(
         "%d.%m.%Y %H:%M:%S"
     )
@@ -237,14 +331,14 @@ def send_to_data_base(
     # FIND ROBOT
     # ========================================================
 
-    robot_data = get_data(
-        f"{API_BASE_URL}/robots/get_robots_by_number",
+    robot_data = _rest_get(
+        "robots_maintenance_list",
         params={
-            "robot_number": int(
-                table_lines["robot"]
-            ),
-            "warehouse": "GLP-C",
-            "limit": 1,
+            "select": "*",
+            "robot_number": f"eq.{int(table_lines['robot'])}",
+            "warehouse": f"eq.{WAREHOUSE}",
+            "order": "updated_at.desc",
+            "limit": "1",
         },
     )
 
@@ -252,11 +346,11 @@ def send_to_data_base(
         obj = {
             "robot_number": table_lines['robot'],
             "employee_id": employee["card_id"],
-            "warehouse": "GLP-C",
+            "warehouse": WAREHOUSE,
         }
 
-        post_data(
-            f"{API_BASE_URL}/exceptions/add_robot_requests",
+        _rest_post(
+            "robots_to_add",
             obj,
         )
 
@@ -293,7 +387,7 @@ def send_to_data_base(
     )
 
     # ========================================================
-    # NEW EXCEPTION OBJECT
+    # NEW EXCEPTION OBJECT (таблица exceptions)
     # ========================================================
 
     obj = {
@@ -315,7 +409,7 @@ def send_to_data_base(
     }
 
     # ========================================================
-    # OLD EXCEPTION OBJECT
+    # OLD EXCEPTION OBJECT (таблица exceptions_glpc)
     # ========================================================
 
     old_obj = {
@@ -363,7 +457,7 @@ def send_to_data_base(
 
         "shift_type": shift_name,
 
-        "warehouse": "GLP-C",
+        "warehouse": WAREHOUSE,
 
         "issue_data": shift_date,
 
@@ -374,8 +468,8 @@ def send_to_data_base(
     # SAVE NEW EXCEPTION
     # ========================================================
 
-    saved = post_data(
-        f"{API_BASE_URL}/exceptions/add_exceptions",
+    saved = _rest_post(
+        "exceptions",
         obj,
     )
 
@@ -383,8 +477,8 @@ def send_to_data_base(
     # SAVE OLD EXCEPTION
     # ========================================================
 
-    saved_old = post_data(
-        f"{API_BASE_URL}/exceptions/add_old_exceptions",
+    saved_old = _rest_post(
+        "exceptions_glpc",
         old_obj,
     )
 
