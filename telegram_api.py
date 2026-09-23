@@ -164,6 +164,43 @@ def send_chat_action(chat_id, action: str = "typing", message_thread_id: int = N
     return call("sendChatAction", payload, timeout=15)
 
 
+def delete_message(chat_id, message_id) -> bool:
+    """
+    Удаляет сообщение бота.
+
+    «Сообщение уже удалено» — обычная ситуация (например, кто-то удалил
+    его вручную), поэтому такие ответы не засоряют лог ошибками.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set")
+        return False
+
+    try:
+        response = requests.post(
+            f"{_API_BASE}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=15,
+        )
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        logger.warning("Telegram deleteMessage failed: %s", e)
+        return False
+    except ValueError:
+        logger.warning("Telegram deleteMessage returned non-JSON")
+        return False
+
+    if not data.get("ok"):
+        logger.info(
+            "Telegram deleteMessage: %s (chat=%s message=%s)",
+            data.get("description"),
+            chat_id,
+            message_id,
+        )
+        return False
+
+    return True
+
+
 # ============================================================
 # FILES
 # ============================================================

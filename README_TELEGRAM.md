@@ -128,7 +128,7 @@ python3 telegram_bot.py
 Переменные окружения живут в Railway → Variables (`.env` в репозиторий не
 попадает): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_TOPIC_ID`, `TELEGRAM_TOPIC_NAME`,
 `TELEGRAM_ALLOWED_CHAT_IDS`, `LARK_APP_ID`, `LARK_APP_SECRET`, `SUPABASE_URL`,
-`SUPABASE_SERVICE_KEY`, `SUPABASE_PHOTO_BUCKET`.
+`SUPABASE_SERVICE_KEY`, `SUPABASE_PHOTO_BUCKET`, `TELEGRAM_CONFIRM_TTL`.
 
 Обновить переменные из локального `.env` через CLI:
 
@@ -156,6 +156,18 @@ railway variable set TELEGRAM_TOPIC_ID=2 --service "$SVC"
 
 При `/reg` имя ищется сначала точно, затем нечётко (rapidfuzz, порог 78) —
 при опечатке бот предложит похожие имена из таблицы `employees`.
+
+## Служебные сообщения бота
+
+Подтверждения (`✅ Saved: robot …`, `✅ Photo forwarded to Lark`, а также
+статусы «не смог скачать/переслать фото») бот **удаляет за собой** через
+`TELEGRAM_CONFIRM_TTL` секунд — по умолчанию 10, `0` отключает удаление.
+Так группа не зарастает «хвостами»: сотрудник видит мгновенную реакцию,
+и через десять секунд остаётся только его собственное сообщение.
+
+Важное и обучающее не удаляется: подсказка про `/reg`, подсказка по формату
+сообщения, `/help`, `/id`, `/stats`, ответы на команды и алерт
+«отправить в обслуживание» (его читает вся смена).
 
 ## Формат сообщения об ошибке
 

@@ -133,6 +133,10 @@ TELEGRAM_TOPIC_NAME = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
 # Отвечать ли в чужом топике подсказкой (один раз на топик).
 WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
 
+# Через сколько секунд удалять свои служебные подтверждения
+# («сохранено», «фото переслано»). 0 — не удалять.
+CONFIRM_TTL_SECONDS = _env_int("TELEGRAM_CONFIRM_TTL", 10)
+
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
@@ -411,7 +415,14 @@ def topic_allowed(chat_id, thread_id):
     return False, "id-mismatch"
 
 
-def _send(chat_id, text, reply_to_message_id=None, thread_id=None, disable_notification=False):
+def _send(
+    chat_id,
+    text,
+    reply_to_message_id=None,
+    thread_id=None,
+    disable_notification=False,
+    delete_after: int = None,
+):
     """
     Отправка с автоопределением топика: ответ уходит в тот же топик,
     откуда пришло сообщение (для форум-групп).
@@ -419,6 +430,8 @@ def _send(chat_id, text, reply_to_message_id=None, thread_id=None, disable_notif
     Если в этот топик отправить нельзя (например, General закрыт —
     Telegram отвечает TOPIC_CLOSED), повторяем в отслеживаемый топик,
     чтобы пользователь всё-таки увидел ответ.
+
+    delete_after — через сколько секунд удалить это сообщение (0/None — не удалять).
     """
     if thread_id is None:
         thread_id = _routes.get(_chat_key(chat_id))
@@ -431,30 +444,35 @@ def _send(chat_id, text, reply_to_message_id=None, thread_id=None, disable_notif
         message_thread_id=thread_id,
     )
 
-    if result is not None:
-        return result
+    if result is None:
+        fallback = TELEGRAM_TOPIC_ID
 
-    fallback = TELEGRAM_TOPIC_ID
+        if (
+            fallback is not None
+            and _chat_key(chat_id) in ALLOWED_CHAT_IDS
+            and (thread_id is None or int(thread_id) != int(fallback))
+        ):
+            logger.warning(
+                "Ответ в топик %s не ушёл — повторяю в отслеживаемый топик %s",
+                thread_id,
+                fallback,
+            )
 
-    if (
-        fallback is not None
-        and _chat_key(chat_id) in ALLOWED_CHAT_IDS
-        and (thread_id is None or int(thread_id) != int(fallback))
-    ):
-        logger.warning(
-            "Ответ в топик %s не ушёл — повторяю в отслеживаемый топик %s",
-            thread_id,
-            fallback,
-        )
+            result = tg.send_message(
+                chat_id,
+                text,
+                disable_notification=disable_notification,
+                message_thread_id=fallback,
+            )
 
-        return tg.send_message(
+    if result is not None and delete_after:
+        schedule_deletion(
             chat_id,
-            text,
-            disable_notification=disable_notification,
-            message_thread_id=fallback,
+            result.get("message_id"),
+            delay=delete_after,
         )
 
-    return None
+    return result
 
 
 def _send_action(chat_id, action="typing"):
@@ -463,6 +481,74 @@ def _send_action(chat_id, action="typing"):
         action,
         message_thread_id=_routes.get(_chat_key(chat_id)),
     )
+
+
+# ------------------------------------------------------------
+# Самоудаление служебных сообщений
+# ------------------------------------------------------------
+#
+# Подтверждения («✅ Saved», «✅ Photo forwarded») нужны только как
+# мгновенная обратная связь, поэтому через CONFIRM_TTL_SECONDS бот
+# удаляет их за собой, чтобы группа не зарастала «хвостами».
+
+_pending_deletions = []
+_pending_lock = threading.Lock()
+
+
+def schedule_deletion(chat_id, message_id, delay: int = None) -> bool:
+    """Ставит сообщение бота в очередь на удаление через delay секунд."""
+    delay = CONFIRM_TTL_SECONDS if delay is None else int(delay)
+
+    if delay <= 0 or message_id is None:
+        return False
+
+    with _pending_lock:
+        _pending_deletions.append((time.time() + delay, int(chat_id), int(message_id)))
+
+    logger.info(
+        "Сообщение %s в чате %s будет удалено через %ss",
+        message_id,
+        chat_id,
+        delay,
+    )
+
+    return True
+
+
+def _drain_pending_deletions(now: float = None) -> int:
+    """Удаляет все сообщения, срок которых наступил. Возвращает их число."""
+    now = time.time() if now is None else now
+
+    with _pending_lock:
+        due = [item for item in _pending_deletions if item[0] <= now]
+        for item in due:
+            _pending_deletions.remove(item)
+
+    for _due_at, chat_id, message_id in due:
+        tg.delete_message(chat_id, message_id)
+
+    return len(due)
+
+
+def _deletion_loop():
+    while True:
+        try:
+            _drain_pending_deletions()
+        except Exception:
+            logger.exception("Ошибка при удалении служебных сообщений")
+
+        time.sleep(1)
+
+
+def start_deletion_worker() -> threading.Thread:
+    thread = threading.Thread(
+        target=_deletion_loop,
+        name="telegram-deletion",
+        daemon=True,
+    )
+    thread.start()
+
+    return thread
 
 
 def _handle_wrong_topic(chat_id, thread_id, reason):
@@ -782,10 +868,11 @@ def handle_error_text(chat_id, sender, text, message_id):
     elif SEND_CONFIRMATION:
         suffix = "" if forwarded else " (Lark forward failed, see logs)"
 
-        notify_user(
+        _send(
             chat_id,
             f"✅ Saved: robot {parsed['robot']} — {parsed['error_text']}\n"
             f"📊 Shift issues: {count}{suffix}",
+            delete_after=CONFIRM_TTL_SECONDS,
         )
 
 
@@ -805,6 +892,7 @@ def handle_photo(chat_id, sender, message, message_id):
             chat_id,
             "⚠️ Can't download the photo from Telegram. Please try again.",
             reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
         )
         return
 
@@ -821,6 +909,7 @@ def handle_photo(chat_id, sender, message, message_id):
             chat_id,
             "⚠️ Can't save the photo on the server. Please try again.",
             reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
         )
         return
 
@@ -841,6 +930,7 @@ def handle_photo(chat_id, sender, message, message_id):
                 chat_id,
                 "✅ Photo forwarded to Lark",
                 reply_to_message_id=message_id,
+                delete_after=CONFIRM_TTL_SECONDS,
             )
     elif mode == "link":
         _send(
@@ -848,12 +938,14 @@ def handle_photo(chat_id, sender, message, message_id):
             "✅ Photo sent to Lark as a link\n"
             "(Lark API quota exceeded — uploaded to Supabase Storage)",
             reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
         )
     else:
         _send(
             chat_id,
             "⚠️ Can't forward the photo to Lark right now (see logs).",
             reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
         )
 
 
@@ -1163,6 +1255,14 @@ def main():
 
     # Отчёт за смену (в конце каждой смены шлёт метрики в целевую группу).
     start_shift_scheduler()
+
+    # Удаление служебных подтверждений («хвостов») через CONFIRM_TTL_SECONDS.
+    if CONFIRM_TTL_SECONDS > 0:
+        start_deletion_worker()
+        console.print(
+            f"[cyan]Подтверждения удаляются через "
+            f"{CONFIRM_TTL_SECONDS}s[/cyan]"
+        )
 
     start_polling()
 

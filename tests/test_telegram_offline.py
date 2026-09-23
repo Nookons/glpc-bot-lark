@@ -1116,6 +1116,137 @@ def test_stats_command_matches_report():
     )
 
 
+def test_self_deleting_confirmations():
+    """Служебные подтверждения должны исчезать через TTL, а важное — нет."""
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    original_send = tg.send_message
+    original_delete = tg.delete_message
+
+    deleted = []
+    next_id = [5000]
+
+    def fake_send(chat_id, text, reply_to_message_id=None,
+                  disable_notification=False, message_thread_id=None):
+        next_id[0] += 1
+        SENT.append({
+            "chat_id": chat_id,
+            "text": text,
+            "thread_id": message_thread_id,
+            "message_id": next_id[0],
+        })
+        return {"message_id": next_id[0]}
+
+    def fake_delete(chat_id, message_id):
+        deleted.append((chat_id, message_id))
+        return True
+
+    tg.send_message = fake_send
+    tg.delete_message = fake_delete
+
+    try:
+        check("self-delete: TTL по умолчанию 10 секунд", bot.CONFIRM_TTL_SECONDS == 10, bot.CONFIRM_TTL_SECONDS)
+
+        # 1) Подтверждение сохранения ставится в очередь на удаление.
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+
+        run(make_update(text="Unable to drive: Security module failure. 3780"))
+
+        with bot._pending_lock:
+            queued = list(bot._pending_deletions)
+
+        check("self-delete: подтверждение сохранения в очереди", len(queued) == 1, queued)
+        check(
+            "self-delete: срок — примерно TTL",
+            queued and 0 < queued[0][0] - time.time() <= bot.CONFIRM_TTL_SECONDS + 1,
+            queued,
+        )
+        check(
+            "self-delete: очередь указывает на сообщение бота",
+            queued and queued[0][2] == SENT[0]["message_id"],
+            (queued, SENT),
+        )
+
+        removed = bot._drain_pending_deletions(
+            now=time.time() + bot.CONFIRM_TTL_SECONDS + 1
+        )
+        check(
+            "self-delete: сообщение удалено по сроку",
+            removed == 1 and deleted == [(-500, SENT[0]["message_id"])],
+            (removed, deleted),
+        )
+        with bot._pending_lock:
+            check("self-delete: очередь очищена", bot._pending_deletions == [], bot._pending_deletions)
+
+        # 2) Алерт про обслуживание удалять нельзя — его читает вся смена.
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+
+        COUNTS["3780"] = 3
+        run(make_update(text="Unable to drive: Security module failure. 3780"))
+
+        with bot._pending_lock:
+            queued = list(bot._pending_deletions)
+
+        check(
+            "self-delete: алерт про обслуживание НЕ удаляется",
+            queued == [] and any("maintenance" in item["text"] for item in SENT),
+            (queued, SENT),
+        )
+
+        # 3) Подтверждение по фото — тоже удаляется.
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+
+        COUNTS["3780"] = 1
+        run(make_update(photo=True, caption="broken robot"))
+
+        with bot._pending_lock:
+            queued = list(bot._pending_deletions)
+
+        check("self-delete: подтверждение по фото в очереди", len(queued) == 1, queued)
+
+        # 4) Инструкции (не статус) не удаляем.
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+
+        LINKS.clear()
+        run(make_update(text="Unable to drive: Security module failure. 3780"))
+
+        with bot._pending_lock:
+            queued = list(bot._pending_deletions)
+
+        check(
+            "self-delete: подсказка про /reg остаётся",
+            queued == [] and any("not registered" in item["text"] for item in SENT),
+            (queued, SENT),
+        )
+
+        # 5) delay=0 отключает удаление, ошибка удаления не ломает очередь.
+        check("self-delete: delay=0 не планирует", bot.schedule_deletion(-500, 42, delay=0) is False)
+        check("self-delete: None message_id не планирует", bot.schedule_deletion(-500, None, delay=10) is False)
+
+        bot.schedule_deletion(-500, 777, delay=1)
+        tg.delete_message = lambda chat_id, message_id: False  # уже удалено кем-то
+        removed = bot._drain_pending_deletions(now=time.time() + 2)
+
+        with bot._pending_lock:
+            check(
+                "self-delete: неудачное удаление не застревает в очереди",
+                removed == 1 and bot._pending_deletions == [],
+                (removed, bot._pending_deletions),
+            )
+    finally:
+        tg.send_message = original_send
+        tg.delete_message = original_delete
+
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+        LINKS.clear()
+
+
 def test_report_previous_shift():
     check(
         "report: день -> ночь предыдущего дня",
@@ -1325,6 +1456,7 @@ def main():
         test_send_fallback_to_monitored_topic,
         test_send_fallback_guarded_by_allow_list,
         test_stats_command_matches_report,
+        test_self_deleting_confirmations,
         test_report_previous_shift,
         test_report_formatting,
         test_report_metrics_and_text,
