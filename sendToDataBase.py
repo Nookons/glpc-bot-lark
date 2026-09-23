@@ -134,10 +134,13 @@ def _rest_get(table: str, params: dict = None):
         return None
 
 
-def _rest_post(table: str, payload: dict):
+def _rest_post(table: str, payload: dict, ignore_conflict: bool = False):
     """
     POST /rest/v1/<table>. Возвращает JSON (созданные строки)
     либо None при ошибке.
+
+    ignore_conflict — для вставок в очереди: 409 означает «строка уже есть»,
+    это не ошибка и не должно выглядеть как сбой в логах.
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
@@ -160,6 +163,20 @@ def _rest_post(table: str, payload: dict):
 
         return _json_or_none(response, table, "POST")
 
+    except requests.exceptions.HTTPError as e:
+        response = getattr(e, "response", None)
+
+        if (
+            ignore_conflict
+            and response is not None
+            and response.status_code == 409
+        ):
+            logger.info("POST %s: строка уже существует (409)", table)
+            return []
+
+        logger.error("POST %s failed: %s", table, e)
+        return None
+
     except requests.exceptions.RequestException as e:
         logger.error("POST %s failed: %s", table, e)
         return None
@@ -170,9 +187,9 @@ def rest_get(table: str, params: dict = None):
     return _rest_get(table, params)
 
 
-def rest_post(table: str, payload: dict):
+def rest_post(table: str, payload: dict, ignore_conflict: bool = False):
     """Публичный доступ к POST /rest/v1/<table> (для других модулей)."""
-    return _rest_post(table, payload)
+    return _rest_post(table, payload, ignore_conflict=ignore_conflict)
 
 
 def rest_upsert(table: str, payload: dict, on_conflict: str):
@@ -660,6 +677,7 @@ def send_to_data_base(
         queued = _rest_post(
             "robots_to_add",
             obj,
+            ignore_conflict=True,
         )
 
         if not queued:

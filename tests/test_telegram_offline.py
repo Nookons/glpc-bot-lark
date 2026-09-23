@@ -2043,6 +2043,34 @@ def test_health_reports_degraded():
         bot._LAST_POLL_AT = original_last_poll
 
 
+def test_rest_post_ignores_conflict():
+    """409 при вставке в очередь — «уже есть», а не ошибка в логах."""
+    import sendToDataBase as stdb
+    import requests as _requests
+
+    class _ConflictResponse:
+        status_code = 409
+        text = "conflict"
+        content = b"conflict"
+
+        def raise_for_status(self):
+            raise _requests.exceptions.HTTPError("409 Conflict", response=self)
+
+    original_post = stdb.requests.post
+    stdb.requests.post = lambda *args, **kwargs: _ConflictResponse()
+
+    try:
+        ignored = stdb._rest_post(
+            "robots_to_add", {"robot_number": 1}, ignore_conflict=True
+        )
+        strict = stdb._rest_post("robots_to_add", {"robot_number": 1})
+    finally:
+        stdb.requests.post = original_post
+
+    check("409: для очереди — не ошибка", ignored == [], ignored)
+    check("409: без флага — ошибка", strict is None, strict)
+
+
 def test_parser_and_count_guards():
     from error_parser import parse_error_message
 
@@ -2161,7 +2189,9 @@ def test_missing_robot_is_queued_and_reported():
         return []
 
     stdb._rest_get = fake_get
-    stdb._rest_post = lambda table, payload: (posted.append((table, payload)), [{}])[1]
+    stdb._rest_post = lambda table, payload, ignore_conflict=False: (
+        posted.append((table, payload)), [{}]
+    )[1]
     stdb.notify_user = lambda chat_id, text: notified.append(text)
 
     try:
@@ -2853,6 +2883,7 @@ def main():
         test_polling_persists_offset,
         test_report_sent_ok_semantics,
         test_health_reports_degraded,
+        test_rest_post_ignores_conflict,
         test_parser_and_count_guards,
         test_stats_endpoint_handles_db_error,
         test_edit_message_truncates,
