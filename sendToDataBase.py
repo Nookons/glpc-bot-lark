@@ -4,6 +4,7 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
 from rapidfuzz import fuzz, process
 
 from lark_send import send_text_message
@@ -12,6 +13,10 @@ from logging_config import setup_logging
 
 
 logger = setup_logging(__name__)
+
+
+# .env должен быть загружен до чтения SUPABASE_* ниже.
+load_dotenv()
 
 
 # ============================================================
@@ -35,6 +40,41 @@ SUPABASE_SERVICE_KEY = os.environ.get(
 WAREHOUSE = "GLP-C"
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+
+
+# ============================================================
+# USER NOTIFIER
+# ============================================================
+#
+# Этот модуль должен уметь отвечать пользователю («шаблон не найден»,
+# «сотрудник не найден», ...). Раньше ответ всегда уходил в Lark через
+# API (расход квоты). Теперь вызывающий код может подменить транспорт:
+# Telegram-бот ставит сюда функцию отправки в Telegram, и тогда ни один
+# ответ пользователю не тратит квоту Lark Open Platform.
+
+_notifier = None
+
+
+def set_notifier(notify):
+    """
+    Регистрирует функцию notify(chat_id, text) для ответов пользователю.
+
+    Если notifier не задан, используется старый путь (Lark API).
+    """
+    global _notifier
+    _notifier = notify
+
+
+def notify_user(chat_id, text):
+    """Отправляет текст пользователю через notifier (или Lark API)."""
+    if _notifier is None:
+        send_text_message(chat_id, text)
+        return
+
+    try:
+        _notifier(chat_id, text)
+    except Exception:
+        logger.exception("Notifier failed for chat %s", chat_id)
 
 
 # ============================================================
@@ -102,6 +142,103 @@ def _rest_post(table: str, payload: dict):
     except requests.exceptions.RequestException as e:
         logger.error("POST %s failed: %s", table, e)
         return None
+
+
+def rest_get(table: str, params: dict = None):
+    """Публичный доступ к GET /rest/v1/<table> (для других модулей)."""
+    return _rest_get(table, params)
+
+
+def rest_upsert(table: str, payload: dict, on_conflict: str):
+    """
+    POST с upsert-семантикой (insert ... on conflict do update).
+
+    Возвращает список строк при успехе, иначе None.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    headers = _headers()
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            params={"on_conflict": on_conflict},
+            json=payload,
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        logger.info("UPSERT %s -> %s", table, response.status_code)
+
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        logger.error("UPSERT %s failed: %s", table, e)
+        return None
+
+
+def supabase_headers() -> dict:
+    """Публичный доступ к заголовкам PostgREST/Storage (для других модулей)."""
+    return _headers()
+
+
+def table_exists(table: str) -> bool:
+    """
+    True, если таблица доступна через PostgREST.
+
+    Нужно, чтобы бот мог работать до применения SQL-миграции
+    (в этом случае привязки Telegram хранятся в Storage).
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    try:
+        response = requests.get(
+            url,
+            headers=_headers(),
+            params={"select": "*", "limit": "0"},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error("Probe %s failed: %s", table, e)
+        return False
+
+    if response.status_code == 200:
+        return True
+
+    logger.info(
+        "Probe %s -> HTTP %s (%s)",
+        table,
+        response.status_code,
+        response.text[:120],
+    )
+
+    return False
+
+
+def rest_delete(table: str, params: dict = None) -> bool:
+    """DELETE /rest/v1/<table>. True при успехе (204 No Content)."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    try:
+        response = requests.delete(
+            url,
+            headers=_headers(),
+            params=params,
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        logger.info("DELETE %s -> %s", table, response.status_code)
+
+        return True
+
+    except requests.exceptions.RequestException as e:
+        logger.error("DELETE %s failed: %s", table, e)
+        return False
 
 
 # ============================================================
@@ -252,7 +389,7 @@ def send_to_data_base(
     if not error_templates:
         logger.error("Failed to fetch exception templates")
 
-        send_text_message(
+        notify_user(
             chat_id,
             "⚠️ Can't load issue templates right now. "
             "Please try again in a minute.",
@@ -275,7 +412,7 @@ def send_to_data_base(
             parsed["error_text"],
         )
 
-        send_text_message(
+        notify_user(
             chat_id,
             "⚠️ Can't recognize the issue description. "
             "Please check the text and try again.",
@@ -308,7 +445,7 @@ def send_to_data_base(
             table_lines["employee"],
         )
 
-        send_text_message(
+        notify_user(
             chat_id,
             "⚠️ Employee not found. "
             "The issue was not saved. "
@@ -372,7 +509,7 @@ def send_to_data_base(
             table_lines["robot"],
         )
 
-        send_text_message(
+        notify_user(
             chat_id,
             f"⚠️ Robot #{table_lines['robot']} not found. "
             "The issue was not saved. "
@@ -503,7 +640,7 @@ def send_to_data_base(
 
         logger.error("Failed to save exception")
 
-        send_text_message(
+        notify_user(
             chat_id,
             "⚠️ Failed to save the issue. "
             "Please try again.",

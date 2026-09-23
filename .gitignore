@@ -7,3 +7,4 @@ images/
 logs/
 .DS_Store
 .env
+.pycache

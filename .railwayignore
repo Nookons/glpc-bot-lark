@@ -5,3 +5,8 @@ __pycache__
 errors.db
 images/
 .DS_Store
+.pycache
+.env
+.git
+logs/
+tests/
