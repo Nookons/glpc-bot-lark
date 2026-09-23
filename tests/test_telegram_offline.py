@@ -10,6 +10,7 @@ Telegram API, Supabase и Lark-хук подменяются заглушкам�
 сохранения ошибки, алерт по порогу, фото и защиту от дублей.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -27,6 +28,7 @@ os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
 import telegram_api as tg  # noqa: E402
 import telegram_bot as bot  # noqa: E402
+import shift_report as sr  # noqa: E402
 
 
 # ============================================================
@@ -1037,6 +1039,210 @@ def test_topic_not_configured():
     )
 
 
+# ============================================================
+# SHIFT REPORT
+# ============================================================
+
+def _report_data_stub(payloads, default=None):
+    """Заглушка shift_report_data + список вызовов."""
+    calls = []
+
+    empty = default or {
+        "total": 0,
+        "robots": {},
+        "types": {},
+        "employees": {},
+        "downtime_minutes": 0,
+        "maintenance": [],
+    }
+
+    def fake(shift_date, shift_name, warehouse=None, maintenance_threshold=3):
+        calls.append((shift_date, shift_name))
+        return dict(payloads.get((shift_date, shift_name), empty))
+
+    return fake, calls
+
+
+def test_report_previous_shift():
+    check(
+        "report: день -> ночь предыдущего дня",
+        sr.previous_shift("2026-09-23", "day") == ("2026-09-22", "night"),
+        sr.previous_shift("2026-09-23", "day"),
+    )
+    check(
+        "report: ночь -> день того же дня",
+        sr.previous_shift("2026-09-23", "night") == ("2026-09-23", "day"),
+        sr.previous_shift("2026-09-23", "night"),
+    )
+    check(
+        "report: переход через месяц",
+        sr.previous_shift("2026-10-01", "day") == ("2026-09-30", "night"),
+        sr.previous_shift("2026-10-01", "day"),
+    )
+
+
+def test_report_formatting():
+    check("report: 40 минут", sr.format_duration(40) == "40m", sr.format_duration(40))
+    check("report: ровно час", sr.format_duration(60) == "1h 00m", sr.format_duration(60))
+    check("report: 95 минут", sr.format_duration(95) == "1h 35m", sr.format_duration(95))
+    check("report: дельта +3", sr.format_delta(3) == "+3 ▲", sr.format_delta(3))
+    check("report: дельта -9", sr.format_delta(-9) == "-9 ▼", sr.format_delta(-9))
+    check("report: дельта 0", sr.format_delta(0) == "±0", sr.format_delta(0))
+
+    top = sr._top_line([("a", 3), ("b", 2), ("c", 1)], limit=2)
+    check("report: топ обрезается с хвостом", top == "a (3) · b (2) (+1 more)", top)
+    check("report: пустой топ", sr._top_line([]) == "—", sr._top_line([]))
+
+    issues = sr._issues_line({"Unable to drive": 3, "Other": 1}, 4)
+    check(
+        "report: проценты по типам",
+        "Unable to drive — 3 (75%)" in issues and "Other — 1 (25%)" in issues,
+        issues,
+    )
+
+
+def test_report_metrics_and_text():
+    original = sr.shift_report_data
+
+    fake, calls = _report_data_stub({
+        ("2026-09-23", "day"): {
+            "total": 14,
+            "robots": {"3638": 3, "3680": 2},
+            "types": {"Unable to drive": 12, "Other": 2},
+            "employees": {"Huseyn": 12, "Dmytro": 2},
+            "downtime_minutes": 88,
+            "maintenance": [("3638", 3)],
+        },
+        ("2026-09-22", "night"): {
+            "total": 23,
+            "robots": {},
+            "types": {},
+            "employees": {},
+            "downtime_minutes": 0,
+            "maintenance": [],
+        },
+    })
+
+    sr.shift_report_data = fake
+
+    try:
+        metrics = sr.shift_metrics("2026-09-23", "day")
+        text = sr.build_shift_summary("2026-09-23", "day", metrics)
+    finally:
+        sr.shift_report_data = original
+
+    check(
+        "report: запрос текущей и прошлой смены",
+        calls == [("2026-09-23", "day"), ("2026-09-22", "night")],
+        calls,
+    )
+    check("report: дельта -9", metrics["delta"] == -9, metrics.get("delta"))
+    check("report: простой в тексте", "Downtime 1h 28m" in text, text)
+    check("report: динамика в тексте", "-9 ▼" in text, text)
+    check("report: роботы на обслуживание", "Maintenance (3+ per shift): 3638 (3)" in text, text)
+    check("report: топ типов с процентами", "Unable to drive — 12 (86%)" in text, text)
+    check("report: разбивка по сотрудникам", "Huseyn (12) · Dmytro (2)" in text, text)
+    check(
+        "report: топ роботов без разбора по каждому",
+        "Top robots: 3638 (3) · 3680 (2)" in text and "more" not in text.split("Top robots")[1],
+        text,
+    )
+
+
+def test_report_empty_shift():
+    original = sr.shift_report_data
+    fake, _ = _report_data_stub({})
+    sr.shift_report_data = fake
+
+    try:
+        metrics = sr.shift_metrics("2026-09-23", "day")
+        text = sr.build_shift_summary("2026-09-23", "day", metrics)
+        card = sr.build_shift_card("2026-09-23", "day", metrics)
+    finally:
+        sr.shift_report_data = original
+
+    check("report: пустая смена в тексте", "No exceptions this shift." in text, text)
+    check("report: пустая смена — зелёная карточка", card["header"]["template"] == "green", card["header"])
+    check("report: пустая смена — один блок", len(card["elements"]) == 1, card["elements"])
+
+
+def test_report_card_structure_and_colors():
+    def card_for(total, maintenance):
+        metrics = {
+            "total": total,
+            "robots": {"3638": 2},
+            "types": {"Unable to drive": total},
+            "employees": {"Huseyn": total},
+            "downtime_minutes": 10,
+            "maintenance": maintenance,
+            "previous": {"date": "2026-09-22", "shift": "night", "total": 1},
+            "delta": total - 1,
+        }
+        return sr.build_shift_card("2026-09-23", "day", metrics)
+
+    check("report: мало ошибок — зелёная", card_for(3, [])["header"]["template"] == "green")
+    check("report: много ошибок — оранжевая", card_for(7, [])["header"]["template"] == "orange")
+    check(
+        "report: есть обслуживание — красная",
+        card_for(7, [("3638", 3)])["header"]["template"] == "red",
+    )
+
+    card = card_for(7, [("3638", 3)])
+    tags = [e["tag"] for e in card["elements"]]
+    check("report: в карточке есть разделитель", "hr" in tags, tags)
+    check("report: роботы уходят в примечание", tags[-1] == "note", tags)
+
+    body = json.dumps(card, ensure_ascii=False)
+    check(
+        "report: в карточке есть обслуживание и динамика",
+        "Maintenance (3+ per shift)" in body and "▲" in body,
+        body[:200],
+    )
+    check(
+        "report: карточка не перечисляет всех роботов",
+        "Top robots" in body and "+0 more" not in body,
+        body[:200],
+    )
+
+
+def test_report_send_fallback():
+    original_data = sr.shift_report_data
+    original_card = sr.send_card_via_hook
+    original_text = sr.send_text_via_hook
+
+    fake, _ = _report_data_stub({
+        ("2026-09-23", "day"): {
+            "total": 4,
+            "robots": {"1": 4},
+            "types": {"X": 4},
+            "employees": {"A": 4},
+            "downtime_minutes": 20,
+            "maintenance": [("1", 4)],
+        },
+    })
+
+    sent = []
+
+    sr.shift_report_data = fake
+
+    try:
+        # 1) Карточка принята — текстом не дублируем.
+        sr.send_card_via_hook = lambda url, card: (sent.append("card"), {"code": 0})[1]
+        sr.send_text_via_hook = lambda url, text: (sent.append("text"), {"code": 0})[1]
+        sr.send_shift_report("2026-09-23", "day")
+        check("report: карточка отправлена", sent == ["card"], sent)
+
+        # 2) Карточку отклонили — уходит текстовый вариант.
+        sent.clear()
+        sr.send_card_via_hook = lambda url, card: {"code": 9499, "msg": "bad"}
+        sr.send_shift_report("2026-09-23", "day")
+        check("report: откат на текст", sent == ["text"], sent)
+    finally:
+        sr.shift_report_data = original_data
+        sr.send_card_via_hook = original_card
+        sr.send_text_via_hook = original_text
+
+
 def main():
     tests = [
         test_parse_command,
@@ -1065,6 +1271,12 @@ def main():
         test_cyrillic_layout_command_works,
         test_send_fallback_to_monitored_topic,
         test_send_fallback_guarded_by_allow_list,
+        test_report_previous_shift,
+        test_report_formatting,
+        test_report_metrics_and_text,
+        test_report_empty_shift,
+        test_report_card_structure_and_colors,
+        test_report_send_fallback,
         test_allow_list_bootstrap_commands,
         test_topic_not_configured,
     ]

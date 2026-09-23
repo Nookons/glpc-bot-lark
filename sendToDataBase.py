@@ -319,6 +319,78 @@ def shift_stats(shift_date: str, shift_name: str):
     return total, by_robot, by_type
 
 
+def shift_report_data(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = WAREHOUSE,
+    maintenance_threshold: int = 3,
+):
+    """
+    Все метрики смены одним запросом (для отчёта).
+
+    Возвращает dict:
+        total              — всего исключений
+        robots             — {robot: count}
+        types              — {issue_type: count}
+        employees          — {employee: count}
+        downtime_minutes   — сумма solving_time (минуты)
+        maintenance        — [(robot, count), ...] у кого count >= порога
+    """
+    rows = get_shift_exceptions(
+        shift_date,
+        shift_name,
+        warehouse=warehouse,
+        limit=2000,
+    )
+
+    by_robot: dict = {}
+    by_type: dict = {}
+    by_employee: dict = {}
+    downtime = 0
+
+    for exc in rows or []:
+        robot = str(exc.get("error_robot"))
+        by_robot[robot] = by_robot.get(robot, 0) + 1
+
+        issue_type = (
+            exc.get("issue_type")
+            or exc.get("first_column")
+            or "unknown"
+        )
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+
+        employee = exc.get("employee") or "unknown"
+        by_employee[employee] = by_employee.get(employee, 0) + 1
+
+        solving_time = exc.get("solving_time")
+
+        if isinstance(solving_time, (int, float)):
+            downtime += int(solving_time)
+
+    maintenance = [
+        (robot, count)
+        for robot, count in by_robot.items()
+        if count >= maintenance_threshold
+    ]
+    maintenance.sort(key=lambda item: (-item[1], _robot_sort_key(item[0])))
+
+    return {
+        "total": len(rows or []),
+        "robots": by_robot,
+        "types": by_type,
+        "employees": by_employee,
+        "downtime_minutes": downtime,
+        "maintenance": maintenance,
+    }
+
+
+def _robot_sort_key(robot: str):
+    """Сортировка роботов: числовые номера — по значению, остальные — по строке."""
+    text = str(robot)
+
+    return (0, int(text), "") if text.isdigit() else (1, 0, text)
+
+
 # ============================================================
 # FIND BEST ERROR TEMPLATE
 # ============================================================

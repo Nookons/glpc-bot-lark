@@ -54,6 +54,22 @@ def _hook_payload_extra():
     return {"timestamp": timestamp, "sign": sign}
 
 
+def hook_ok(result) -> bool:
+    """Успешен ли ответ webhook: старая схема StatusCode, новая — code."""
+    if not isinstance(result, dict):
+        return False
+
+    return result.get("code") == 0 or result.get("StatusCode") == 0
+
+
+def send_card_via_hook(hook_url: str, card: dict):
+    """Отправляет интерактивную карточку в группу через webhook."""
+    payload = {"msg_type": "interactive", "card": card}
+    payload.update(_hook_payload_extra())
+    resp = requests.post(hook_url, json=payload, timeout=15)
+    return resp.json()
+
+
 def send_text_via_hook(hook_url: str, text: str):
     payload = {"msg_type": "text", "content": {"text": text}}
     payload.update(_hook_payload_extra())

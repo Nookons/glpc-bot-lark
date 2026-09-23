@@ -12,6 +12,7 @@
 import os
 
 from lark_media import (
+    hook_ok,
     send_image_via_hook,
     send_post_via_hook,
     send_text_via_hook,
@@ -36,12 +37,8 @@ TARGET_HOOK_URL = os.environ.get(
 )
 
 
-def _hook_ok(result) -> bool:
-    """Проверяет ответ webhook: старая схема StatusCode, новая — code."""
-    if not isinstance(result, dict):
-        return False
-
-    return result.get("code") == 0 or result.get("StatusCode") == 0
+# Оставлено для обратной совместимости: реализация живёт в lark_media.
+_hook_ok = hook_ok
 
 
 def handle_incoming_photo(image_path: str, console=None, caption: str = None) -> str:
