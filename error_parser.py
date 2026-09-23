@@ -19,7 +19,11 @@ def parse_error_message(text: str):
     if not text:
         return None
 
-    text = str(text).strip()
+    # Точка/многоточие в конце — частая привычка: «... 3780.»
+    text = str(text).strip().rstrip(".").strip()
+
+    if not text:
+        return None
 
     match = re.match(r"^([^:]+):\s*(.+)\.\s*([^.]+)$", text)
     if not match:

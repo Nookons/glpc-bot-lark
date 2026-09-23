@@ -23,6 +23,15 @@ logger = setup_logging(__name__)
 
 TABLE = "telegram_users"
 
+
+class StoreUnavailable(RuntimeError):
+    """
+    База недоступна: это НЕ «нет данных».
+
+    Без такого различия сетевой сбой выглядел бы как «вы не
+    зарегистрированы» или «сотрудник не найден».
+    """
+
 # Порог схожести для автоподбора имени сотрудника (rapidfuzz).
 NAME_MATCH_THRESHOLD = 78
 
@@ -34,8 +43,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_link(telegram_id: int):
-    """Строка привязки из telegram_users или None."""
+def get_link(telegram_id: int, strict: bool = False):
+    """
+    Строка привязки из telegram_users или None.
+
+    strict=True — при сбое чтения бросает StoreUnavailable (вместо None).
+    """
     rows = rest_get(
         TABLE,
         params={
@@ -45,15 +58,23 @@ def get_link(telegram_id: int):
         },
     )
 
+    if rows is None:
+        logger.error("Не удалось прочитать привязку telegram_id=%s", telegram_id)
+
+        if strict:
+            raise StoreUnavailable("telegram_users read failed")
+
+        return None
+
     if not rows:
         return None
 
     return rows[0]
 
 
-def get_employee_name(telegram_id: int):
+def get_employee_name(telegram_id: int, strict: bool = False):
     """Имя сотрудника для Telegram-аккаунта или None."""
-    link = get_link(telegram_id)
+    link = get_link(telegram_id, strict=strict)
 
     if not link:
         return None
@@ -61,14 +82,14 @@ def get_employee_name(telegram_id: int):
     return link.get("employee_name")
 
 
-def get_employee(telegram_id: int):
+def get_employee(telegram_id: int, strict: bool = False):
     """
     Строка сотрудника из employees для привязанного Telegram-аккаунта.
 
     Нужна там, где недостаточно имени: например, для card_id при смене
     статуса робота (add_by / updated_by).
     """
-    employee_name = get_employee_name(telegram_id)
+    employee_name = get_employee_name(telegram_id, strict=strict)
 
     if not employee_name:
         return None
@@ -82,8 +103,19 @@ def get_employee(telegram_id: int):
         },
     )
 
+    if rows is None:
+        logger.error("Не удалось прочитать сотрудника %r", employee_name)
+
+        if strict:
+            raise StoreUnavailable("employees read failed")
+
+        return None
+
     if not rows:
-        logger.warning("Сотрудник %r есть в telegram_users, но не найден в employees", employee_name)
+        logger.warning(
+            "Сотрудник %r есть в telegram_users, но не найден в employees",
+            employee_name,
+        )
         return None
 
     return rows[0]
@@ -136,8 +168,12 @@ def unlink_user(telegram_id: int) -> bool:
 # EMPLOYEE NAME RESOLUTION
 # ============================================================
 
-def load_employee_names() -> list:
-    """Список user_name из таблицы employees."""
+def load_employee_names(strict: bool = False) -> list:
+    """
+    Список user_name из таблицы employees.
+
+    strict=True — при сбое чтения бросает StoreUnavailable.
+    """
     rows = rest_get(
         "employees",
         params={
@@ -146,6 +182,14 @@ def load_employee_names() -> list:
             "limit": "5000",
         },
     )
+
+    if rows is None:
+        logger.error("Не удалось прочитать список сотрудников")
+
+        if strict:
+            raise StoreUnavailable("employees list read failed")
+
+        return []
 
     if not rows:
         return []
@@ -172,7 +216,7 @@ def suggest_employee_names(raw_name: str, names: list, limit: int = SUGGESTION_L
     return [name for name, _score, _index in matches]
 
 
-def resolve_employee_name(raw_name: str):
+def resolve_employee_name(raw_name: str, strict: bool = False):
     """
     Ищет сотрудника по введённому имени.
 
@@ -181,7 +225,7 @@ def resolve_employee_name(raw_name: str):
     Сначала точное совпадение без учёта регистра, затем нечёткое
     сравнение через rapidfuzz (люди пишут имена с опечатками).
     """
-    names = load_employee_names()
+    names = load_employee_names(strict=strict)
 
     if not names:
         logger.error("No employees loaded (table employees?)")

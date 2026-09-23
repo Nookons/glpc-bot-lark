@@ -1,5 +1,10 @@
-flask
-requests
-rapidfuzz
-rich
-python-dotenv
+# Мажорные версии ограничены: иначе неожиданный релиз ломает прод-сборку.
+flask>=3.0,<4
+requests>=2.31,<3
+rapidfuzz>=3.5,<4
+rich>=13,<16
+python-dotenv>=1.0,<2
+
+# База часовых поясов для zoneinfo: на python:*-slim её нет, а бот
+# считает смены и отчёты по Europe/Warsaw.
+tzdata>=2024.1

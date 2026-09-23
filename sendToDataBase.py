@@ -637,6 +637,21 @@ def send_to_data_base(
         },
     )
 
+    if employee_data is None:
+        # Сбой чтения: нельзя говорить «сотрудник не найден».
+        logger.error(
+            "Не удалось проверить сотрудника %r — база недоступна",
+            table_lines.get("employee"),
+        )
+
+        notify_user(
+            chat_id,
+            "⚠️ Can't check the employee right now (database error). "
+            "Please try again in a minute.",
+        )
+
+        return None
+
     if not employee_data:
 
         logger.warning(
@@ -690,6 +705,22 @@ def send_to_data_base(
             "limit": "1",
         },
     )
+
+    if robot_data is None:
+        # Сбой чтения: робота НЕ ставим в очередь (иначе на сетевом сбое
+        # в очереди появятся фантомные роботы).
+        logger.error(
+            "Не удалось проверить робота #%s — база недоступна",
+            table_lines.get("robot"),
+        )
+
+        notify_user(
+            chat_id,
+            "⚠️ Can't check the robot right now (database error). "
+            "Please try again in a minute.",
+        )
+
+        return None
 
     if not robot_data:
         obj = {

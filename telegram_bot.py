@@ -65,6 +65,7 @@ from shift import get_current_shift
 from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
 from text_utils import truncate
 from telegram_store import (
+    StoreUnavailable,
     get_employee,
     get_employee_name,
     link_user,
@@ -282,6 +283,10 @@ FORMAT_HINT = (
     "\n"
     "Example:\n"
     "Unable to drive: Security module failure. 3780"
+)
+
+DB_UNAVAILABLE_HINT = (
+    "⚠️ Can't read the database right now. Please try again in a minute."
 )
 
 NOT_REGISTERED_HINT = (
@@ -936,7 +941,10 @@ def status_usage(direction: str) -> str:
 
 def _handle_status_command(chat_id, sender, direction, args, message_id):
     """/offline или /online: показываем робота и кнопки причин."""
-    employee = get_employee(sender.get("id"))
+    employee, db_error = _lookup_employee(chat_id, sender, message_id)
+
+    if db_error:
+        return
 
     if not employee:
         _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
@@ -1029,7 +1037,14 @@ def handle_status_callback(callback: dict):
         _delete_quiet(chat_id, message_id)
         return
 
-    employee = get_employee(sender.get("id"))
+    try:
+        employee = get_employee(sender.get("id"), strict=True)
+    except StoreUnavailable:
+        tg.answer_callback_query(
+            callback_id,
+            "Database unavailable — try again in a minute",
+        )
+        return
 
     if not employee:
         tg.answer_callback_query(callback_id, "Register first: /reg <Your Name>")
@@ -1409,6 +1424,39 @@ def _show_console_message(chat, sender, message_type: str, extra_rows=None):
     )
 
 
+def _lookup_employee_name(chat_id, sender, message_id):
+    """
+    Имя сотрудника для Telegram-аккаунта.
+
+    Возвращает (имя|None, ошибка_базы). При ошибке ответ уже отправлен:
+    «вы не зарегистрированы» на сетевом сбое — неверный и путающий ответ.
+    """
+    try:
+        return get_employee_name(sender.get("id"), strict=True), False
+    except StoreUnavailable:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return None, True
+
+
+def _lookup_employee(chat_id, sender, message_id):
+    """Строка сотрудника (с card_id) или (None, True) при сбое базы."""
+    try:
+        return get_employee(sender.get("id"), strict=True), False
+    except StoreUnavailable:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return None, True
+
+
 def _handle_reg(chat_id, sender, args, reply_to):
     telegram_id = sender.get("id")
 
@@ -1421,7 +1469,16 @@ def _handle_reg(chat_id, sender, args, reply_to):
         )
         return
 
-    employee_name, suggestions = resolve_employee_name(args)
+    try:
+        employee_name, suggestions = resolve_employee_name(args, strict=True)
+    except StoreUnavailable:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
 
     if not employee_name:
         text = f"⚠️ Employee {args!r} not found in the employees list."
@@ -1605,7 +1662,10 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
 
 def handle_error_text(chat_id, sender, text, message_id):
     """Сообщение с описанием ошибки: сохранить и переслать в Lark."""
-    employee_name = get_employee_name(sender.get("id"))
+    employee_name, db_error = _lookup_employee_name(chat_id, sender, message_id)
+
+    if db_error:
+        return
 
     if not employee_name:
         _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
@@ -2150,6 +2210,10 @@ LEASE_MODE = "unknown"   # acquired / taken-over / no-table / held-by-other
 # Когда последний раз успешно вызывали getUpdates (для /health).
 _LAST_POLL_AT = 0.0
 
+# Последний подтверждённый offset: сохраняем его при остановке, чтобы
+# после перезапуска Telegram не прислал уже обработанные апдейты.
+_CURRENT_OFFSET = None
+
 # Статус таблицы привязок (проверяется один раз на старте, чтобы
 # /health не дёргал Supabase на каждый запрос).
 USERS_TABLE_OK = None
@@ -2177,7 +2241,7 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
         lease_holder,
     )
 
-    global _LAST_POLL_AT
+    global _LAST_POLL_AT, _CURRENT_OFFSET
 
     while stop_event is None or not stop_event.is_set():
         if lease_holder:
@@ -2224,6 +2288,7 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
 
             if update_id is not None:
                 offset = update_id + 1
+                _CURRENT_OFFSET = offset
 
             try:
                 handle_update(update, BOT_USERNAME)
@@ -2290,6 +2355,14 @@ def install_shutdown_handler(holder: str):
             time.sleep(SHUTDOWN_GRACE_SECONDS)
         except Exception:
             pass
+
+        try:
+            # Фиксируем offset: иначе после перезапуска Telegram пришлёт
+            # последний батч повторно и записи продублируются.
+            if _CURRENT_OFFSET:
+                save_offset(_CURRENT_OFFSET)
+        except Exception:
+            logger.exception("Не удалось сохранить offset при завершении")
 
         try:
             bot_lease.release(holder)

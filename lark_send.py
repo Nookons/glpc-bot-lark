@@ -37,7 +37,14 @@ def send_text_message(chat_id: str, text: str):
         logger.error("Failed to send Lark message: %s", e)
         return None
 
-    result = resp.json()
+    try:
+        result = resp.json()
+    except ValueError:
+        logger.error(
+            "Lark send: ответ не JSON (HTTP %s)",
+            resp.status_code,
+        )
+        return None
 
     if result.get("code") != 0:
         logger.error(

@@ -134,11 +134,11 @@ def fake_download_file(file_path, destination):
 ROBOTS = {}
 
 
-def fake_get_employee_name(telegram_id):
+def fake_get_employee_name(telegram_id, strict=False):
     return LINKS.get(telegram_id)
 
 
-def fake_get_employee(telegram_id):
+def fake_get_employee(telegram_id, strict=False):
     if telegram_id not in LINKS:
         return None
 
@@ -162,7 +162,7 @@ def fake_find_robot_by_id(robot_id):
     return None
 
 
-def fake_resolve_employee_name(raw_name):
+def fake_resolve_employee_name(raw_name, strict=False):
     if raw_name.strip().casefold() == "ivan":
         return "Ivan Petrenko", []
 
@@ -683,6 +683,171 @@ def test_photo_attaches_to_recent_error():
         sent and "attached" in sent[0]["text"],
         sent,
     )
+
+
+def test_db_error_is_not_reported_as_unregistered():
+    """Сбой чтения БД не должен выглядеть как «вы не зарегистрированы»."""
+    from telegram_store import StoreUnavailable
+
+    original_name = bot.get_employee_name
+    original_resolve = bot.resolve_employee_name
+
+    def boom(*args, **kwargs):
+        raise StoreUnavailable("db down")
+
+    bot.get_employee_name = boom
+
+    try:
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=2,
+        ))
+    finally:
+        bot.get_employee_name = original_name
+
+    check(
+        "db error: пишем о сбое базы, а не «not registered»",
+        sent and "database" in sent[0]["text"].lower(),
+        sent,
+    )
+    check("db error: в базу ничего не пишем", DB_CALLS == [], DB_CALLS)
+
+    bot.resolve_employee_name = boom
+
+    try:
+        sent = run(make_update(text="/reg Ivan", thread_id=2))
+    finally:
+        bot.resolve_employee_name = original_resolve
+
+    check(
+        "db error: /reg сообщает о сбое базы",
+        sent and "database" in sent[0]["text"].lower(),
+        sent,
+    )
+
+
+def test_send_to_data_base_db_error_paths():
+    """Ошибка чтения сотрудника/робота — не «не найден»."""
+    import sendToDataBase as stdb
+
+    template = {
+        "employee_title": "Security module failure",
+        "id": 122,
+        "solving_time": 6,
+        "issue_sub_type": "sub",
+        "issue_description": "desc",
+        "issue_type": "Unable to drive",
+        "recovery_title": "recovery",
+    }
+
+    parsed = {
+        "error_type": "Unable to drive",
+        "robot": "3884",
+        "error_text": "Security module failure",
+    }
+
+    original_get = stdb._rest_get
+    original_post = stdb._rest_post
+    original_notify = stdb.notify_user
+
+    posted, notified = [], []
+    failing_table = ["employees"]
+
+    def fake_get(table, params=None):
+        if table in failing_table:
+            return None
+
+        if table == "issue_templates":
+            return [template]
+
+        if table == "employees":
+            return [{"card_id": 1, "user_name": "Ivan", "home_warehouse": "GLP-C"}]
+
+        return []
+
+    stdb._rest_get = fake_get
+    stdb._rest_post = lambda table, payload, ignore_conflict=False: (
+        posted.append(table), [{}]
+    )[1]
+    stdb.notify_user = lambda chat_id, text: notified.append(text)
+
+    try:
+        result = stdb.send_to_data_base(
+            parsed,
+            {"employee": "Ivan", "robot": "3884",
+             "error_text": "Security module failure"},
+            -500,
+        )
+
+        check(
+            "db error: сотрудник — сообщаем о сбое, а не «не найден»",
+            notified and "database" in notified[0].lower(),
+            notified,
+        )
+        check(
+            "db error: при сбое чтения сотрудника в базу не пишем",
+            posted == [] and result is None,
+            (posted, result),
+        )
+
+        # Теперь сбой на чтении робота: в очередь фантомного робота не пишем.
+        failing_table[0] = "robots_maintenance_list"
+        posted.clear()
+        notified.clear()
+
+        result = stdb.send_to_data_base(
+            parsed,
+            {"employee": "Ivan", "robot": "3884",
+             "error_text": "Security module failure"},
+            -500,
+        )
+
+        check(
+            "db error: робот — сообщаем о сбое",
+            notified and "database" in notified[0].lower(),
+            notified,
+        )
+        check(
+            "db error: фантомного робота в очередь не пишем",
+            posted == [] and result is None,
+            (posted, result),
+        )
+    finally:
+        stdb._rest_get = original_get
+        stdb._rest_post = original_post
+        stdb.notify_user = original_notify
+
+
+def test_shutdown_saves_offset_and_releases_lease():
+    original_save = bot.save_offset
+    original_release = bot_lease.release
+    original_exit = os._exit
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    original_grace = bot.SHUTDOWN_GRACE_SECONDS
+    original_offset = bot._CURRENT_OFFSET
+
+    saved, released = [], []
+
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+    bot_lease.release = lambda holder=None: (released.append(holder), True)[1]
+    bot.SHUTDOWN_GRACE_SECONDS = 0
+    bot._CURRENT_OFFSET = 4242
+    os._exit = lambda code=None: None
+
+    try:
+        bot.install_shutdown_handler("me-offset")
+        handler = signal.getsignal(signal.SIGTERM)
+        handler(signal.SIGTERM, None)
+    finally:
+        bot.save_offset = original_save
+        bot_lease.release = original_release
+        bot.SHUTDOWN_GRACE_SECONDS = original_grace
+        bot._CURRENT_OFFSET = original_offset
+        os._exit = original_exit
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+    check("shutdown: offset сохранён перед выходом", saved == [4242], saved)
+    check("shutdown: лиз отпущен", released == ["me-offset"], released)
 
 
 def test_user_commands_are_deleted():
@@ -2415,6 +2580,20 @@ def test_parser_and_count_guards():
     check("parser: None не роняет разбор", parse_error_message(None) is None)
     check("parser: пустая строка", parse_error_message("   ") is None)
 
+    trailing = parse_error_message("Unable to drive: Security module failure. 3780.")
+    check(
+        "parser: точка в конце не ломает разбор",
+        trailing and trailing["robot"] == "3780",
+        trailing,
+    )
+
+    dotted = parse_error_message("first: text with. dot inside. 123")
+    check(
+        "parser: точки внутри описания сохраняются",
+        dotted and dotted["error_text"] == "text with. dot inside",
+        dotted,
+    )
+
     import sendToDataBase as stdb
 
     original_get = stdb._rest_get
@@ -3193,6 +3372,9 @@ def main():
         test_threshold_alert,
         test_bad_format,
         test_not_saved_no_forward,
+        test_db_error_is_not_reported_as_unregistered,
+        test_send_to_data_base_db_error_paths,
+        test_shutdown_saves_offset_and_releases_lease,
         test_user_commands_are_deleted,
         test_status_note_deleted_and_change_message_kept,
         test_short_photo_link_and_redirect,
