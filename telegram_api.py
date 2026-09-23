@@ -106,7 +106,8 @@ def get_updates(offset: int = None, timeout: int = 30):
     """
     payload = {
         "timeout": timeout,
-        "allowed_updates": ["message"],
+        # callback_query нужен для кнопок выбора причины смены статуса.
+        "allowed_updates": ["message", "callback_query"],
     }
 
     if offset is not None:
@@ -126,6 +127,7 @@ def send_message(
     reply_to_message_id: int = None,
     disable_notification: bool = False,
     message_thread_id: int = None,
+    reply_markup: dict = None,
 ):
     """
     Отправляет текстовое сообщение. Возвращает message или None.
@@ -142,6 +144,9 @@ def send_message(
     if message_thread_id is not None:
         payload["message_thread_id"] = int(message_thread_id)
 
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
     if reply_to_message_id is not None:
         payload["reply_parameters"] = {
             "message_id": reply_to_message_id,
@@ -152,6 +157,31 @@ def send_message(
         payload["disable_notification"] = True
 
     return call("sendMessage", payload, timeout=15)
+
+
+def edit_message_text(chat_id, message_id, text: str, reply_markup: dict = None):
+    """Меняет текст сообщения бота (и убирает кнопки, если markup не передан)."""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    return call("editMessageText", payload, timeout=15)
+
+
+def answer_callback_query(callback_query_id: str, text: str = None):
+    """Гасит «часики» на кнопке; text показывается всплывашкой."""
+    payload = {"callback_query_id": callback_query_id}
+
+    if text:
+        payload["text"] = text[:200]
+
+    return call("answerCallbackQuery", payload, timeout=15)
 
 
 def send_chat_action(chat_id, action: str = "typing", message_thread_id: int = None):

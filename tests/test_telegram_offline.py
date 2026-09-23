@@ -28,6 +28,7 @@ os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
 import telegram_api as tg  # noqa: E402
 import telegram_bot as bot  # noqa: E402
+import robot_status  # noqa: E402
 import shift_report as sr  # noqa: E402
 
 
@@ -66,15 +67,42 @@ FORWARDED = []
 PHOTO_CALLS = []
 
 
+DELETED = []
+EDITED = []
+ANSWERED = []
+
+
 def fake_send_message(
     chat_id,
     text,
     reply_to_message_id=None,
     disable_notification=False,
     message_thread_id=None,
+    reply_markup=None,
 ):
-    SENT.append({"chat_id": chat_id, "text": text, "thread_id": message_thread_id})
+    SENT.append({
+        "chat_id": chat_id,
+        "text": text,
+        "thread_id": message_thread_id,
+        "reply_markup": reply_markup,
+        "message_id": len(SENT) + 1,
+    })
     return {"message_id": len(SENT)}
+
+
+def fake_delete_message(chat_id, message_id):
+    DELETED.append((chat_id, message_id))
+    return True
+
+
+def fake_edit_message_text(chat_id, message_id, text, reply_markup=None):
+    EDITED.append({"chat_id": chat_id, "message_id": message_id, "text": text})
+    return {"message_id": message_id}
+
+
+def fake_answer_callback_query(callback_query_id, text=None):
+    ANSWERED.append({"id": callback_query_id, "text": text})
+    return True
 
 
 def fake_send_chat_action(*args, **kwargs):
@@ -94,8 +122,35 @@ def fake_download_file(file_path, destination):
     return destination
 
 
+ROBOTS = {}
+
+
 def fake_get_employee_name(telegram_id):
     return LINKS.get(telegram_id)
+
+
+def fake_get_employee(telegram_id):
+    if telegram_id not in LINKS:
+        return None
+
+    return {
+        "user_name": LINKS[telegram_id],
+        "card_id": 60072001,
+        "is_leader": False,
+        "home_warehouse": "GLP-C",
+    }
+
+
+def fake_find_robot(robot_number, warehouse=None):
+    return ROBOTS.get(str(robot_number).strip().lstrip("#"))
+
+
+def fake_find_robot_by_id(robot_id):
+    for row in ROBOTS.values():
+        if str(row.get("id")) == str(robot_id):
+            return row
+
+    return None
 
 
 def fake_resolve_employee_name(raw_name):
@@ -142,10 +197,16 @@ COUNTS = {}
 
 tg.send_message = fake_send_message
 tg.send_chat_action = fake_send_chat_action
+tg.delete_message = fake_delete_message
+tg.edit_message_text = fake_edit_message_text
+tg.answer_callback_query = fake_answer_callback_query
 tg.get_file = fake_get_file
 tg.download_file = fake_download_file
 
 bot.get_employee_name = fake_get_employee_name
+bot.get_employee = fake_get_employee
+robot_status.find_robot = fake_find_robot
+robot_status.find_robot_by_id = fake_find_robot_by_id
 bot.resolve_employee_name = fake_resolve_employee_name
 bot.link_user = fake_link_user
 bot.unlink_user = fake_unlink_user
@@ -222,9 +283,40 @@ def make_update(
     return {"update_id": MESSAGE_SEQ[0], "message": message}
 
 
+def make_callback(data, user_id=100, chat_id=-500, message_id=1, thread_id=2):
+    MESSAGE_SEQ[0] += 1
+
+    message = {
+        "message_id": message_id,
+        "chat": {"id": chat_id, "type": "supergroup"},
+        "from": {"id": 8732612039, "is_bot": True},
+    }
+
+    if thread_id is not None:
+        message["message_thread_id"] = thread_id
+
+    return {
+        "update_id": MESSAGE_SEQ[0],
+        "callback_query": {
+            "id": f"cb{MESSAGE_SEQ[0]}",
+            "from": {
+                "id": user_id,
+                "is_bot": False,
+                "username": "tester",
+                "first_name": "Tester",
+            },
+            "message": message,
+            "data": data,
+        },
+    }
+
+
 def run(update):
     stdb.set_notifier(notifier)
     SENT.clear()
+    DELETED.clear()
+    EDITED.clear()
+    ANSWERED.clear()
     DB_CALLS.clear()
     FORWARDED.clear()
     PHOTO_CALLS.clear()
@@ -916,7 +1008,8 @@ def test_send_fallback_to_monitored_topic():
 
     calls = []
 
-    def flaky(chat_id, text, reply_to_message_id=None, disable_notification=False, message_thread_id=None):
+    def flaky(chat_id, text, reply_to_message_id=None, disable_notification=False,
+              message_thread_id=None, reply_markup=None):
         calls.append(message_thread_id)
 
         if message_thread_id is None:
@@ -954,7 +1047,8 @@ def test_send_fallback_guarded_by_allow_list():
 
     calls = []
 
-    def always_fail(chat_id, text, reply_to_message_id=None, disable_notification=False, message_thread_id=None):
+    def always_fail(chat_id, text, reply_to_message_id=None, disable_notification=False,
+                    message_thread_id=None, reply_markup=None):
         calls.append(message_thread_id)
         return None
 
@@ -1128,7 +1222,8 @@ def test_self_deleting_confirmations():
     next_id = [5000]
 
     def fake_send(chat_id, text, reply_to_message_id=None,
-                  disable_notification=False, message_thread_id=None):
+                  disable_notification=False, message_thread_id=None,
+                  reply_markup=None):
         next_id[0] += 1
         SENT.append({
             "chat_id": chat_id,
@@ -1245,6 +1340,337 @@ def test_self_deleting_confirmations():
         with bot._pending_lock:
             bot._pending_deletions.clear()
         LINKS.clear()
+
+
+def _robot(number=3783, robot_id=3542, status=None):
+    return {
+        "id": robot_id,
+        "robot_number": number,
+        "robot_type": "RT_KUBOT_MINI_HAIFLEX",
+        "status": status or robot_status.ONLINE,
+        "warehouse": "GLP-C",
+    }
+
+
+def test_robot_status_module():
+    check(
+        "status: подпись причины из журнала",
+        robot_status.reason_label("offline", "abnormal_walking") == "行走异常/Abnormal walking",
+        robot_status.reason_label("offline", "abnormal_walking"),
+    )
+    check("status: неизвестный код причины", robot_status.reason_label("offline", "nope") is None)
+
+    robot = _robot()
+    check(
+        "status: определение текущего состояния",
+        robot_status.is_in_status(robot, "online") is True
+        and robot_status.is_in_status(robot, "offline") is False,
+    )
+
+    original_patch = robot_status.rest_patch
+    original_post = robot_status.rest_post
+
+    patched, posted = [], []
+
+    robot_status.rest_patch = lambda table, params, payload: (
+        patched.append((table, params, payload)), [{}]
+    )[1]
+    robot_status.rest_post = lambda table, payload: (
+        posted.append((table, payload)), [{}]
+    )[1]
+
+    try:
+        result = robot_status.change_robot_status(
+            robot, "offline", "Other", "сломан ролик", {"card_id": 60072001, "user_name": "Ivan"}
+        )
+    finally:
+        robot_status.rest_patch = original_patch
+        robot_status.rest_post = original_post
+
+    check(
+        "status: PATCH статуса робота",
+        patched and patched[0][0] == "robots_maintenance_list"
+        and patched[0][2]["status"] == robot_status.OFFLINE,
+        patched,
+    )
+    check(
+        "status: PATCH проставляет updated_by",
+        patched and patched[0][2]["updated_by"] == 60072001,
+        patched,
+    )
+    check(
+        "status: запись в журнал change_status_robots",
+        posted and posted[0][0] == "change_status_robots"
+        and posted[0][1]["old_status"] == robot_status.ONLINE
+        and posted[0][1]["new_status"] == robot_status.OFFLINE
+        and posted[0][1]["add_by"] == 60072001
+        and posted[0][1]["robot_id"] == 3542,
+        posted,
+    )
+    check(
+        "status: причина и заметка в журнале",
+        posted and posted[0][1]["type_problem"] == "Other"
+        and posted[0][1]["problem_note"] == "сломан ролик",
+        posted,
+    )
+    check(
+        "status: результат для карточки",
+        result and result["old_status"] == robot_status.ONLINE
+        and result["new_status"] == robot_status.OFFLINE,
+        result,
+    )
+
+    card = robot_status.build_status_card("offline", result, "Ivan Petrenko")
+    body = json.dumps(card, ensure_ascii=False)
+
+    check("status: офлайн-карточка оранжевая", card["header"]["template"] == "orange", card["header"])
+    check(
+        "status: в карточке причина, заметка и автор",
+        "сломан ролик" in body and "Ivan Petrenko" in body and "Other" in body,
+        body[:200],
+    )
+
+    online_card = robot_status.build_status_card(
+        "online",
+        {
+            "robot": _robot(status=robot_status.OFFLINE),
+            "old_status": robot_status.OFFLINE,
+            "new_status": robot_status.ONLINE,
+            "type_problem": "Software fix",
+            "problem_note": "",
+            "changed_at": "2026-09-23T10:00:00+00:00",
+        },
+        "Ivan",
+    )
+    check("status: онлайн-карточка зелёная", online_card["header"]["template"] == "green", online_card["header"])
+    check(
+        "status: текстовый запасной вариант",
+        "Offline" in robot_status.build_status_text("offline", result, "Ivan")
+        and "сломан ролик" in robot_status.build_status_text("offline", result, "Ivan"),
+    )
+
+
+def test_offline_command_validation():
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    LINKS.clear()
+    sent = run(make_update(text="/offline 3783"))
+    check("offline: без регистрации — подсказка", len(sent) == 1 and "not registered" in sent[0]["text"], sent)
+    LINKS[100] = "Ivan Petrenko"
+
+    sent = run(make_update(text="/offline"))
+    check("offline: без номера — usage", len(sent) == 1 and "Usage: /offline" in sent[0]["text"], sent)
+
+    sent = run(make_update(text="/offline 99999"))
+    check("offline: робот не найден", len(sent) == 1 and "not found" in sent[0]["text"], sent)
+
+    sent = run(make_update(text="/online 3783"))
+    check(
+        "online: робот уже онлайн — отказ без записи",
+        len(sent) == 1 and "already" in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/offline 3783"))
+    keyboard = (sent[0].get("reply_markup") or {}).get("inline_keyboard") or []
+    codes = [button["callback_data"] for row in keyboard for button in row]
+
+    check(
+        "offline: показан робот и переход статуса",
+        "Online" in sent[0]["text"] and "Offline" in sent[0]["text"],
+        sent,
+    )
+    check(
+        "offline: кнопки всех причин + отмена",
+        len(codes) == len(robot_status.REASONS["offline"]) + 1
+        and any("abnormal_walking" in code for code in codes)
+        and any(code.endswith(":cancel") for code in codes),
+        codes,
+    )
+
+
+def test_status_flow_end_to_end():
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    # 1) команда -> кнопки
+    sent = run(make_update(text="/offline 3783", thread_id=2))
+    prompt_id = sent[0]["message_id"]
+
+    # 2) тап по причине
+    sent = run(make_callback(
+        "st:offline:3542:abnormal_walking",
+        message_id=prompt_id,
+        thread_id=2,
+    ))
+
+    check("flow: нажатие подтверждено", ANSWERED and "Abnormal" in (ANSWERED[-1]["text"] or ""), ANSWERED)
+    check(
+        "flow: бот просит описать причину",
+        EDITED and "Describe the reason" in EDITED[-1]["text"],
+        EDITED,
+    )
+
+    pending = bot.peek_pending_status(-500, 100)
+    check(
+        "flow: флоу ждёт описание причины",
+        pending and pending["type_problem"] == "行走异常/Abnormal walking"
+        and str(pending["robot_number"]) == "3783",
+        pending,
+    )
+
+    # 3) пустое описание — просим ещё раз, флоу не теряется
+    run(make_update(text="   ", thread_id=2))
+    check(
+        "flow: пустое описание не принимается",
+        bot.peek_pending_status(-500, 100) is not None,
+    )
+
+    # 4) описание есть -> меняем статус, чистим за собой, шлём карточку
+    original_patch = robot_status.rest_patch
+    original_post = robot_status.rest_post
+    original_card = bot.send_card_via_hook
+
+    patched, posted, cards = [], [], []
+
+    robot_status.rest_patch = lambda table, params, payload: (
+        patched.append((table, params, payload)), [{}]
+    )[1]
+    robot_status.rest_post = lambda table, payload: (
+        posted.append((table, payload)), [{}]
+    )[1]
+    bot.send_card_via_hook = lambda url, card: (cards.append(card), {"code": 0})[1]
+
+    try:
+        sent = run(make_update(text="сломан ролик, заменили", thread_id=2))
+    finally:
+        robot_status.rest_patch = original_patch
+        robot_status.rest_post = original_post
+        bot.send_card_via_hook = original_card
+
+    check(
+        "flow: статус робота изменён на Offline",
+        patched and patched[0][2]["status"] == robot_status.OFFLINE,
+        patched,
+    )
+    check(
+        "flow: в журнал ушло описание сотрудника",
+        posted and posted[0][1]["problem_note"] == "сломан ролик, заменили"
+        and posted[0][1]["type_problem"] == "行走异常/Abnormal walking",
+        posted,
+    )
+    check(
+        "flow: своё сообщение с кнопками удалено",
+        (-500, prompt_id) in DELETED,
+        DELETED,
+    )
+    check(
+        "flow: подтверждение в Telegram с причиной",
+        sent and "Offline" in sent[0]["text"] and "сломан ролик" in sent[0]["text"],
+        sent,
+    )
+    check(
+        "flow: карточка ушла в Lark",
+        cards and "сломан ролик" in json.dumps(cards[0], ensure_ascii=False),
+        cards,
+    )
+    check("flow: состояние флоу очищено", bot.peek_pending_status(-500, 100) is None)
+
+
+def test_status_flow_cancel_and_fallbacks():
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    # Отмена кнопкой.
+    sent = run(make_update(text="/offline 3783", thread_id=2))
+    prompt_id = sent[0]["message_id"]
+
+    run(make_callback("st:offline:3542:cancel", message_id=prompt_id, thread_id=2))
+
+    check("cancel: сообщение с кнопками удалено", (-500, prompt_id) in DELETED, DELETED)
+    check("cancel: состояние сброшено", bot.peek_pending_status(-500, 100) is None)
+
+    # Отмена командой уже после выбора причины.
+    sent = run(make_update(text="/offline 3783", thread_id=2))
+    prompt_id = sent[0]["message_id"]
+    run(make_callback("st:offline:3542:other", message_id=prompt_id, thread_id=2))
+    check("cancel: причина выбрана", bot.peek_pending_status(-500, 100) is not None)
+
+    run(make_update(text="/cancel", thread_id=2))
+    check("cancel: /cancel сбрасывает флоу", bot.peek_pending_status(-500, 100) is None)
+    check("cancel: сообщение бота убрано", (-500, prompt_id) in DELETED, DELETED)
+
+    # Кнопка без регистрации.
+    sent = run(make_update(text="/offline 3783", thread_id=2))
+    prompt_id = sent[0]["message_id"]
+    LINKS.clear()
+
+    run(make_callback("st:offline:3542:other", message_id=prompt_id, thread_id=2))
+    check(
+        "callback: без регистрации — всплывашка про /reg",
+        ANSWERED and "Register first" in (ANSWERED[-1]["text"] or ""),
+        ANSWERED,
+    )
+    LINKS[100] = "Ivan Petrenko"
+
+    # Карточка не прошла -> уходит текстом.
+    original_card = bot.send_card_via_hook
+    original_text = bot.send_text_via_hook
+    hooks = []
+
+    bot.send_card_via_hook = lambda url, card: {"code": 9499, "msg": "bad"}
+    bot.send_text_via_hook = lambda url, text: (hooks.append(text), {"code": 0})[1]
+
+    try:
+        sent = run(make_update(text="/offline 3783", thread_id=2))
+        prompt_id = sent[0]["message_id"]
+        run(make_callback("st:offline:3542:other", message_id=prompt_id, thread_id=2))
+
+        original_patch = robot_status.rest_patch
+        original_post = robot_status.rest_post
+        robot_status.rest_patch = lambda table, params, payload: [{}]
+        robot_status.rest_post = lambda table, payload: [{}]
+
+        try:
+            run(make_update(text="нет запчасти", thread_id=2))
+        finally:
+            robot_status.rest_patch = original_patch
+            robot_status.rest_post = original_post
+    finally:
+        bot.send_card_via_hook = original_card
+        bot.send_text_via_hook = original_text
+
+    check(
+        "flow: карточка не прошла — отчёт ушёл текстом",
+        hooks and "нет запчасти" in hooks[-1],
+        hooks,
+    )
+
+    # Просроченный флоу не перехватывает обычные сообщения.
+    bot.set_pending_status(-500, 100, {
+        "direction": "offline",
+        "robot_number": 3783,
+        "type_problem": "Other",
+        "prompt_message_id": None,
+    })
+
+    with bot._pending_status_lock:
+        bot._pending_status[(-500, 100)]["expires"] = 0
+
+    sent = run(make_update(text="Unable to drive: Security module failure. 3783", thread_id=2))
+    check(
+        "flow: просроченный флоу не перехватывает ошибку",
+        bot.peek_pending_status(-500, 100) is None,
+        bot._pending_status,
+    )
+
+    bot.clear_pending_status(-500, 100)
+    ROBOTS.clear()
+    LINKS.clear()
 
 
 def test_report_previous_shift():
@@ -1457,6 +1883,10 @@ def main():
         test_send_fallback_guarded_by_allow_list,
         test_stats_command_matches_report,
         test_self_deleting_confirmations,
+        test_robot_status_module,
+        test_offline_command_validation,
+        test_status_flow_end_to_end,
+        test_status_flow_cancel_and_fallbacks,
         test_report_previous_shift,
         test_report_formatting,
         test_report_metrics_and_text,

@@ -33,8 +33,11 @@ from rich.table import Table
 import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
-from pending_photos import forward_error, handle_incoming_photo
+from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
+from pending_photos import TARGET_HOOK_URL, forward_error, handle_incoming_photo
+import robot_status
 from sendToDataBase import (
+    WAREHOUSE,
     count_robot_errors_in_shift,
     notify_user,
     send_to_data_base,
@@ -45,6 +48,7 @@ from sendToDataBase import (
 from shift import get_current_shift
 from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
 from telegram_store import (
+    get_employee,
     get_employee_name,
     link_user,
     resolve_employee_name,
@@ -137,12 +141,18 @@ WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
 # («сохранено», «фото переслано»). 0 — не удалять.
 CONFIRM_TTL_SECONDS = _env_int("TELEGRAM_CONFIRM_TTL", 10)
 
+# Сколько ждём описание причины при смене статуса робота.
+STATUS_FLOW_TTL_SECONDS = _env_int("TELEGRAM_STATUS_FLOW_TTL", 300)
+
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
 
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
-KNOWN_COMMANDS = ("reg", "unreg", "whoami", "stats", "id", "help", "start")
+KNOWN_COMMANDS = (
+    "reg", "unreg", "whoami", "stats", "id", "help", "start",
+    "offline", "online", "cancel",
+)
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
 # Переводим символы ЙЦУКЕН в QWERTY, чтобы команда распозналась.
@@ -202,7 +212,10 @@ HELP_TEXT = (
     "/reg <Your Name> — link Telegram to your employee name\n"
     "/whoami — show current link\n"
     "/unreg — remove the link\n"
-    "/stats — current shift statistics\n"
+    "/stats [date] [day|night] — shift statistics\n"
+    "/offline <robot> — take a robot out of service\n"
+    "/online <robot> — return a robot to service\n"
+    "/cancel — cancel the current action\n"
     "/id — show chat/user IDs\n"
     "/help — this message"
 )
@@ -422,6 +435,7 @@ def _send(
     thread_id=None,
     disable_notification=False,
     delete_after: int = None,
+    reply_markup: dict = None,
 ):
     """
     Отправка с автоопределением топика: ответ уходит в тот же топик,
@@ -442,6 +456,7 @@ def _send(
         reply_to_message_id=reply_to_message_id,
         disable_notification=disable_notification,
         message_thread_id=thread_id,
+        reply_markup=reply_markup,
     )
 
     if result is None:
@@ -585,6 +600,337 @@ def _handle_wrong_topic(chat_id, thread_id, reason):
         )
 
     _send(chat_id, text, thread_id=thread_id)
+
+
+# ============================================================
+# СМЕНА СТАТУСА РОБОТА (офлайн / онлайн)
+# ============================================================
+#
+# Флоу: /offline 3680 → бот показывает робота и кнопки причин → тап по
+# причине → бот просит описать причину сообщением → сотрудник пишет →
+# бот убирает свои сообщения, меняет статус в базе и отправляет карточку
+# в целевую Lark-группу.
+
+STATUS_DIRECTIONS = ("offline", "online")
+
+_pending_status = {}
+_pending_status_lock = threading.Lock()
+
+
+def _pending_key(chat_id, user_id):
+    return (int(chat_id), int(user_id))
+
+
+def set_pending_status(chat_id, user_id, data: dict):
+    with _pending_status_lock:
+        _pending_status[_pending_key(chat_id, user_id)] = dict(
+            data,
+            expires=time.time() + STATUS_FLOW_TTL_SECONDS,
+        )
+
+
+def peek_pending_status(chat_id, user_id):
+    """Незавершённый флоу пользователя (просроченные отбрасываются)."""
+    key = _pending_key(chat_id, user_id)
+
+    with _pending_status_lock:
+        data = _pending_status.get(key)
+
+        if not data:
+            return None
+
+        if data.get("expires", 0) < time.time():
+            _pending_status.pop(key, None)
+            return None
+
+        return dict(data)
+
+
+def clear_pending_status(chat_id, user_id):
+    with _pending_status_lock:
+        return _pending_status.pop(_pending_key(chat_id, user_id), None)
+
+
+def reasons_keyboard(direction: str, robot_id) -> dict:
+    """Кнопки с причинами: callback_data несёт всё нужное, состояние не нужно."""
+    rows = [
+        [{"text": label, "callback_data": f"st:{direction}:{robot_id}:{code}"}]
+        for code, label in robot_status.REASONS.get(direction, ())
+    ]
+
+    rows.append([{
+        "text": "✖️ Cancel",
+        "callback_data": f"st:{direction}:{robot_id}:cancel",
+    }])
+
+    return {"inline_keyboard": rows}
+
+
+def _delete_quiet(chat_id, message_id) -> bool:
+    """Удаляет сообщение бота, если у него есть id."""
+    if message_id is None:
+        return False
+
+    return tg.delete_message(chat_id, message_id)
+
+
+def status_usage(direction: str) -> str:
+    return (
+        f"Usage: /{direction} <robot number>\n"
+        f"Example: /{direction} 3680"
+    )
+
+
+def _handle_status_command(chat_id, sender, direction, args, message_id):
+    """/offline или /online: показываем робота и кнопки причин."""
+    employee = get_employee(sender.get("id"))
+
+    if not employee:
+        _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
+        return
+
+    if not args:
+        _send(chat_id, status_usage(direction), reply_to_message_id=message_id)
+        return
+
+    robot_number = args.split()[0]
+    robot = robot_status.find_robot(robot_number)
+    spec = robot_status.DIRECTIONS[direction]
+
+    if not robot:
+        _send(
+            chat_id,
+            f"⚠️ Robot {robot_number} not found in {WAREHOUSE}.",
+            reply_to_message_id=message_id,
+        )
+        return
+
+    if robot_status.is_in_status(robot, direction):
+        other = "online" if direction == "offline" else "offline"
+
+        _send(
+            chat_id,
+            f"ℹ️ Robot {robot.get('robot_number')} is already "
+            f"{robot.get('status')}.\n"
+            f"Use /{other} {robot.get('robot_number')} if that is wrong.",
+            reply_to_message_id=message_id,
+        )
+        return
+
+    _send(
+        chat_id,
+        f"{spec['emoji']} Robot {robot.get('robot_number')} · "
+        f"{robot.get('robot_type') or '-'} · {robot.get('warehouse') or WAREHOUSE}\n"
+        f"Status: {robot.get('status')} → {spec['new_status']}\n"
+        "\n"
+        "Choose the reason:",
+        reply_to_message_id=message_id,
+        reply_markup=reasons_keyboard(direction, robot.get("id")),
+    )
+
+
+def handle_status_callback(callback: dict):
+    """Нажатие кнопки с причиной."""
+    sender = callback.get("from") or {}
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    callback_id = callback.get("id")
+
+    if chat_id is None:
+        tg.answer_callback_query(callback_id)
+        return
+
+    thread_id = message.get("message_thread_id")
+    _routes[_chat_key(chat_id)] = thread_id
+
+    if not _chat_allowed(chat_id):
+        tg.answer_callback_query(callback_id, "This chat is not allowed")
+        return
+
+    allowed, _reason = topic_allowed(chat_id, thread_id)
+
+    if not allowed:
+        tg.answer_callback_query(callback_id, "This topic is not monitored")
+        return
+
+    parts = (callback.get("data") or "").split(":")
+
+    if len(parts) != 4 or parts[0] != "st":
+        tg.answer_callback_query(callback_id)
+        return
+
+    _, direction, robot_id, code = parts
+
+    if direction not in STATUS_DIRECTIONS:
+        tg.answer_callback_query(callback_id, "Unknown action")
+        return
+
+    if code == "cancel":
+        tg.answer_callback_query(callback_id, "Cancelled")
+        clear_pending_status(chat_id, sender.get("id"))
+        _delete_quiet(chat_id, message_id)
+        return
+
+    employee = get_employee(sender.get("id"))
+
+    if not employee:
+        tg.answer_callback_query(callback_id, "Register first: /reg <Your Name>")
+        return
+
+    label = robot_status.reason_label(direction, code)
+
+    if not label:
+        tg.answer_callback_query(callback_id, "Unknown reason")
+        return
+
+    robot = robot_status.find_robot_by_id(robot_id)
+
+    if not robot:
+        tg.answer_callback_query(callback_id, "Robot not found")
+        return
+
+    spec = robot_status.DIRECTIONS[direction]
+
+    if robot_status.is_in_status(robot, direction):
+        tg.answer_callback_query(callback_id, f"Already {spec['label']}")
+        _delete_quiet(chat_id, message_id)
+        return
+
+    set_pending_status(chat_id, sender.get("id"), {
+        "direction": direction,
+        "robot_number": robot.get("robot_number"),
+        "type_problem": label,
+        "prompt_message_id": message_id,
+    })
+
+    tg.answer_callback_query(callback_id, f"Reason: {label}")
+
+    tg.edit_message_text(
+        chat_id,
+        message_id,
+        f"{spec['emoji']} Robot {robot.get('robot_number')} · "
+        f"{robot.get('status')} → {spec['new_status']}\n"
+        f"Reason: {label}\n"
+        "\n"
+        "✍️ Describe the reason in one message (or /cancel).",
+    )
+
+
+def _notify_lark_status(direction, result, employee_name) -> bool:
+    """Карточка о смене статуса в целевой Lark-группе (с откатом на текст)."""
+    card = robot_status.build_status_card(direction, result, employee_name)
+    hook_result = send_card_via_hook(TARGET_HOOK_URL, card)
+
+    if hook_ok(hook_result):
+        logger.info(
+            "Статус робота #%s отправлен в Lark карточкой",
+            result["robot"].get("robot_number"),
+        )
+        return True
+
+    logger.warning("Карточка статуса не прошла (%s) — отправляю текстом", hook_result)
+
+    send_text_via_hook(
+        TARGET_HOOK_URL,
+        robot_status.build_status_text(direction, result, employee_name),
+    )
+
+    return False
+
+
+def finish_status_change(chat_id, sender, note, message_id, pending: dict):
+    """Сотрудник описал причину: меняем статус и убираем свои сообщения."""
+    direction = pending["direction"]
+    note = (note or "").strip()
+
+    if not note:
+        _send(
+            chat_id,
+            "✍️ Please describe the reason in one message (or /cancel).",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    employee = get_employee(sender.get("id"))
+
+    if not employee:
+        clear_pending_status(chat_id, sender.get("id"))
+        _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
+        return
+
+    robot = robot_status.find_robot(pending["robot_number"])
+
+    if not robot:
+        clear_pending_status(chat_id, sender.get("id"))
+        _send(
+            chat_id,
+            f"⚠️ Robot {pending['robot_number']} not found in {WAREHOUSE}.",
+            reply_to_message_id=message_id,
+        )
+        return
+
+    if robot_status.is_in_status(robot, direction):
+        clear_pending_status(chat_id, sender.get("id"))
+        _delete_quiet(chat_id, pending.get("prompt_message_id"))
+        _send(
+            chat_id,
+            f"ℹ️ Robot {robot.get('robot_number')} is already "
+            f"{robot.get('status')}.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    result = robot_status.change_robot_status(
+        robot,
+        direction,
+        pending["type_problem"],
+        note,
+        employee,
+    )
+
+    clear_pending_status(chat_id, sender.get("id"))
+
+    if not result:
+        _send(
+            chat_id,
+            "⚠️ Can't change the robot status right now (database error).",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    # Убираем свои сообщения: в чате остаётся только сообщение сотрудника.
+    _delete_quiet(chat_id, pending.get("prompt_message_id"))
+
+    _send(
+        chat_id,
+        "\n".join([
+            robot_status.status_title(direction, robot),
+            f"Reason: {pending['type_problem']}",
+            f"Note: {note}",
+        ]),
+        delete_after=CONFIRM_TTL_SECONDS,
+    )
+
+    _notify_lark_status(direction, result, employee.get("user_name"))
+
+
+def _handle_cancel(chat_id, sender, reply_to):
+    pending = clear_pending_status(chat_id, sender.get("id"))
+
+    if pending:
+        _delete_quiet(chat_id, pending.get("prompt_message_id"))
+
+    _send(
+        chat_id,
+        "✖️ Cancelled." if pending else "Nothing to cancel.",
+        reply_to_message_id=reply_to,
+        delete_after=CONFIRM_TTL_SECONDS,
+    )
 
 
 # ============================================================
@@ -762,6 +1108,14 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
 
     if command == "stats":
         _handle_stats(chat_id, args, reply_to)
+        return True
+
+    if command in STATUS_DIRECTIONS:
+        _handle_status_command(chat_id, sender, command, args, reply_to)
+        return True
+
+    if command == "cancel":
+        _handle_cancel(chat_id, sender, reply_to)
         return True
 
     if command == "id":
@@ -951,6 +1305,16 @@ def handle_photo(chat_id, sender, message, message_id):
 
 def handle_update(update: dict, bot_username: str = None):
     """Обрабатывает один апдейт Telegram."""
+    callback = update.get("callback_query")
+
+    if callback:
+        try:
+            handle_status_callback(callback)
+        except Exception:
+            logger.exception("Не удалось обработать нажатие кнопки")
+
+        return
+
     message = update.get("message") or update.get("edited_message")
 
     if not message:
@@ -1051,6 +1415,17 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
                 normalized,
             )
 
+        if normalized != "cancel":
+            interrupted = clear_pending_status(chat_id, sender.get("id"))
+
+            if interrupted:
+                # Новая команда прерывает незавершённую смену статуса.
+                _delete_quiet(chat_id, interrupted.get("prompt_message_id"))
+                logger.info(
+                    "Флоу смены статуса прерван командой /%s",
+                    normalized,
+                )
+
         _show_console_message(
             chat,
             sender,
@@ -1078,6 +1453,19 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             )
 
         _send(chat_id, hint, reply_to_message_id=message_id)
+        return
+
+    pending = peek_pending_status(chat_id, sender.get("id"))
+
+    if pending:
+        # Это описание причины для смены статуса, а не сообщение об ошибке.
+        logger.info(
+            "Описание причины для робота #%s: %r",
+            pending.get("robot_number"),
+            text[:80],
+        )
+
+        finish_status_change(chat_id, sender, text, message_id, pending)
         return
 
     parsed = parse_error_message(text)
@@ -1212,6 +1600,8 @@ def main():
         {"command": "whoami", "description": "Show current link"},
         {"command": "unreg", "description": "Remove the link"},
         {"command": "stats", "description": "Shift statistics"},
+        {"command": "offline", "description": "Take a robot out of service"},
+        {"command": "online", "description": "Return a robot to service"},
         {"command": "id", "description": "Show chat/user IDs"},
         {"command": "help", "description": "Help"},
     ])

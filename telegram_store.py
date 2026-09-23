@@ -61,6 +61,34 @@ def get_employee_name(telegram_id: int):
     return link.get("employee_name")
 
 
+def get_employee(telegram_id: int):
+    """
+    Строка сотрудника из employees для привязанного Telegram-аккаунта.
+
+    Нужна там, где недостаточно имени: например, для card_id при смене
+    статуса робота (add_by / updated_by).
+    """
+    employee_name = get_employee_name(telegram_id)
+
+    if not employee_name:
+        return None
+
+    rows = rest_get(
+        "employees",
+        params={
+            "select": "*",
+            "user_name": f"eq.{employee_name}",
+            "limit": "1",
+        },
+    )
+
+    if not rows:
+        logger.warning("Сотрудник %r есть в telegram_users, но не найден в employees", employee_name)
+        return None
+
+    return rows[0]
+
+
 def link_user(telegram_id: int, username, employee_name: str) -> bool:
     """
     Создаёт/обновляет привязку Telegram-аккаунта к сотруднику.

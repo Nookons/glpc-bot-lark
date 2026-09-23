@@ -149,6 +149,11 @@ def rest_get(table: str, params: dict = None):
     return _rest_get(table, params)
 
 
+def rest_post(table: str, payload: dict):
+    """Публичный доступ к POST /rest/v1/<table> (для других модулей)."""
+    return _rest_post(table, payload)
+
+
 def rest_upsert(table: str, payload: dict, on_conflict: str):
     """
     POST с upsert-семантикой (insert ... on conflict do update).
@@ -216,6 +221,35 @@ def table_exists(table: str) -> bool:
     )
 
     return False
+
+
+def rest_patch(table: str, params: dict, payload: dict):
+    """
+    PATCH /rest/v1/<table>?<params>. Возвращает обновлённые строки или None.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    headers = _headers()
+    headers["Prefer"] = "return=representation"
+
+    try:
+        response = requests.patch(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        logger.info("PATCH %s -> %s", table, response.status_code)
+
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        logger.error("PATCH %s failed: %s", table, e)
+        return None
 
 
 def rest_delete(table: str, params: dict = None) -> bool:
