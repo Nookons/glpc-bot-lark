@@ -1497,6 +1497,7 @@ BOT_USERNAME = None
 # и в каком режиме находится этот процесс.
 LEASE_HOLDER = None
 LEASE_STATUS = "starting"
+LEASE_MODE = "unknown"   # acquired / taken-over / no-table / held-by-other
 
 # Статус таблицы привязок (проверяется один раз на старте, чтобы
 # /health не дёргал Supabase на каждый запрос).
@@ -1565,12 +1566,15 @@ def start_polling(lease_holder: str = None) -> threading.Thread:
     return thread
 
 
-def start_polling_and_reports(holder: str):
+def start_polling_and_reports(holder: str, lease_mode: str = None):
     """Этот инстанс выиграл лиз: опрашиваем Telegram и шлём отчёты за смену."""
-    global LEASE_HOLDER, LEASE_STATUS
+    global LEASE_HOLDER, LEASE_STATUS, LEASE_MODE
 
     LEASE_HOLDER = holder
     LEASE_STATUS = "poller"
+
+    if lease_mode:
+        LEASE_MODE = lease_mode
 
     # Отчёт за смену шлёт только опрашивающий инстанс, иначе будут дубли.
     start_shift_scheduler()
@@ -1617,6 +1621,7 @@ def health():
         "users_table": USERS_TABLE_OK,
         "poller": LEASE_STATUS,
         "poller_holder": LEASE_HOLDER,
+        "lease": LEASE_MODE,
         "time": now_warsaw().strftime("%d.%m.%Y %H:%M:%S"),
     })
 
@@ -1726,10 +1731,14 @@ def main():
     lease = bot_lease.acquire(holder)
 
     if lease["acquired"]:
-        console.print(f"[green]Опрашиваю Telegram (лиз: {holder})[/green]")
-        start_polling_and_reports(holder)
+        LEASE_MODE = lease["status"]
+        console.print(
+            f"[green]Опрашиваю Telegram (лиз: {lease['status']})[/green]"
+        )
+        start_polling_and_reports(holder, lease["status"])
     else:
         LEASE_STATUS = f"standby ({lease.get('holder')})"
+        LEASE_MODE = lease["status"]
         console.print(
             f"[bold yellow]Telegram уже опрашивает другой инстанс "
             f"({lease.get('holder')}) — этот процесс в режиме standby, "
