@@ -822,6 +822,156 @@ def test_commands_work_in_any_topic():
     reset_topics()
 
 
+def test_command_normalization():
+    # «куй» = «req» в русской раскладке, а «req» — псевдоним «reg».
+    check("раскладка: /куй -> reg", bot.normalize_command("куй") == "reg")
+    check("раскладка: /куп -> reg", bot.normalize_command("куп") == "reg")
+    check("раскладка: /рудз -> help", bot.normalize_command("рудз") == "help")
+    check("регистр: /REG -> reg", bot.normalize_command("REG") == "reg")
+    check("латиница не портится", bot.normalize_command("whoami") == "whoami")
+
+    check("псевдоним: /req -> reg", bot.normalize_command("req") == "reg")
+    check("псевдоним: /register -> reg", bot.normalize_command("register") == "reg")
+    check("псевдоним: /stat -> stats", bot.normalize_command("stat") == "stats")
+    check("псевдонимов у /unreg нет", bot.normalize_command("unregs") == "unregs")
+
+    check("подсказка: stas -> stats", bot.suggest_command("stas") == "stats")
+    check("подсказка: whoam -> whoami", bot.suggest_command("whoam") == "whoami")
+    check("подсказка: мусор не угадывается", bot.suggest_command("zzzzzz") is None)
+
+
+def test_alias_req_registers():
+    """Частая опечатка /req должна работать как /reg."""
+    LINKS.clear()
+
+    sent = run(make_update(text="/req Ivan"))
+
+    check("псевдоним: /req выполнил привязку", LINKS.get(100) == "Ivan Petrenko", LINKS)
+    check(
+        "псевдоним: подтверждение привязки",
+        len(sent) == 1 and "Ivan Petrenko" in sent[0]["text"],
+        sent,
+    )
+
+    LINKS.clear()
+
+
+def test_unknown_command_suggests():
+    LINKS[100] = "Ivan Petrenko"
+
+    sent = run(make_update(text="/stas"))
+    check(
+        "unknown: подсказка про /stats",
+        len(sent) == 1 and "Did you mean /stats?" in sent[0]["text"],
+        sent,
+    )
+    check(
+        "unknown: без простыни help",
+        sent and "Robot exception bot" not in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/zzzzzz"))
+    check(
+        "unknown: без похожих — отправляем в /help",
+        len(sent) == 1 and "Send /help" in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/unregs"))
+    check(
+        "unknown: опасная команда не угадывается молча",
+        len(sent) == 1 and "Did you mean /unreg?" in sent[0]["text"] and LINKS.get(100) == "Ivan Petrenko",
+        (sent, LINKS),
+    )
+
+
+def test_cyrillic_layout_command_works():
+    LINKS.clear()
+
+    sent = run(make_update(text="/куп Ivan"))
+
+    check(
+        "раскладка: /куп выполнил /reg",
+        LINKS.get(100) == "Ivan Petrenko",
+        LINKS,
+    )
+    check(
+        "раскладка: подтверждение привязки",
+        len(sent) == 1 and "Ivan Petrenko" in sent[0]["text"],
+        sent,
+    )
+
+    LINKS.clear()
+
+
+def test_send_fallback_to_monitored_topic():
+    reset_topics(topic_id=555)
+
+    original_allowed = bot.ALLOWED_CHAT_IDS
+    original_send = tg.send_message
+    bot.ALLOWED_CHAT_IDS = {-500}
+
+    calls = []
+
+    def flaky(chat_id, text, reply_to_message_id=None, disable_notification=False, message_thread_id=None):
+        calls.append(message_thread_id)
+
+        if message_thread_id is None:
+            return None  # имитируем TOPIC_CLOSED для General
+
+        SENT.append({"chat_id": chat_id, "text": text, "thread_id": message_thread_id})
+        return {"message_id": 1}
+
+    tg.send_message = flaky
+
+    try:
+        SENT.clear()
+        result = bot._send(-500, "привет")
+    finally:
+        tg.send_message = original_send
+        bot.ALLOWED_CHAT_IDS = original_allowed
+        reset_topics()
+
+    check("fallback: первая попытка была в General", calls and calls[0] is None, calls)
+    check("fallback: повтор в отслеживаемый топик", calls and calls[-1] == 555, calls)
+    check(
+        "fallback: ответ доставлен",
+        result is not None and len(SENT) == 1 and SENT[0]["thread_id"] == 555,
+        (result, SENT),
+    )
+
+
+def test_send_fallback_guarded_by_allow_list():
+    """Без чата в белом списке ответ не должен улетать в группу."""
+    reset_topics(topic_id=555)
+
+    original_allowed = bot.ALLOWED_CHAT_IDS
+    original_send = tg.send_message
+    bot.ALLOWED_CHAT_IDS = {999}
+
+    calls = []
+
+    def always_fail(chat_id, text, reply_to_message_id=None, disable_notification=False, message_thread_id=None):
+        calls.append(message_thread_id)
+        return None
+
+    tg.send_message = always_fail
+
+    try:
+        result = bot._send(-500, "привет")
+    finally:
+        tg.send_message = original_send
+        bot.ALLOWED_CHAT_IDS = original_allowed
+        reset_topics()
+
+    check(
+        "fallback: чужие чаты не получают ответ в группу",
+        result is None and calls == [None],
+        calls,
+    )
+
+
 def test_allow_list_bootstrap_commands():
     """Вне белого списка чатов /id и /help всё равно отвечают."""
     reset_topics()
@@ -909,6 +1059,12 @@ def main():
         test_topic_filter_by_id,
         test_topic_filter_by_name,
         test_commands_work_in_any_topic,
+        test_command_normalization,
+        test_alias_req_registers,
+        test_unknown_command_suggests,
+        test_cyrillic_layout_command_works,
+        test_send_fallback_to_monitored_topic,
+        test_send_fallback_guarded_by_allow_list,
         test_allow_list_bootstrap_commands,
         test_topic_not_configured,
     ]

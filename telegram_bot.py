@@ -17,6 +17,7 @@ error_parser.py / shift.py / sendToDataBase.py без изменений.
 
 from __future__ import annotations
 
+import difflib
 import os
 import threading
 import time
@@ -135,6 +136,47 @@ WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
+
+# Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
+KNOWN_COMMANDS = ("reg", "unreg", "whoami", "stats", "id", "help", "start")
+
+# Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
+# Переводим символы ЙЦУКЕН в QWERTY, чтобы команда распозналась.
+RU_LAYOUT = str.maketrans({
+    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y",
+    "г": "u", "ш": "i", "щ": "o", "з": "p", "х": "[", "ъ": "]",
+    "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g", "р": "h",
+    "о": "j", "л": "k", "д": "l", "ж": ";", "э": "'",
+    "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b", "т": "n",
+    "ь": "m", "б": ",", "ю": ".",
+})
+
+
+# Псевдонимы для безопасных команд: люди регулярно пишут /req вместо /reg.
+# Для удаляющей /unreg псевдонимов намеренно нет.
+COMMAND_ALIASES = {
+    "req": "reg",
+    "regs": "reg",
+    "register": "reg",
+    "stat": "stats",
+}
+
+
+def normalize_command(command: str) -> str:
+    """Латиница + нижний регистр + раскладка + псевдонимы."""
+    if not command:
+        return command
+
+    normalized = command.strip().lower().translate(RU_LAYOUT)
+
+    return COMMAND_ALIASES.get(normalized, normalized)
+
+
+def suggest_command(command: str):
+    """Ближайшая известная команда или None."""
+    matches = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
+
+    return matches[0] if matches else None
 
 _SEEN_LIMIT = 2000
 _seen_lock = threading.Lock()
@@ -373,17 +415,46 @@ def _send(chat_id, text, reply_to_message_id=None, thread_id=None, disable_notif
     """
     Отправка с автоопределением топика: ответ уходит в тот же топик,
     откуда пришло сообщение (для форум-групп).
+
+    Если в этот топик отправить нельзя (например, General закрыт —
+    Telegram отвечает TOPIC_CLOSED), повторяем в отслеживаемый топик,
+    чтобы пользователь всё-таки увидел ответ.
     """
     if thread_id is None:
         thread_id = _routes.get(_chat_key(chat_id))
 
-    return tg.send_message(
+    result = tg.send_message(
         chat_id,
         text,
         reply_to_message_id=reply_to_message_id,
         disable_notification=disable_notification,
         message_thread_id=thread_id,
     )
+
+    if result is not None:
+        return result
+
+    fallback = TELEGRAM_TOPIC_ID
+
+    if (
+        fallback is not None
+        and _chat_key(chat_id) in ALLOWED_CHAT_IDS
+        and (thread_id is None or int(thread_id) != int(fallback))
+    ):
+        logger.warning(
+            "Ответ в топик %s не ушёл — повторяю в отслеживаемый топик %s",
+            thread_id,
+            fallback,
+        )
+
+        return tg.send_message(
+            chat_id,
+            text,
+            disable_notification=disable_notification,
+            message_thread_id=fallback,
+        )
+
+    return None
 
 
 def _send_action(chat_id, action="typing"):
@@ -901,21 +972,42 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             # Команда адресована другому боту в группе.
             return
 
+        normalized = normalize_command(command)
+
+        if normalized != command:
+            logger.info(
+                "Команда /%s распознана как /%s (раскладка клавиатуры)",
+                command,
+                normalized,
+            )
+
         _show_console_message(
             chat,
             sender,
             "command",
-            extra_rows=[("⚙️ Команда", text)],
+            extra_rows=[
+                ("⚙️ Команда", text),
+                ("🔤 Распознано", f"/{normalized}"),
+            ],
         )
 
-        if _handle_command(chat_id, sender, command, args, message_id, chat):
+        if _handle_command(chat_id, sender, normalized, args, message_id, chat):
             return
 
-        _send(
-            chat_id,
-            f"Unknown command: /{command}\n\n{HELP_TEXT}",
-            reply_to_message_id=message_id,
-        )
+        suggestion = suggest_command(normalized)
+
+        if suggestion:
+            hint = (
+                f"🤔 Unknown command: /{command}\n"
+                f"Did you mean /{suggestion}?"
+            )
+        else:
+            hint = (
+                f"🤔 Unknown command: /{command}\n"
+                "Send /help to see the available commands."
+            )
+
+        _send(chat_id, hint, reply_to_message_id=message_id)
         return
 
     parsed = parse_error_message(text)
