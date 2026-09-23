@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import signal
 import threading
 import time
 from collections import OrderedDict
@@ -1552,7 +1553,8 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
             )
             return
 
-        updates = tg.get_updates(offset=offset, timeout=30)
+        # Таймаут меньше TTL лиза: цикл успевает продлить лиз с запасом.
+        updates = tg.get_updates(offset=offset, timeout=20)
 
         if updates is None:
             # Ошибка сети/токена — пауза и повтор.
@@ -1602,7 +1604,29 @@ def start_polling_and_reports(holder: str, lease_mode: str = None):
     start_polling(holder)
 
 
-def standby_loop(holder: str, interval: int = 60):
+def install_shutdown_handler(holder: str):
+    """
+    На SIGTERM/SIGINT отпускаем лиз, чтобы после деплоя новый контейнер
+    начал опрашивать Telegram сразу, а не ждал истечения лиза.
+    """
+    def handler(signum, _frame):
+        logger.info("Сигнал %s — отпускаю лиз опроса и завершаюсь", signum)
+
+        try:
+            bot_lease.release(holder)
+        except Exception:
+            logger.exception("Не удалось отпустить лиз при завершении")
+
+        os._exit(0)
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+
+        if sig is not None:
+            signal.signal(sig, handler)
+
+
+def standby_loop(holder: str, interval: int = 10):
     """
     Ждём, когда лиз освободится, и тогда становимся опрашивающим.
 
@@ -1749,6 +1773,8 @@ def main():
     global LEASE_STATUS
     holder = bot_lease.holder_id()
     lease = bot_lease.acquire(holder)
+
+    install_shutdown_handler(holder)
 
     if lease["acquired"]:
         LEASE_MODE = lease["status"]

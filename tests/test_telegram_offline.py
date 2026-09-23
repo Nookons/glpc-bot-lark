@@ -12,6 +12,7 @@ Telegram API, Supabase и Lark-хук подменяются заглушкам�
 
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -1953,6 +1954,60 @@ def test_lease_acquire_and_refresh():
     check("lease: чужой лиз продлить нельзя", renewed is False)
 
 
+def test_lease_release_and_shutdown_handler():
+    """Лиз должен отпускаться при остановке — иначе после деплоя пауза."""
+    calls, original = _lease_env(
+        rows=[{"holder": "me-1", "heartbeat_at": _iso()}],
+    )
+
+    original_delete = bot_lease.rest_delete
+    deleted = []
+    bot_lease.rest_delete = lambda table_name, params=None: (
+        deleted.append(params), True
+    )[1]
+
+    try:
+        released = bot_lease.release("me-1")
+    finally:
+        bot_lease.rest_delete = original_delete
+        _lease_restore(original)
+
+    check("lease: лиз отпускается", released is True, released)
+    check(
+        "lease: отпускаем только свой лиз (по holder)",
+        deleted and deleted[0].get("holder") == "eq.me-1",
+        deleted,
+    )
+
+    # Обработчик SIGTERM отпускает лиз.
+    original_release = bot_lease.release
+    released_holders = []
+    bot_lease.release = lambda holder=None: (
+        released_holders.append(holder), True
+    )[1]
+
+    original_exit = os._exit
+    os._exit = lambda code=None: None
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    try:
+        bot.install_shutdown_handler("me-42")
+        handler = signal.getsignal(signal.SIGTERM)
+
+        check("shutdown: обработчик установлен", callable(handler), handler)
+        handler(signal.SIGTERM, None)
+    finally:
+        bot_lease.release = original_release
+        os._exit = original_exit
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+    check(
+        "shutdown: по сигналу лиз отпускается",
+        released_holders and released_holders[-1] == "me-42",
+        released_holders,
+    )
+
+
 def test_lease_held_by_other_and_takeover():
     # Живой чужой лиз не трогаем.
     calls, original = _lease_env(
@@ -2304,6 +2359,7 @@ def main():
         test_missing_robot_is_queued_and_reported,
         test_bot_forwards_missing_robot_to_lark,
         test_lease_acquire_and_refresh,
+        test_lease_release_and_shutdown_handler,
         test_lease_held_by_other_and_takeover,
         test_lease_edge_cases_and_polling_guard,
         test_robot_status_module,

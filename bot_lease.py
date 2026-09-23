@@ -24,7 +24,13 @@ import socket
 
 from datetime import datetime, timedelta, timezone
 
-from sendToDataBase import rest_get, rest_patch, rest_post, table_exists
+from sendToDataBase import (
+    rest_delete,
+    rest_get,
+    rest_patch,
+    rest_post,
+    table_exists,
+)
 from logging_config import setup_logging
 
 
@@ -37,7 +43,9 @@ TABLE = "bot_leases"
 LEASE_NAME = os.environ.get("BOT_LEASE_NAME", "glpc-bot-telegram")
 
 # Через сколько секунд без heartbeat лиз считается брошенным.
-LEASE_TTL_SECONDS = int(os.environ.get("BOT_LEASE_TTL", "120"))
+# Небольшой TTL нужен, чтобы после деплоя новый контейнер быстро подхватил
+# работу, если старый не успел отпустить лиз сам.
+LEASE_TTL_SECONDS = int(os.environ.get("BOT_LEASE_TTL", "60"))
 
 _table_ok = None
 _warned_no_table = False
@@ -117,6 +125,31 @@ def refresh(holder: str = None, ttl: int = None) -> bool:
     )
 
     return bool(updated)
+
+
+def release(holder: str = None) -> bool:
+    """
+    Отпускает лиз — вызывается при аккуратном завершении (деплой, Ctrl+C).
+
+    Тогда новый контейнер подхватывает работу сразу, а не ждёт, пока лиз
+    протухнет.
+    """
+    holder = holder or holder_id()
+
+    if not _has_table():
+        return False
+
+    released = rest_delete(
+        TABLE,
+        params={"name": f"eq.{LEASE_NAME}", "holder": f"eq.{holder}"},
+    )
+
+    if released:
+        logger.info("Лиз опроса отпущен: %s", holder)
+    else:
+        logger.warning("Лиз опроса отпустить не удалось (holder=%s)", holder)
+
+    return released
 
 
 def acquire(holder: str = None, ttl: int = None) -> dict:
