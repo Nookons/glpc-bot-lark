@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 
 import requests
 
@@ -36,6 +37,22 @@ SIGNED_URL_TTL = int(os.environ.get("SUPABASE_SIGNED_URL_TTL", "31536000"))
 
 # Кэш созданных bucket'ов: {имя: bool}
 _buckets_ok = {}
+
+# Короткие ссылки: https://<наш домен>/p/<файл> вместо длинного signed URL.
+PHOTO_LINK_BASE = os.environ.get(
+    "PHOTO_LINK_BASE",
+    "https://glpc-bot-lark-production.up.railway.app",
+).rstrip("/")
+
+# true — отдавать публичные ссылки Supabase (bucket становится публичным),
+# false — короткая ссылка на наш /p/<файл> (bucket остаётся приватным).
+PUBLIC_PHOTO_URLS = os.environ.get(
+    "PUBLIC_PHOTO_URLS",
+    "false",
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Кэш подписанных ссылок: файл -> (url, годен до).
+_signed_cache = {}
 
 
 def _safe_object_name(name: str) -> str:
@@ -80,7 +97,7 @@ def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
 
 def ensure_bucket() -> bool:
     """Bucket для фото."""
-    return ensure_bucket_named(BUCKET, BUCKET_PUBLIC)
+    return ensure_bucket_named(BUCKET, BUCKET_PUBLIC or PUBLIC_PHOTO_URLS)
 
 
 def upload_json(bucket: str, name: str, payload: dict) -> bool:
@@ -242,18 +259,48 @@ def create_signed_url(object_name: str, expires_in: int = None):
     return f"{SUPABASE_URL}/storage/v1{signed}"
 
 
+def short_photo_url(object_name: str) -> str:
+    """Короткая ссылка на фото: <наш домен>/p/<файл>."""
+    return f"{PHOTO_LINK_BASE}/p/{object_name}"
+
+
+def resolve_photo_url(object_name: str):
+    """
+    Ссылка, на которую ведёт короткий адрес: подписанный URL Supabase.
+
+    Подписанные ссылки кэшируются на час, чтобы клик по короткой ссылке
+    не дёргал Supabase каждый раз.
+    """
+    cached = _signed_cache.get(object_name)
+
+    if cached and cached[1] > time.time():
+        return cached[0]
+
+    url = create_signed_url(object_name)
+
+    if url:
+        _signed_cache[object_name] = (url, time.time() + 3600)
+
+    return url
+
+
+def photo_url_for_object(object_name: str):
+    """Ссылка для показа пользователю: публичная или короткая."""
+    if PUBLIC_PHOTO_URLS:
+        return public_url(object_name)
+
+    return short_photo_url(object_name)
+
+
 def upload_photo_and_get_url(local_path: str, object_name: str = None):
     """
-    Загружает фото и возвращает ссылку для Lark-группы.
+    Загружает фото и возвращает короткую ссылку для Lark-группы.
 
-    Публичный bucket -> постоянная ссылка, приватный -> signed URL.
+    При включённом PUBLIC_PHOTO_URLS — публичную ссылку Supabase.
     """
     uploaded = upload_file(local_path, object_name)
 
     if not uploaded:
         return None
 
-    if BUCKET_PUBLIC:
-        return public_url(uploaded)
-
-    return create_signed_url(uploaded)
+    return photo_url_for_object(uploaded)

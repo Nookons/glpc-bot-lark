@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import signal
 import threading
 import time
@@ -26,7 +27,7 @@ from collections import OrderedDict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -43,7 +44,12 @@ from pending_photos import (
     send_error_with_photo,
     send_photo,
 )
-from supabase_storage import download_json, upload_json, upload_photo_and_get_url
+from supabase_storage import (
+    download_json,
+    resolve_photo_url,
+    upload_json,
+    upload_photo_and_get_url,
+)
 import robot_status
 from sendToDataBase import (
     WAREHOUSE,
@@ -185,6 +191,10 @@ PHOTO_ATTACH_WINDOW = _env_int("PHOTO_ATTACH_WINDOW", 600)
 
 # Сколько держим фото, ожидая текст ошибки, прежде чем переслать отдельно.
 PHOTO_HOLD_SECONDS = _env_int("PHOTO_HOLD_SECONDS", 90)
+
+# Объединять ли фото с записью об ошибке (привязка, ожидание текста,
+# photo_url). По умолчанию выключено: фото просто уходит в группу.
+PHOTO_ATTACH_ENABLED = _env_bool("PHOTO_ATTACH_ENABLED", False)
 
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
@@ -1155,7 +1165,11 @@ def _handle_cancel(chat_id, sender, reply_to):
     if pending:
         _delete_quiet(chat_id, pending.get("prompt_message_id"))
 
-    waiting_photo = take_pending_photo(chat_id, sender.get("id"))
+    waiting_photo = (
+        take_pending_photo(chat_id, sender.get("id"))
+        if PHOTO_ATTACH_ENABLED
+        else None
+    )
 
     if waiting_photo:
         # Фото ждало текст ошибки, но его отменили — пересылаем как есть.
@@ -1328,6 +1342,9 @@ def flush_pending_photo(chat_id, user_id, data):
 
 def flush_expired_photos():
     """Периодическая задача: отдаём фото, которые так и не дождались текста."""
+    if not PHOTO_ATTACH_ENABLED:
+        return
+
     for (chat_id, user_id), data in expired_pending_photos():
         try:
             flush_pending_photo(chat_id, user_id, data)
@@ -1678,7 +1695,14 @@ def save_and_forward_error(
     ]
 
     # Фото, которое ждало текст ошибки (сотрудник прислал фото раньше).
-    waited_photo = take_pending_photo(chat_id, sender.get("id"))
+    waited_photo = (
+        take_pending_photo(chat_id, sender.get("id"))
+        if PHOTO_ATTACH_ENABLED
+        else None
+    )
+
+    if not PHOTO_ATTACH_ENABLED:
+        photo_path = None
 
     if waited_photo and not photo_path:
         photo_path = waited_photo.get("path")
@@ -1802,6 +1826,43 @@ def handle_photo(chat_id, sender, message, message_id):
     caption = (message.get("caption") or "").strip()
     employee_name = get_employee_name(sender.get("id"))
 
+    if not PHOTO_ATTACH_ENABLED:
+        # Привязка выключена: фото просто уходит в группу (как раньше).
+        photo_caption = (
+            f"📷 Photo from {employee_name}"
+            if employee_name
+            else f"📷 Photo from {_sender_title(sender)} (Telegram)"
+        )
+
+        if caption:
+            photo_caption = f"{photo_caption}\n{caption}"
+
+        mode = send_photo(destination, photo_caption, console)
+
+        if mode["mode"] == "none":
+            _send(
+                chat_id,
+                "⚠️ Can't forward the photo to Lark right now (see logs).",
+                reply_to_message_id=message_id,
+                delete_after=CONFIRM_TTL_SECONDS,
+            )
+        elif SEND_CONFIRMATION and mode["mode"] == "lark":
+            _send(
+                chat_id,
+                "✅ Photo forwarded to Lark",
+                reply_to_message_id=message_id,
+                delete_after=CONFIRM_TTL_SECONDS,
+            )
+        elif mode["mode"] == "link":
+            _send(
+                chat_id,
+                "✅ Photo sent to Lark as a link",
+                reply_to_message_id=message_id,
+                delete_after=CONFIRM_TTL_SECONDS,
+            )
+
+        return
+
     # 1) В подписи целиком ошибка — создаём запись вместе с фото.
     parsed = parse_error_message(caption) if caption else None
 
@@ -1813,7 +1874,7 @@ def handle_photo(chat_id, sender, message, message_id):
             parsed,
             message_id,
             employee_name,
-            photo_path=destination,
+            photo_path=destination if PHOTO_ATTACH_ENABLED else None,
         )
         return
 
@@ -2338,6 +2399,32 @@ def health():
     }
 
     return jsonify(payload), (200 if healthy else 503)
+
+
+def is_safe_object_name(name: str) -> bool:
+    """Имя файла из короткой ссылки: без .., только безопасные символы."""
+    return bool(name) and ".." not in name and bool(
+        re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", name)
+    )
+
+
+@app.route("/p/<path:object_name>", methods=["GET"])
+def photo_redirect(object_name):
+    """
+    Короткая ссылка на фото: /p/<файл> -> подписанный URL Supabase.
+
+    Имя файла приходит от Telegram (случайный id), но проверяем его на
+    всякий случай: без .. и посторонних символов.
+    """
+    if not is_safe_object_name(object_name):
+        return jsonify({"error": "bad object name"}), 400
+
+    url = resolve_photo_url(object_name)
+
+    if not url:
+        return jsonify({"error": "not found"}), 404
+
+    return redirect(url, code=302)
 
 
 @app.route("/shift_stats", methods=["GET"])

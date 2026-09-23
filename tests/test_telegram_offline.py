@@ -510,6 +510,9 @@ def test_not_saved_no_forward():
 
 
 def test_photo_with_error_caption_creates_one_record():
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    bot.PHOTO_ATTACH_ENABLED = True
+
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
 
@@ -536,6 +539,7 @@ def test_photo_with_error_caption_creates_one_record():
     finally:
         bot.send_error_with_photo = original_combined
         bot.store_photo_for_record = original_store
+        bot.PHOTO_ATTACH_ENABLED = original_flag
 
     check("photo caption: запись создана", len(DB_CALLS) == 1, DB_CALLS)
     check(
@@ -561,6 +565,9 @@ def test_photo_with_error_caption_creates_one_record():
 
 
 def test_photo_waits_for_text_then_combines():
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    bot.PHOTO_ATTACH_ENABLED = True
+
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
 
@@ -598,6 +605,7 @@ def test_photo_waits_for_text_then_combines():
     finally:
         bot.send_error_with_photo = original_combined
         bot.store_photo_for_record = original_store
+        bot.PHOTO_ATTACH_ENABLED = original_flag
 
         with bot._photo_lock:
             bot._pending_photo.clear()
@@ -617,6 +625,9 @@ def test_photo_waits_for_text_then_combines():
 
 
 def test_photo_attaches_to_recent_error():
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    bot.PHOTO_ATTACH_ENABLED = True
+
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
 
@@ -650,6 +661,7 @@ def test_photo_attaches_to_recent_error():
     finally:
         bot.send_photo = original_send
         bot.set_exception_photo = original_set
+        bot.PHOTO_ATTACH_ENABLED = original_flag
 
         with bot._photo_lock:
             bot._pending_photo.clear()
@@ -669,6 +681,88 @@ def test_photo_attaches_to_recent_error():
     check(
         "photo after: подтверждение о прикреплении",
         sent and "attached" in sent[0]["text"],
+        sent,
+    )
+
+
+def test_short_photo_link_and_redirect():
+    from supabase_storage import PHOTO_LINK_BASE, short_photo_url
+
+    name = "tg_AQADox9rGxg5oEl-.jpg"
+    link = short_photo_url(name)
+
+    check(
+        "short link: короткий адрес на нашем домене",
+        link == f"{PHOTO_LINK_BASE}/p/{name}",
+        link,
+    )
+    check("short link: заметно короче signed url", len(link) < 100, len(link))
+    check(
+        "short link: имя файла проверяется",
+        bot.is_safe_object_name(name) is True
+        and bot.is_safe_object_name("../../etc/passwd") is False
+        and bot.is_safe_object_name("bad name!.jpg") is False,
+    )
+
+    original = bot.resolve_photo_url
+    bot.resolve_photo_url = lambda object_name: (
+        "https://supabase.example/signed?token=abc"
+        if object_name == name
+        else None
+    )
+
+    client = bot.app.test_client()
+
+    try:
+        found = client.get(f"/p/{name}")
+        missing = client.get("/p/unknown-file.jpg")
+        bad = client.get("/p/bad%20name!.jpg")
+    finally:
+        bot.resolve_photo_url = original
+
+    check(
+        "short link: редирект на подписанный URL",
+        found.status_code == 302
+        and "supabase" in found.headers.get("Location", ""),
+        (found.status_code, found.headers.get("Location")),
+    )
+    check("short link: неизвестный файл -> 404", missing.status_code == 404, missing.status_code)
+    check("short link: опасное имя -> 400", bad.status_code == 400, bad.status_code)
+
+
+def test_photo_forwarded_when_attachment_disabled():
+    """При выключенной привязке фото просто уходит в группу, как раньше."""
+    LINKS[100] = "Ivan Petrenko"
+
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_send = bot.send_photo
+
+    calls = []
+    bot.PHOTO_ATTACH_ENABLED = False
+    bot.send_photo = lambda path, caption=None, console=None: (
+        calls.append(caption), {"mode": "link", "url": "https://x/p/1"}
+    )[1]
+
+    try:
+        sent = run(make_update(photo=True, caption="Общий план робота", thread_id=2))
+    finally:
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.send_photo = original_send
+
+    check(
+        "photo off: фото уходит сразу с именем сотрудника",
+        calls and "Photo from Ivan Petrenko" in calls[0],
+        calls,
+    )
+    check(
+        "photo off: подпись сотрудника сохраняется",
+        calls and "Общий план робота" in calls[0],
+        calls,
+    )
+    check("photo off: запись об ошибке не создаётся", DB_CALLS == [], DB_CALLS)
+    check(
+        "photo off: подтверждение про ссылку",
+        sent and "as a link" in sent[0]["text"],
         sent,
     )
 
@@ -2998,6 +3092,8 @@ def main():
         test_threshold_alert,
         test_bad_format,
         test_not_saved_no_forward,
+        test_short_photo_link_and_redirect,
+        test_photo_forwarded_when_attachment_disabled,
         test_photo_with_error_caption_creates_one_record,
         test_photo_waits_for_text_then_combines,
         test_photo_attaches_to_recent_error,
