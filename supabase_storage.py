@@ -234,6 +234,11 @@ def create_signed_url(object_name: str, expires_in: int = None):
         return None
 
     if response.status_code not in (200, 201):
+        # Отсутствующий объект (старая или битая ссылка) — не ошибка сервиса.
+        if response.status_code in (400, 404) and "not_found" in response.text:
+            logger.info("Storage: файла %s нет (ссылка устарела?)", object_name)
+            return None
+
         logger.error(
             "Storage: sign %s -> HTTP %s %s",
             object_name,
