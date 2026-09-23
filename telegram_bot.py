@@ -1185,6 +1185,30 @@ def handle_error_text(chat_id, sender, text, message_id):
     # не найдены (через notifier, т.е. в Telegram).
     saved = send_to_data_base(parsed, data_obj, chat_id)
 
+    if isinstance(saved, dict) and saved.get("robot_missing"):
+        # Робота нет в списке склада: в базу писать нечего, но ошибку
+        # всё равно отправляем в Lark с пометкой — иначе смена её не увидит.
+        pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
+
+        forward_error(parsed, [
+            ("👤 Employee", employee_name),
+            ("🤖 Robot", f"{parsed['robot']} (not in the system)"),
+            ("⚠️ Time", pretty),
+            ("📝 Details", parsed["error_text"]),
+            (
+                "📌 Note",
+                "Robot is missing from robots_maintenance_list — "
+                "queued to be added, issue NOT saved to the database",
+            ),
+        ])
+
+        logger.warning(
+            "Робот %s не найден в системе — ошибка переслана в Lark "
+            "без записи в базу",
+            parsed["robot"],
+        )
+        return
+
     if not saved:
         logger.warning(
             "Exception not saved, skip forwarding: robot=%s",

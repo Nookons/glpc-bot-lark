@@ -617,12 +617,18 @@ def send_to_data_base(
 
         notify_user(
             chat_id,
-            f"⚠️ Robot #{table_lines['robot']} not found. "
-            "The issue was not saved. "
-            "Please check the robot number.",
+            f"⚠️ Robot #{table_lines['robot']} is not in the system.\n"
+            "The issue was forwarded to Lark, "
+            "the robot is queued to be added.",
         )
 
-        return None
+        # Возвращаем маркер: запись в базу невозможна (нет робота), но
+        # вызывающий код всё равно перешлёт ошибку в Lark-группу, чтобы
+        # смена её увидела, а не потеряла.
+        return {
+            "robot_missing": True,
+            "robot": str(table_lines["robot"]),
+        }
 
     robot = robot_data[0]
 

@@ -1764,6 +1764,141 @@ def _iso(seconds_ago=0):
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def test_missing_robot_is_queued_and_reported():
+    """send_to_data_base: нет робота -> в очередь на добавление + маркер для Lark."""
+    import sendToDataBase as stdb
+
+    template = {
+        "employee_title": "Security module failure",
+        "id": 122,
+        "solving_time": 6,
+        "issue_sub_type": "sub",
+        "issue_description": "desc",
+        "issue_type": "Unable to drive",
+        "recovery_title": "recovery",
+    }
+
+    parsed = {
+        "error_type": "Unable to drive",
+        "robot": "3884",
+        "error_text": "Security module failure",
+    }
+
+    original_get = stdb._rest_get
+    original_post = stdb._rest_post
+    original_notify = stdb.notify_user
+
+    posted, notified = [], []
+
+    def fake_get(table, params=None):
+        if table == "issue_templates":
+            return [template]
+        if table == "employees":
+            return [{
+                "card_id": 60072001,
+                "user_name": "Ivan Petrenko",
+                "home_warehouse": "GLP-C",
+            }]
+        if table == "robots_maintenance_list":
+            return []
+        return []
+
+    stdb._rest_get = fake_get
+    stdb._rest_post = lambda table, payload: (posted.append((table, payload)), [{}])[1]
+    stdb.notify_user = lambda chat_id, text: notified.append(text)
+
+    try:
+        result = stdb.send_to_data_base(
+            parsed,
+            {"employee": "Ivan Petrenko", "robot": "3884",
+             "error_text": "Security module failure"},
+            -500,
+        )
+    finally:
+        stdb._rest_get = original_get
+        stdb._rest_post = original_post
+        stdb.notify_user = original_notify
+
+    check(
+        "robot missing: возвращается маркер для пересылки в Lark",
+        isinstance(result, dict)
+        and result.get("robot_missing") is True
+        and result.get("robot") == "3884",
+        result,
+    )
+    check(
+        "robot missing: робот поставлен в очередь добавления",
+        posted and posted[0][0] == "robots_to_add"
+        and posted[0][1]["robot_number"] == "3884",
+        posted,
+    )
+    check(
+        "robot missing: сотруднику сказано, что ошибка ушла в Lark",
+        notified and "Lark" in notified[0],
+        notified,
+    )
+    check(
+        "robot missing: в базу исключений ничего не пишем",
+        all(table != "exceptions" for table, _payload in posted),
+        posted,
+    )
+
+
+def test_bot_forwards_missing_robot_to_lark():
+    """Бот должен переслать в Lark ошибку по роботу, которого нет в системе."""
+    LINKS[100] = "Ivan Petrenko"
+
+    original_save = bot.send_to_data_base
+    original_count = bot.count_robot_errors_in_shift
+
+    counted = []
+
+    bot.send_to_data_base = lambda parsed, data_obj, chat_id: {
+        "robot_missing": True,
+        "robot": parsed["robot"],
+    }
+    bot.count_robot_errors_in_shift = lambda *args, **kwargs: counted.append(args) or 0
+
+    try:
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3884",
+            thread_id=2,
+        ))
+    finally:
+        bot.send_to_data_base = original_save
+        bot.count_robot_errors_in_shift = original_count
+
+    lines = FORWARDED[-1]["lines"] if FORWARDED else []
+    flat = " ".join(f"{label}: {value}" for label, value in lines)
+
+    check(
+        "robot missing: карточка всё равно ушла в Lark",
+        len(FORWARDED) == 1 and "not in the system" in flat,
+        FORWARDED,
+    )
+    check(
+        "robot missing: в карточке есть автор, время и детали",
+        "Ivan Petrenko" in flat and "Security module failure" in flat
+        and "Time" in flat,
+        flat,
+    )
+    check(
+        "robot missing: помечено, что в базу не сохраняли",
+        "NOT saved to the database" in flat,
+        flat,
+    )
+    check(
+        "robot missing: счётчик смены не запрашивается",
+        counted == [],
+        counted,
+    )
+    check(
+        "robot missing: нет подтверждения о сохранении",
+        not any("Saved" in item["text"] for item in sent),
+        sent,
+    )
+
+
 def test_lease_acquire_and_refresh():
     # Свободный лиз занимаем вставкой строки.
     calls, original = _lease_env(rows=[], post_result=[{"name": "glpc-bot-telegram"}])
@@ -2164,6 +2299,8 @@ def main():
         test_send_fallback_guarded_by_allow_list,
         test_stats_command_matches_report,
         test_self_deleting_confirmations,
+        test_missing_robot_is_queued_and_reported,
+        test_bot_forwards_missing_robot_to_lark,
         test_lease_acquire_and_refresh,
         test_lease_held_by_other_and_takeover,
         test_lease_edge_cases_and_polling_guard,
