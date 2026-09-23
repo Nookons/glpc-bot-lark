@@ -3824,7 +3824,10 @@ def test_bucket_public_flag_updates_existing_bucket():
             self.text = text
 
         def json(self):
-            return {}
+            try:
+                return json.loads(self.text or "{}")
+            except ValueError:
+                return {}
 
     calls = {"post": [], "put": []}
     original_post = storage.requests.post
@@ -3832,7 +3835,13 @@ def test_bucket_public_flag_updates_existing_bucket():
 
     def fake_post(url, **kwargs):
         calls["post"].append((url, kwargs.get("json")))
-        return FakeResponse(409, '{"error":"BucketAlreadyExists"}')
+        # Именно так отвечает боевой Supabase: HTTP 400, а «409» — в теле.
+        return FakeResponse(
+            400,
+            '{"statusCode":"409","error":"Duplicate",'
+            '"message":"The resource already exists",'
+            '"code":"BucketAlreadyExists"}',
+        )
 
     def fake_put(url, **kwargs):
         calls["put"].append((url, kwargs.get("json")))
@@ -3867,6 +3876,20 @@ def test_bucket_public_flag_updates_existing_bucket():
         private_ok is True and len(calls["put"]) == 1,
         calls["put"],
     )
+
+    # Настоящая ошибка запроса существующим bucket не считается
+    storage._buckets_ok.clear()
+    storage.requests.post = lambda url, **kwargs: FakeResponse(
+        400, '{"error":"Invalid bucket name"}'
+    )
+
+    try:
+        real_error = storage.ensure_bucket_named("bot-photos", public=False)
+    finally:
+        storage.requests.post = fake_post
+        storage._buckets_ok.clear()
+
+    check("bucket M2: настоящая 400 — это ошибка", real_error is False, real_error)
 
 
 def test_table_probe_and_lease_error_caching():

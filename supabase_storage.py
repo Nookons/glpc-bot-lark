@@ -89,13 +89,43 @@ def _safe_object_name(name: str) -> str:
     return base or "photo.jpg"
 
 
+def _bucket_already_exists(response) -> bool:
+    """
+    Отличает «bucket уже существует» от настоящей ошибки запроса.
+
+    Разные версии Supabase Storage отвечают на существующий bucket по-разному:
+    HTTP 409 либо HTTP 400 с телом
+    {"statusCode":"409","code":"BucketAlreadyExists"}. Второй вариант важно
+    распознать: иначе создание считается неудачным, и ВСЯ работа с bucket
+    (offset, маркеры отчётов, фото) молча ломается после рестарта.
+    """
+    if response.status_code == 409:
+        return True
+
+    if response.status_code != 400:
+        return False
+
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+
+    if not isinstance(body, dict):
+        return False
+
+    if body.get("code") == "BucketAlreadyExists":
+        return True
+
+    return str(body.get("statusCode")) == "409"
+
+
 def _set_bucket_public(bucket: str) -> bool:
     """
     Делает существующий bucket публичным.
 
-    POST /storage/v1/bucket на существующий bucket отвечает 409 и видимость
-    НЕ меняет, поэтому при PUBLIC_PHOTO_URLS=true нужен явный PUT — иначе
-    ссылки public/... отдают 403, а бот считает, что фото доставлено.
+    POST /storage/v1/bucket на существующий bucket видимость НЕ меняет,
+    поэтому при PUBLIC_PHOTO_URLS=true нужен явный PUT — иначе ссылки
+    public/... отдают 403, а бот считает, что фото доставлено.
     """
     url = f"{SUPABASE_URL}/storage/v1/bucket/{bucket}"
 
@@ -148,9 +178,9 @@ def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
         _buckets_ok[bucket] = True
         return True
 
-    # 409 — bucket уже существует. POST видимость не меняет: если нужен
-    # публичный доступ, переводим bucket в public явно.
-    if response.status_code == 409:
+    # Bucket уже существует (409 либо 400 + BucketAlreadyExists). POST
+    # видимость не меняет: если нужен публичный доступ, переводим явно.
+    if _bucket_already_exists(response):
         if public and not _set_bucket_public(bucket):
             return False
 
