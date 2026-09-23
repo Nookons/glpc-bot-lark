@@ -302,12 +302,13 @@ def supabase_headers() -> dict:
     return _headers()
 
 
-def table_exists(table: str) -> bool:
+def table_probe(table: str) -> str:
     """
-    True, если таблица доступна через PostgREST.
+    Состояние таблицы: "ok" | "missing" | "error".
 
-    Нужно, чтобы бот мог работать до применения SQL-миграции
-    (в этом случае привязки Telegram хранятся в Storage).
+    "error" — сеть или 5xx: это НЕ значит, что таблицы нет. Вызывающий код
+    не должен надолго кэшировать такой ответ (иначе сетевой blip выключит
+    защиту от двойного запуска на несколько минут).
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
@@ -320,10 +321,18 @@ def table_exists(table: str) -> bool:
         )
     except requests.exceptions.RequestException as e:
         logger.error("Probe %s failed: %s", table, e)
-        return False
+        return "error"
 
     if response.status_code == 200:
-        return True
+        return "ok"
+
+    if response.status_code >= 500 or response.status_code == 429:
+        logger.error(
+            "Probe %s -> HTTP %s (сервис недоступен)",
+            table,
+            response.status_code,
+        )
+        return "error"
 
     logger.info(
         "Probe %s -> HTTP %s (%s)",
@@ -332,7 +341,17 @@ def table_exists(table: str) -> bool:
         response.text[:120],
     )
 
-    return False
+    return "missing"
+
+
+def table_exists(table: str) -> bool:
+    """
+    True, если таблица доступна через PostgREST.
+
+    Нужно, чтобы бот мог работать до применения SQL-миграции
+    (в этом случае привязки Telegram хранятся в Storage).
+    """
+    return table_probe(table) == "ok"
 
 
 def rest_patch(table: str, params: dict, payload: dict):

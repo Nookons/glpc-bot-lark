@@ -28,6 +28,12 @@ os.environ["TELEGRAM_TOPIC_ID"] = ""
 os.environ["TELEGRAM_TOPIC_NAME"] = ""
 os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
+# load_dotenv() не перезаписывает уже заданные переменные, поэтому здесь
+# подставляем заведомо нерабочие значения: если какой-то вызов забудут
+# заглушить, тест упадёт, а не постучится в боевую базу из .env.
+os.environ["SUPABASE_URL"] = "http://supabase.invalid"
+os.environ["SUPABASE_SERVICE_KEY"] = "offline-test-key"
+
 import telegram_api as tg  # noqa: E402
 
 # Настоящая send_message нужна для проверки обрезки текста:
@@ -94,6 +100,7 @@ def fake_send_message(
         "text": text,
         "thread_id": message_thread_id,
         "reply_markup": reply_markup,
+        "reply_to": reply_to_message_id,
         "message_id": len(SENT) + 1,
     })
     return {"message_id": len(SENT)}
@@ -971,7 +978,7 @@ def test_short_photo_link_and_redirect():
     )
 
     original = bot.resolve_photo_url
-    bot.resolve_photo_url = lambda object_name: (
+    bot.resolve_photo_url = lambda object_name, strict=False: (
         "https://supabase.example/signed?token=abc"
         if object_name == name
         else None
@@ -2311,16 +2318,19 @@ def _lease_env(rows=None, post_result=None, patch_result=None, table=True):
     calls = {"get": [], "post": [], "patch": []}
 
     original = (
-        bot_lease.table_exists,
+        bot_lease.table_probe,
         bot_lease.rest_get,
         bot_lease.rest_post,
         bot_lease.rest_patch,
     )
 
     bot_lease._table_ok = None
+    bot_lease._table_checked_at = 0.0
     bot_lease._warned_no_table = False
 
-    bot_lease.table_exists = lambda table_name: table
+    bot_lease.table_probe = lambda table_name: (
+        "ok" if table else "missing"
+    )
     bot_lease.rest_get = lambda table_name, params=None: (
         calls["get"].append(params), rows
     )[1]
@@ -2336,7 +2346,7 @@ def _lease_env(rows=None, post_result=None, patch_result=None, table=True):
 
 def _lease_restore(original):
     (
-        bot_lease.table_exists,
+        bot_lease.table_probe,
         bot_lease.rest_get,
         bot_lease.rest_post,
         bot_lease.rest_patch,
@@ -3532,6 +3542,486 @@ def test_report_send_fallback():
         sr.upload_json = original_marker_put
 
 
+# ============================================================
+# ПРАВКИ ПО РЕЗУЛЬТАТАМ АУДИТА (M/L/T)
+# ============================================================
+
+def test_offset_saved_for_every_confirmed_update():
+    """M7: offset пишется после каждого апдейта, а не только в конце батча."""
+    stop = threading.Event()
+    saved = []
+    handled = []
+    first = make_update(text="/help", message_id=7001)
+    second = make_update(text="/help", message_id=7002)
+    batches = [[first, second]]
+
+    def fake_get_updates(offset=None, timeout=30):
+        if batches:
+            return batches.pop(0)
+
+        stop.set()
+        return []
+
+    original = (
+        tg.get_updates,
+        bot.save_offset,
+        bot.load_saved_offset,
+        bot.handle_update,
+    )
+
+    tg.get_updates = fake_get_updates
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+    bot.load_saved_offset = lambda: None
+    bot.handle_update = lambda update, username: handled.append(update["update_id"])
+
+    try:
+        bot.polling_loop(stop, None)
+    finally:
+        (
+            tg.get_updates,
+            bot.save_offset,
+            bot.load_saved_offset,
+            bot.handle_update,
+        ) = original
+
+    check(
+        "offset M7: оба апдейта батча подтверждены и сохранены",
+        saved == [first["update_id"] + 1, second["update_id"] + 1],
+        saved,
+    )
+
+
+def test_failed_update_never_confirms_offset():
+    """M7: упавший апдейт не подтверждаем — Telegram пришлёт его снова."""
+    stop = threading.Event()
+    saved = []
+    update = make_update(text="/help", message_id=7003)
+    batches = [[update]]
+
+    def fake_get_updates(offset=None, timeout=30):
+        if batches:
+            return batches.pop(0)
+
+        stop.set()
+        return []
+
+    def boom(update, username):
+        raise RuntimeError("handler failed")
+
+    original = (
+        tg.get_updates,
+        bot.save_offset,
+        bot.load_saved_offset,
+        bot.handle_update,
+    )
+
+    tg.get_updates = fake_get_updates
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+    bot.load_saved_offset = lambda: None
+    bot.handle_update = boom
+
+    try:
+        bot.polling_loop(stop, None)
+    finally:
+        (
+            tg.get_updates,
+            bot.save_offset,
+            bot.load_saved_offset,
+            bot.handle_update,
+        ) = original
+
+    check("offset M7: упавший апдейт не подтверждён", saved == [], saved)
+
+
+def test_status_note_kept_when_db_write_fails():
+    """M6: при ошибке записи причина сотрудника остаётся в чате."""
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    sender = {"id": 100, "username": "tester", "first_name": "Tester"}
+    pending = {
+        "direction": "offline",
+        "robot_number": "3783",
+        "type_problem": "Other",
+        "prompt_message_id": 555,
+    }
+
+    original = (
+        robot_status.change_robot_status,
+        bot.send_card_via_hook,
+        bot.DELETE_USER_MESSAGES,
+    )
+
+    bot.DELETE_USER_MESSAGES = True
+    bot.send_card_via_hook = lambda url, card: {"code": 0, "msg": "success"}
+    DELETED.clear()
+
+    chat = {"id": -500, "type": "supergroup"}
+
+    try:
+        robot_status.change_robot_status = lambda *a, **k: None
+        bot.set_pending_status(-500, 100, dict(pending))
+        bot._handle_text_message(-500, sender, "сломан ролик", 7201, chat)
+
+        check(
+            "status M6: текст сотрудника не удалён",
+            (-500, 7201) not in DELETED,
+            DELETED,
+        )
+        check(
+            "status M6: флоу не потерян, причину можно повторить",
+            bot.peek_pending_status(-500, 100) is not None,
+        )
+
+        robot_status.change_robot_status = lambda *a, **k: {
+            "robot": ROBOTS["3783"],
+            "old_status": robot_status.ONLINE,
+            "new_status": robot_status.OFFLINE,
+            "type_problem": "Other",
+            "problem_note": "сломан ролик",
+            "changed_at": "2026-03-08T10:00:00+00:00",
+            "history_saved": True,
+        }
+
+        bot.set_pending_status(-500, 100, dict(pending, prompt_message_id=556))
+        bot._handle_text_message(-500, sender, "сломан ролик", 7202, chat)
+
+        check("status M6: при успехе текст удаляем", (-500, 7202) in DELETED, DELETED)
+        check("status M6: флоу закрыт", bot.peek_pending_status(-500, 100) is None)
+    finally:
+        (
+            robot_status.change_robot_status,
+            bot.send_card_via_hook,
+            bot.DELETE_USER_MESSAGES,
+        ) = original
+        ROBOTS.clear()
+
+
+def test_command_replies_do_not_reply_to_deleted_message():
+    """L1: команду бот удаляет, поэтому ответ не должен ссылаться на неё."""
+    LINKS[100] = "Ivan Petrenko"
+    original_flag = bot.DELETE_USER_MESSAGES
+    bot.DELETE_USER_MESSAGES = True
+
+    try:
+        sent = run(make_update(text="/whoami", message_id=7301, thread_id=2))
+    finally:
+        bot.DELETE_USER_MESSAGES = original_flag
+
+    check("commands L1: команда удалена", (-500, 7301) in DELETED, DELETED)
+    check(
+        "commands L1: ответ не привязан к удалённому сообщению",
+        bool(sent) and all(item.get("reply_to") is None for item in sent),
+        sent,
+    )
+
+
+def test_short_link_negative_cache_and_lru():
+    """M3: /p/ не должен бесконечно подписывать несуществующие имена."""
+    import supabase_storage as storage
+
+    calls = []
+    original = storage.create_signed_url
+
+    storage._signed_cache.clear()
+    storage._signed_missing.clear()
+    storage.create_signed_url = lambda object_name, expires_in=None, strict=False: (
+        calls.append(object_name), None
+    )[1]
+
+    try:
+        first = storage.resolve_photo_url("missing-1.jpg")
+        second = storage.resolve_photo_url("missing-1.jpg")
+    finally:
+        storage.create_signed_url = original
+        storage._signed_missing.clear()
+
+    check("short link M3: промах -> None", first is None and second is None, (first, second))
+    check("short link M3: повторный промах берётся из кэша", calls == ["missing-1.jpg"], calls)
+
+    storage._signed_cache.clear()
+
+    for index in range(storage._SIGNED_CACHE_MAX + 20):
+        storage._cache_put(
+            storage._signed_cache,
+            f"file-{index}.jpg",
+            ("https://signed", time.time() + 3600),
+        )
+
+    check(
+        "short link M3: размер кэша ограничен",
+        len(storage._signed_cache) == storage._SIGNED_CACHE_MAX,
+        len(storage._signed_cache),
+    )
+    check(
+        "short link M3: самые старые записи вытеснены",
+        "file-0.jpg" not in storage._signed_cache,
+    )
+
+    storage._signed_cache.clear()
+
+
+def test_short_link_distinguishes_storage_failure():
+    """M3: сбой Storage — это 503, а не «файла нет»."""
+    import supabase_storage as storage
+
+    original_create = storage.create_signed_url
+    original_resolve = bot.resolve_photo_url
+
+    storage._signed_cache.clear()
+    storage._signed_missing.clear()
+
+    def failing_resolve(object_name, strict=False):
+        raise storage.StorageUnavailable("network down")
+
+    def boom(object_name, expires_in=None, strict=False):
+        if strict:
+            raise storage.StorageUnavailable("network down")
+
+        return None
+
+    try:
+        raised = False
+
+        try:
+            storage.resolve_photo_url("photo.jpg", strict=True)
+        except storage.StorageUnavailable:
+            raised = True
+
+        check("short link M3: strict -> StorageUnavailable", raised)
+
+        storage.create_signed_url = boom
+        storage._signed_missing.clear()
+
+        check(
+            "short link M3: без strict сбой -> None",
+            storage.resolve_photo_url("photo.jpg") is None,
+        )
+
+        bot.resolve_photo_url = failing_resolve
+        response = bot.app.test_client().get("/p/photo.jpg")
+
+        check(
+            "short link M3: Storage лежит -> 503",
+            response.status_code == 503,
+            response.status_code,
+        )
+    finally:
+        storage.create_signed_url = original_create
+        bot.resolve_photo_url = original_resolve
+        storage._signed_missing.clear()
+        storage._signed_cache.clear()
+
+
+def test_bucket_public_flag_updates_existing_bucket():
+    """M2: PUBLIC_PHOTO_URLS должен переводить существующий bucket в public."""
+    import supabase_storage as storage
+
+    class FakeResponse:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {}
+
+    calls = {"post": [], "put": []}
+    original_post = storage.requests.post
+    original_put = storage.requests.put
+
+    def fake_post(url, **kwargs):
+        calls["post"].append((url, kwargs.get("json")))
+        return FakeResponse(409, '{"error":"BucketAlreadyExists"}')
+
+    def fake_put(url, **kwargs):
+        calls["put"].append((url, kwargs.get("json")))
+        return FakeResponse(200, "{}")
+
+    storage.requests.post = fake_post
+    storage.requests.put = fake_put
+    storage._buckets_ok.clear()
+
+    try:
+        public_ok = storage.ensure_bucket_named("bot-photos", public=True)
+
+        storage._buckets_ok.clear()
+        private_ok = storage.ensure_bucket_named("bot-photos", public=False)
+    finally:
+        storage.requests.post = original_post
+        storage.requests.put = original_put
+        storage._buckets_ok.clear()
+
+    check(
+        "bucket M2: существующий bucket переводится в public",
+        public_ok is True and len(calls["put"]) == 1,
+        calls,
+    )
+    check(
+        "bucket M2: PUT несёт public=true",
+        bool(calls["put"]) and calls["put"][0][1] == {"public": True},
+        calls["put"],
+    )
+    check(
+        "bucket M2: приватному bucket PUT не нужен",
+        private_ok is True and len(calls["put"]) == 1,
+        calls["put"],
+    )
+
+
+def test_table_probe_and_lease_error_caching():
+    """L6: сетевой сбой — это не «таблицы нет» и он не кэшируется надолго."""
+    import sendToDataBase as stdb
+
+    class FakeResponse:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {}
+
+    original_get = stdb.requests.get
+
+    try:
+        stdb.requests.get = lambda url, **kwargs: FakeResponse(200)
+        ok_state = stdb.table_probe("telegram_users")
+
+        stdb.requests.get = lambda url, **kwargs: FakeResponse(404, "not found")
+        missing_state = stdb.table_probe("telegram_users")
+
+        stdb.requests.get = lambda url, **kwargs: FakeResponse(503, "unavailable")
+        server_state = stdb.table_probe("telegram_users")
+
+        def boom(url, **kwargs):
+            raise stdb.requests.exceptions.RequestException("no network")
+
+        stdb.requests.get = boom
+        error_state = stdb.table_probe("telegram_users")
+    finally:
+        stdb.requests.get = original_get
+
+    check("probe L6: 200 -> ok", ok_state == "ok", ok_state)
+    check("probe L6: 404 -> missing", missing_state == "missing", missing_state)
+    check("probe L6: 5xx -> error", server_state == "error", server_state)
+    check("probe L6: сеть -> error", error_state == "error", error_state)
+
+    probes = []
+    original_probe = bot_lease.table_probe
+    original_state = (bot_lease._table_ok, bot_lease._table_checked_at)
+
+    bot_lease.table_probe = lambda table: (probes.append(table), "error")[1]
+    bot_lease._table_ok = None
+    bot_lease._table_checked_at = 0.0
+
+    try:
+        bot_lease._has_table()
+        bot_lease._has_table()
+    finally:
+        bot_lease.table_probe = original_probe
+
+    check(
+        "lease L6: сбой проверки не запоминается как «таблицы нет»",
+        bot_lease._table_ok is None,
+        bot_lease._table_ok,
+    )
+    check("lease L6: сбой проверки не кэшируется", probes == ["bot_leases"], probes)
+
+    probes_missing = []
+    bot_lease.table_probe = lambda table: (probes_missing.append(table), "missing")[1]
+    bot_lease._table_ok = None
+    bot_lease._table_checked_at = 0.0
+
+    try:
+        bot_lease._has_table()
+        bot_lease._has_table()
+    finally:
+        bot_lease.table_probe = original_probe
+        bot_lease._table_ok, bot_lease._table_checked_at = original_state
+
+    check(
+        "lease L6: реальное отсутствие таблицы кэшируется",
+        probes_missing == ["bot_leases"],
+        probes_missing,
+    )
+
+
+def test_flush_expired_photos_noop_when_disabled():
+    """T4: с выключенной привязкой фото фоновый flush ничего не делает."""
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_flush = bot.flush_pending_photo
+    calls = []
+    key = (-500, 100)
+
+    bot.PHOTO_ATTACH_ENABLED = False
+    bot.flush_pending_photo = lambda *a, **k: calls.append(a)
+
+    with bot._photo_lock:
+        bot._pending_photo[key] = {
+            "path": "/tmp/x.jpg",
+            "message_id": 1,
+            "expires": time.time() - 10,
+        }
+
+    try:
+        bot.flush_expired_photos()
+
+        with bot._photo_lock:
+            still_there = key in bot._pending_photo
+    finally:
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.flush_pending_photo = original_flush
+
+        with bot._photo_lock:
+            bot._pending_photo.pop(key, None)
+
+    check("photo T4: flush при выключенной привязке — no-op", calls == [], calls)
+    check("photo T4: очередь ожидающих фото не тронута", still_there is True)
+
+
+def test_cache_helpers_are_bounded():
+    """L3: словари-кэши не растут бесконечно."""
+    store = {}
+    flags = set()
+
+    for index in range(bot._CACHE_LIMIT + 5):
+        bot._remember_bounded(store, index, index)
+        bot._remember_flag(flags, index)
+
+    check(
+        "cache L3: словарь ограничен",
+        len(store) == bot._CACHE_LIMIT,
+        len(store),
+    )
+    check(
+        "cache L3: set ограничен",
+        len(flags) == bot._CACHE_LIMIT,
+        len(flags),
+    )
+    check(
+        "cache L3: самые старые записи вытеснены",
+        0 not in store and 0 not in flags,
+        (0 in store, 0 in flags),
+    )
+
+
+def test_user_messages_not_deleted_in_private_chats():
+    """L7: в личной переписке чужие сообщения не удаляем."""
+    original_flag = bot.DELETE_USER_MESSAGES
+    bot.DELETE_USER_MESSAGES = True
+    DELETED.clear()
+
+    bot._set_route(-777, None, "private")
+
+    try:
+        deleted = bot._delete_user_message(-777, 4242)
+    finally:
+        bot.DELETE_USER_MESSAGES = original_flag
+
+    check("private L7: удаление в личке не выполняется", deleted is False, deleted)
+    check("private L7: deleteMessage не вызывался", (-777, 4242) not in DELETED, DELETED)
+
+
 def main():
     tests = [
         test_parse_command,
@@ -3605,7 +4095,31 @@ def main():
         test_report_sent_only_once_per_shift,
         test_allow_list_bootstrap_commands,
         test_topic_not_configured,
+        test_offset_saved_for_every_confirmed_update,
+        test_failed_update_never_confirms_offset,
+        test_status_note_kept_when_db_write_fails,
+        test_command_replies_do_not_reply_to_deleted_message,
+        test_user_messages_not_deleted_in_private_chats,
+        test_short_link_negative_cache_and_lru,
+        test_short_link_distinguishes_storage_failure,
+        test_bucket_public_flag_updates_existing_bucket,
+        test_table_probe_and_lease_error_caching,
+        test_flush_expired_photos_noop_when_disabled,
+        test_cache_helpers_are_bounded,
     ]
+
+    # T6: ручной список легко забыть обновить — проверяем это явно.
+    registered = {test.__name__ for test in tests}
+    defined = {
+        name
+        for name, value in globals().items()
+        if name.startswith("test_") and callable(value)
+    }
+    unregistered = sorted(defined - registered)
+
+    if unregistered:
+        print("НЕ ЗАРЕГИСТРИРОВАНЫ В main():", ", ".join(unregistered))
+        return 1
 
     for test in tests:
         print(f"\n--- {test.__name__} ---")

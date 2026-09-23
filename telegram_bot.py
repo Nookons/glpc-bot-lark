@@ -46,6 +46,7 @@ from pending_photos import (
     send_photo,
 )
 from supabase_storage import (
+    StorageUnavailable,
     download_json,
     resolve_photo_url,
     upload_json,
@@ -251,6 +252,29 @@ _SEEN_LIMIT = 2000
 _seen_lock = threading.Lock()
 _seen_message_ids = OrderedDict()
 
+# Общий предел для словарей-кэшей, которые наполняются из интернета
+# (имена топиков, последние ошибки, «уже подсказали»): без него память
+# процесса растёт бесконечно.
+_CACHE_LIMIT = 500
+
+
+def _remember_bounded(store: dict, key, value, limit: int = _CACHE_LIMIT) -> None:
+    """Пишет в словарь-кэш, вытесняя самые старые записи."""
+    store.pop(key, None)
+    store[key] = value
+
+    while len(store) > limit:
+        store.pop(next(iter(store)))
+
+
+def _remember_flag(store: set, item, limit: int = _CACHE_LIMIT) -> None:
+    """Добавляет элемент в set-кэш, вытесняя произвольные старые."""
+    store.add(item)
+
+    while len(store) > limit:
+        store.discard(next(iter(store)))
+
+
 _IMAGES_DIR = os.environ.get("IMAGES_DIR", "images")
 
 
@@ -330,6 +354,13 @@ def _mark_processed(key) -> None:
 
         if len(_seen_message_ids) > _SEEN_LIMIT:
             _seen_message_ids.popitem(last=False)
+
+
+def _update_text(update: dict) -> str:
+    """Текст апдейта — для логов, когда обработка падает."""
+    message = update.get("message") or update.get("edited_message") or {}
+
+    return message.get("text") or message.get("caption") or ""
 
 
 def _update_key(update: dict) -> str:
@@ -459,7 +490,7 @@ def remember_topic(chat_id, thread_id, name):
     key = (_chat_key(chat_id), int(thread_id))
 
     if _topic_names.get(key) != name:
-        _topic_names[key] = name
+        _remember_bounded(_topic_names, key, name)
         logger.info(
             "Learned topic name: chat=%s thread=%s name=%r",
             chat_id,
@@ -596,8 +627,12 @@ def _send(
             result = tg.send_message(
                 chat_id,
                 text,
+                reply_to_message_id=reply_to_message_id,
                 disable_notification=disable_notification,
                 message_thread_id=fallback,
+                # Без этого кнопки выбора причины терялись и флоу
+                # /offline и /online становился непроходимым.
+                reply_markup=reply_markup,
             )
 
     if result is not None and delete_after:
@@ -748,7 +783,10 @@ def load_saved_offset():
     """Последний подтверждённый offset из Storage (None — нет/ошибка)."""
     data = download_json(OFFSET_BUCKET, OFFSET_OBJECT)
 
-    if not data:
+    if not isinstance(data, dict):
+        if data is not None:
+            logger.warning("Сохранённый offset не объект: %r", data)
+
         return None
 
     try:
@@ -791,7 +829,7 @@ def _handle_wrong_topic(chat_id, thread_id, reason):
     if key in _hinted_threads:
         return
 
-    _hinted_threads.add(key)
+    _remember_flag(_hinted_threads, key)
 
     if reason == "name-unknown":
         text = (
@@ -922,6 +960,13 @@ def _delete_user_message(chat_id, message_id) -> bool:
     if not DELETE_USER_MESSAGES or message_id is None:
         return False
 
+    chat_type = _route_chat_type(chat_id)
+
+    if chat_type and chat_type not in ("group", "supergroup"):
+        # В личной переписке чужие сообщения не удаляем: команда deleteMessage
+        # там работает иначе, а смысла «чистить» личку нет.
+        return False
+
     deleted = tg.delete_message(chat_id, message_id)
 
     if deleted:
@@ -1007,7 +1052,8 @@ def handle_status_callback(callback: dict):
     callback_id = callback.get("id")
 
     if chat_id is None:
-        tg.answer_callback_query(callback_id)
+        if callback_id:
+            tg.answer_callback_query(callback_id)
         return
 
     if callback_id and _is_processed(f"cb:{callback_id}"):
@@ -1030,7 +1076,8 @@ def handle_status_callback(callback: dict):
     parts = (callback.get("data") or "").split(":")
 
     if len(parts) != 4 or parts[0] != "st":
-        tg.answer_callback_query(callback_id)
+        if callback_id:
+            tg.answer_callback_query(callback_id)
         return
 
     _, direction, robot_id, code = parts
@@ -1126,8 +1173,14 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
     return False
 
 
-def finish_status_change(chat_id, sender, note, message_id, pending: dict):
-    """Сотрудник описал причину: меняем статус и убираем свои сообщения."""
+def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bool:
+    """
+    Сотрудник описал причину: меняем статус и убираем свои сообщения.
+
+    True — статус изменён, сообщение сотрудника можно удалять. False — ничего
+    не изменилось (база недоступна / ошибка записи / робот не найден):
+    сообщение с причиной остаётся в чате, чтобы сотрудник не потерял текст.
+    """
     direction = pending["direction"]
     note = (note or "").strip()
 
@@ -1142,14 +1195,14 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
-        return
+        return False
 
     employee = get_employee(sender.get("id"))
 
     if not employee:
         clear_pending_status(chat_id, sender.get("id"))
         _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
-        return
+        return False
 
     try:
         robot = robot_status.find_robot(pending["robot_number"], strict=True)
@@ -1164,7 +1217,7 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
-        return
+        return False
 
     if not robot:
         clear_pending_status(chat_id, sender.get("id"))
@@ -1173,7 +1226,7 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
             f"⚠️ Robot {pending['robot_number']} not found in {WAREHOUSE}.",
             reply_to_message_id=message_id,
         )
-        return
+        return False
 
     if robot_status.is_in_status(robot, direction):
         clear_pending_status(chat_id, sender.get("id"))
@@ -1185,7 +1238,7 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
-        return
+        return False
 
     result = robot_status.change_robot_status(
         robot,
@@ -1195,16 +1248,21 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
         employee,
     )
 
-    clear_pending_status(chat_id, sender.get("id"))
-
     if not result:
+        # Ничего не изменилось: возвращаем флоу, чтобы сотрудник просто
+        # повторил сообщение с причиной (его текст остаётся в чате).
+        set_pending_status(chat_id, sender.get("id"), pending)
+
         _send(
             chat_id,
-            "⚠️ Can't change the robot status right now (database error).",
+            "⚠️ Can't change the robot status right now (database error).\n"
+            "Send the reason again in a moment.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
-        return
+        return False
+
+    clear_pending_status(chat_id, sender.get("id"))
 
     # Убираем свои сообщения: в чате остаётся только сообщение сотрудника.
     _delete_quiet(chat_id, pending.get("prompt_message_id"))
@@ -1220,6 +1278,8 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
     )
 
     _notify_lark_status(direction, result, employee.get("user_name"))
+
+    return True
 
 
 def _handle_cancel(chat_id, sender, reply_to):
@@ -1315,12 +1375,16 @@ def remember_last_error(chat_id, user_id, saved, parsed, table_lines):
         return
 
     with _photo_lock:
-        _last_error[_photo_key(chat_id, user_id)] = {
-            "glpc_id": glpc_id,
-            "parsed": parsed,
-            "table_lines": table_lines,
-            "at": time.time(),
-        }
+        _remember_bounded(
+            _last_error,
+            _photo_key(chat_id, user_id),
+            {
+                "glpc_id": glpc_id,
+                "parsed": parsed,
+                "table_lines": table_lines,
+                "at": time.time(),
+            },
+        )
 
 
 def recent_last_error(chat_id, user_id):
@@ -1820,20 +1884,38 @@ def save_and_forward_error(
             parsed["robot"],
         )
 
-    photo_url = store_photo_for_record(saved, photo_path) if photo_path else None
+    # Запись в базу уже сделана — это точка фиксации. Всё, что ниже
+    # (Storage, Lark, счётчики), best-effort: исключение здесь не должно
+    # приводить к повторной обработке апдейта и второй записи.
+    try:
+        photo_url = (
+            store_photo_for_record(saved, photo_path) if photo_path else None
+        )
 
-    if photo_path or photo_url:
-        mode = send_error_with_photo(
+        if photo_path or photo_url:
+            mode = send_error_with_photo(
+                parsed,
+                table_lines,
+                photo_path=photo_path,
+                photo_url=photo_url,
+            )
+            forwarded = mode != "none"
+        else:
+            forwarded = forward_error(parsed, table_lines)
+
+        remember_last_error(
+            chat_id,
+            sender.get("id"),
+            saved,
             parsed,
             table_lines,
-            photo_path=photo_path,
-            photo_url=photo_url,
         )
-        forwarded = mode != "none"
-    else:
-        forwarded = forward_error(parsed, table_lines)
-
-    remember_last_error(chat_id, sender.get("id"), saved, parsed, table_lines)
+    except Exception:
+        logger.exception(
+            "Ошибка пересылки после сохранения (робот %s) — запись уже в базе",
+            parsed.get("robot"),
+        )
+        forwarded = False
 
     if count >= ERROR_THRESHOLD:
         notify_user(
@@ -1877,6 +1959,15 @@ def attach_photo_to_last_error(chat_id, sender, recent, photo_path, message_id):
         robot,
         result.get("mode"),
     )
+
+    if result.get("mode") == "none":
+        _send(
+            chat_id,
+            "⚠️ Can't forward the photo to Lark right now (see logs).",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
 
     if SEND_CONFIRMATION:
         _send(
@@ -2167,7 +2258,9 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             ],
         )
 
-        if _handle_command(chat_id, sender, normalized, args, message_id, chat):
+        # reply_to не передаём: команду бот сразу удалит, и ответ «в ответ
+        # на удалённое сообщение» выглядел бы сломанным.
+        if _handle_command(chat_id, sender, normalized, args, None, chat):
             # Команда отработана — затираем её, чтобы чат не зарастал.
             _delete_user_message(chat_id, message_id)
             return
@@ -2185,7 +2278,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
                 "Send /help to see the available commands."
             )
 
-        _send(chat_id, hint, reply_to_message_id=message_id)
+        _send(chat_id, hint)
         _delete_user_message(chat_id, message_id)
         return
 
@@ -2199,10 +2292,13 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             text[:80],
         )
 
-        finish_status_change(chat_id, sender, text, message_id, pending)
+        changed = finish_status_change(chat_id, sender, text, message_id, pending)
 
-        # Описание причины бот тоже забирает себе.
-        _delete_user_message(chat_id, message_id)
+        if changed:
+            # Описание причины бот забирает себе — но только если статус
+            # действительно изменён: иначе сотрудник потерял бы текст.
+            _delete_user_message(chat_id, message_id)
+
         return
 
     parsed = parse_error_message(text)
@@ -2332,9 +2428,10 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
 
                 if attempts >= MAX_UPDATE_ATTEMPTS:
                     logger.error(
-                        "Апдейт %s пропускаю после %s попыток",
+                        "Апдейт %s пропускаю после %s попыток (текст: %r)",
                         update_id,
                         attempts,
+                        str(_update_text(update))[:120],
                     )
                     failed_attempts.pop(update_id, None)
                 else:
@@ -2347,10 +2444,11 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
                 offset = update_id + 1
                 _CURRENT_OFFSET = offset
 
-        if updates and offset is not None:
-            # Фиксируем offset, чтобы после перезапуска Telegram не прислал
-            # эти же апдейты повторно.
-            save_offset(offset)
+                # Фиксируем offset после КАЖДОГО подтверждённого апдейта.
+                # Если сохранять его только в конце батча, падение процесса
+                # посреди батча вернёт Telegram уже обработанные апдейты —
+                # а это дубли строк в Supabase и дубли карточек в Lark.
+                save_offset(offset)
 
         if not updates:
             time.sleep(0.2)
@@ -2455,6 +2553,10 @@ def standby_loop(holder: str, interval: int = None) -> bool:
         if result["acquired"]:
             LEASE_MODE = result["status"]
             return True
+
+        if result["status"] == "error":
+            LEASE_STATUS = "standby (error)"
+            continue
 
         LEASE_STATUS = f"standby ({result.get('holder')})"
 
@@ -2572,7 +2674,16 @@ def photo_redirect(object_name):
     if not is_safe_object_name(object_name):
         return jsonify({"error": "bad object name"}), 400
 
-    url = resolve_photo_url(object_name)
+    try:
+        url = resolve_photo_url(object_name, strict=True)
+    except StorageUnavailable:
+        # Storage лежит — это не «файла нет»: отдаём 503, чтобы битая
+        # ссылка не закэшировалась у клиента и в Telegram.
+        logger.warning(
+            "Storage недоступен при открытии короткой ссылки /p/%s",
+            object_name,
+        )
+        return jsonify({"error": "storage unavailable"}), 503
 
     if not url:
         return jsonify({"error": "not found"}), 404
@@ -2701,15 +2812,22 @@ def main():
     # сообщения обоим инстансам и они обрабатываются дважды (дубли).
     global LEASE_STATUS, LEASE_MODE
     holder = bot_lease.holder_id()
-    lease = bot_lease.acquire(holder)
 
-    LEASE_MODE = lease["status"]
+    # Обработчик ставим ДО получения лиза: сигнал в это окно иначе оставил бы
+    # лиз висеть до истечения TTL.
     install_shutdown_handler(holder)
+
+    lease = bot_lease.acquire(holder)
+    LEASE_MODE = lease["status"]
 
     if lease["acquired"]:
         console.print(
             f"[green]Опрашиваю Telegram (лиз: {lease['status']})[/green]"
         )
+    elif lease["status"] == "error":
+        # Не смогли даже прочитать лиз: это не «standby у соседа»,
+        # а нездоровое состояние — /health должен отдавать 503.
+        LEASE_STATUS = "standby (error)"
     else:
         LEASE_STATUS = f"standby ({lease.get('holder')})"
         console.print(

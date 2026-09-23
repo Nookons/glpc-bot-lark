@@ -55,6 +55,31 @@ PUBLIC_PHOTO_URLS = os.environ.get(
 # Кэш подписанных ссылок: файл -> (url, годен до).
 _signed_cache = {}
 
+# Негативный кэш: файл -> момент, раньше которого не пробуем подписывать снова.
+# Без него любой запрос к /p/<несуществующий файл> бил бы в Supabase.
+_signed_missing = {}
+
+# Ограничение размера кэшей: имена файлов приходят из интернета, поэтому
+# неограниченный словарь — это утечка памяти.
+_SIGNED_CACHE_MAX = env_int("SIGNED_URL_CACHE_MAX", 512)
+
+_SIGNED_MISS_TTL_SECONDS = env_int("SIGNED_URL_MISS_TTL", 300)
+
+_SIGNED_CACHE_SECONDS = 3600
+
+
+class StorageUnavailable(Exception):
+    """Supabase Storage недоступен (сеть/5xx) — это не «файла нет»."""
+
+
+def _cache_put(cache: dict, key, value) -> None:
+    """Кладёт значение в кэш с вытеснением самых старых записей."""
+    cache.pop(key, None)
+    cache[key] = value
+
+    while len(cache) > _SIGNED_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+
 
 def _safe_object_name(name: str) -> str:
     """Оставляет в имени только безопасные символы."""
@@ -62,6 +87,42 @@ def _safe_object_name(name: str) -> str:
     base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
 
     return base or "photo.jpg"
+
+
+def _set_bucket_public(bucket: str) -> bool:
+    """
+    Делает существующий bucket публичным.
+
+    POST /storage/v1/bucket на существующий bucket отвечает 409 и видимость
+    НЕ меняет, поэтому при PUBLIC_PHOTO_URLS=true нужен явный PUT — иначе
+    ссылки public/... отдают 403, а бот считает, что фото доставлено.
+    """
+    url = f"{SUPABASE_URL}/storage/v1/bucket/{bucket}"
+
+    try:
+        response = requests.put(
+            url,
+            headers=supabase_headers(),
+            json={"public": True},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error(
+            "Storage: не удалось сделать bucket %s публичным: %s", bucket, e
+        )
+        return False
+
+    if response.status_code in (200, 201):
+        logger.info("Storage: bucket %s переведён в public", bucket)
+        return True
+
+    logger.error(
+        "Storage: bucket %s public -> HTTP %s %s",
+        bucket,
+        response.status_code,
+        response.text[:200],
+    )
+    return False
 
 
 def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
@@ -82,8 +143,17 @@ def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
         logger.error("Storage: не удалось создать bucket %s: %s", bucket, e)
         return False
 
-    # 409 — bucket уже существует; 200/201 — создали.
-    if response.status_code in (200, 201, 409):
+    # 200/201 — создали.
+    if response.status_code in (200, 201):
+        _buckets_ok[bucket] = True
+        return True
+
+    # 409 — bucket уже существует. POST видимость не меняет: если нужен
+    # публичный доступ, переводим bucket в public явно.
+    if response.status_code == 409:
+        if public and not _set_bucket_public(bucket):
+            return False
+
         _buckets_ok[bucket] = True
         return True
 
@@ -213,11 +283,15 @@ def public_url(object_name: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{object_name}"
 
 
-def create_signed_url(object_name: str, expires_in: int = None):
+def create_signed_url(object_name: str, expires_in: int = None, strict: bool = False):
     """
     Подписанная ссылка на приватный объект или None.
 
     Supabase отдаёт относительный путь вида /object/sign/<bucket>/<path>?token=...
+
+    strict=True — сбой сервиса (сеть/5xx/пустой ответ) бросает
+    StorageUnavailable вместо None: «файла нет» и «Storage лежит» — это
+    разные ответы для короткой ссылки /p/<файл> (404 против 503).
     """
     ttl = int(expires_in or SIGNED_URL_TTL)
 
@@ -232,6 +306,10 @@ def create_signed_url(object_name: str, expires_in: int = None):
         )
     except requests.exceptions.RequestException as e:
         logger.error("Storage: не удалось подписать ссылку: %s", e)
+
+        if strict:
+            raise StorageUnavailable(str(e)) from e
+
         return None
 
     if response.status_code not in (200, 201):
@@ -246,6 +324,12 @@ def create_signed_url(object_name: str, expires_in: int = None):
             response.status_code,
             response.text[:200],
         )
+
+        if strict:
+            raise StorageUnavailable(
+                f"HTTP {response.status_code}: {response.text[:200]}"
+            )
+
         return None
 
     try:
@@ -257,6 +341,10 @@ def create_signed_url(object_name: str, expires_in: int = None):
 
     if not signed:
         logger.error("Storage: пустой signedURL в ответе")
+
+        if strict:
+            raise StorageUnavailable("пустой signedURL в ответе")
+
         return None
 
     if signed.startswith("http"):
@@ -270,22 +358,51 @@ def short_photo_url(object_name: str) -> str:
     return f"{PHOTO_LINK_BASE}/p/{object_name}"
 
 
-def resolve_photo_url(object_name: str):
+def resolve_photo_url(object_name: str, strict: bool = False):
     """
     Ссылка, на которую ведёт короткий адрес: подписанный URL Supabase.
 
     Подписанные ссылки кэшируются на час, чтобы клик по короткой ссылке
-    не дёргал Supabase каждый раз.
+    не дёргал Supabase каждый раз. Неудачи кэшируются ненадолго (негативный
+    кэш): иначе перебор имён файлов — это бесплатная нагрузка на Storage.
+
+    strict=True — сбой Storage бросает StorageUnavailable (для /p/ это 503);
+    None в этом режиме означает именно «файла нет».
     """
+    now = time.time()
+
     cached = _signed_cache.get(object_name)
 
-    if cached and cached[1] > time.time():
-        return cached[0]
+    if cached:
+        if cached[1] > now:
+            # Освежаем позицию в кэше (LRU), а не только факт попадания.
+            _cache_put(_signed_cache, object_name, cached)
+            return cached[0]
 
-    url = create_signed_url(object_name)
+        _signed_cache.pop(object_name, None)
+
+    retry_after = _signed_missing.get(object_name)
+
+    if retry_after and retry_after > now:
+        return None
+
+    try:
+        url = create_signed_url(object_name, strict=strict)
+    except StorageUnavailable:
+        # Транзиентный сбой: запоминаем коротко, чтобы не долбить Storage,
+        # но и не выдавать 404 вместо 503.
+        _cache_put(_signed_missing, object_name, now + _SIGNED_MISS_TTL_SECONDS)
+        raise
 
     if url:
-        _signed_cache[object_name] = (url, time.time() + 3600)
+        _cache_put(
+            _signed_cache,
+            object_name,
+            (url, now + _SIGNED_CACHE_SECONDS),
+        )
+        _signed_missing.pop(object_name, None)
+    else:
+        _cache_put(_signed_missing, object_name, now + _SIGNED_MISS_TTL_SECONDS)
 
     return url
 

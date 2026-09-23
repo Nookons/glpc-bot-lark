@@ -31,7 +31,7 @@ from sendToDataBase import (
     rest_get,
     rest_patch,
     rest_post,
-    table_exists,
+    table_probe,
 )
 from logging_config import setup_logging
 
@@ -56,6 +56,10 @@ _warned_no_table = False
 # Если таблицы нет, проверяем её снова раз в 5 минут: миграцию могли
 # применить без перезапуска бота.
 _TABLE_RECHECK_SECONDS = 300
+
+# Если проверка упала по сети/5xx, это не «таблицы нет»: повторяем быстро
+# и не кэшируем отрицательный ответ надолго.
+_TABLE_ERROR_RETRY_SECONDS = env_int("LEASE_TABLE_ERROR_RETRY_SECONDS", 20)
 
 
 def holder_id() -> str:
@@ -98,11 +102,30 @@ def _has_table() -> bool:
     if _table_ok is True:
         return True
 
-    if _table_ok is False and now - _table_checked_at < _TABLE_RECHECK_SECONDS:
-        return False
+    # _table_ok is False — таблицы точно нет (HTTP 404/400);
+    # _table_ok is None  — проверка не удалась (сеть/5xx): пробуем снова скоро.
+    if _table_checked_at:
+        interval = (
+            _TABLE_RECHECK_SECONDS
+            if _table_ok is False
+            else _TABLE_ERROR_RETRY_SECONDS
+        )
 
-    _table_ok = table_exists(TABLE)
+        if now - _table_checked_at < interval:
+            return False
+
+    state = table_probe(TABLE)
     _table_checked_at = now
+    _table_ok = state == "ok" if state != "error" else None
+
+    if state == "error":
+        logger.warning(
+            "Не удалось проверить таблицу %s (сеть/база) — защита от "
+            "двойного запуска пока выключена, повторю через %s с.",
+            TABLE,
+            _TABLE_ERROR_RETRY_SECONDS,
+        )
+        return False
 
     if _table_ok:
         logger.info("Лиз единственного инстанса: таблица %s найдена", TABLE)
