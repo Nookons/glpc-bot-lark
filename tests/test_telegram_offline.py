@@ -1354,8 +1354,8 @@ def _robot(number=3783, robot_id=3542, status=None):
 
 def test_robot_status_module():
     check(
-        "status: подпись причины из журнала",
-        robot_status.reason_label("offline", "abnormal_walking") == "行走异常/Abnormal walking",
+        "status: подпись причины",
+        robot_status.reason_label("offline", "abnormal_walking") == "Abnormal walking",
         robot_status.reason_label("offline", "abnormal_walking"),
     )
     check("status: неизвестный код причины", robot_status.reason_label("offline", "nope") is None)
@@ -1399,6 +1399,12 @@ def test_robot_status_module():
         patched,
     )
     check(
+        "status: CURRENT ISSUE в карточке робота заполняется",
+        patched and patched[0][2]["type_problem"] == "Other"
+        and patched[0][2]["problem_note"] == "сломан ролик",
+        patched,
+    )
+    check(
         "status: запись в журнал change_status_robots",
         posted and posted[0][0] == "change_status_robots"
         and posted[0][1]["old_status"] == robot_status.ONLINE
@@ -1428,6 +1434,33 @@ def test_robot_status_module():
         "status: в карточке причина, заметка и автор",
         "сломан ролик" in body and "Ivan Petrenko" in body and "Other" in body,
         body[:200],
+    )
+
+    # Возврат в работу очищает текущую проблему в карточке робота.
+    offline_robot = _robot(status=robot_status.OFFLINE)
+    patched_online = []
+    original_patch = robot_status.rest_patch
+    original_post = robot_status.rest_post
+    robot_status.rest_patch = lambda table, params, payload: (
+        patched_online.append(payload), [{}]
+    )[1]
+    robot_status.rest_post = lambda table, payload: [{}]
+
+    try:
+        robot_status.change_robot_status(
+            offline_robot, "online", "Software fix", "починили", {"card_id": 60072001}
+        )
+    finally:
+        robot_status.rest_patch = original_patch
+        robot_status.rest_post = original_post
+
+    check(
+        "status: онлайн очищает CURRENT ISSUE",
+        patched_online
+        and patched_online[0]["status"] == robot_status.ONLINE
+        and patched_online[0]["type_problem"] is None
+        and patched_online[0]["problem_note"] is None,
+        patched_online,
     )
 
     online_card = robot_status.build_status_card(
@@ -1517,7 +1550,7 @@ def test_status_flow_end_to_end():
     pending = bot.peek_pending_status(-500, 100)
     check(
         "flow: флоу ждёт описание причины",
-        pending and pending["type_problem"] == "行走异常/Abnormal walking"
+        pending and pending["type_problem"] == "Abnormal walking"
         and str(pending["robot_number"]) == "3783",
         pending,
     )
@@ -1559,8 +1592,14 @@ def test_status_flow_end_to_end():
     check(
         "flow: в журнал ушло описание сотрудника",
         posted and posted[0][1]["problem_note"] == "сломан ролик, заменили"
-        and posted[0][1]["type_problem"] == "行走异常/Abnormal walking",
+        and posted[0][1]["type_problem"] == "Abnormal walking",
         posted,
+    )
+    check(
+        "flow: CURRENT ISSUE заполнен в карточке робота",
+        patched and patched[0][2]["type_problem"] == "Abnormal walking"
+        and patched[0][2]["problem_note"] == "сломан ролик, заменили",
+        patched,
     )
     check(
         "flow: своё сообщение с кнопками удалено",

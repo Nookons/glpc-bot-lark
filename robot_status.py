@@ -49,17 +49,17 @@ DIRECTIONS = {
 # Коды нужны для callback_data кнопок, подписи — то, что уходит в базу.
 REASONS = {
     "offline": (
-        ("abnormal_walking", "行走异常/Abnormal walking"),
-        ("damaged_body", "小车车身部件撞坏/Damaged car body parts"),
+        ("abnormal_walking", "Abnormal walking"),
+        ("damaged_body", "Damaged car body parts"),
         ("safety_controller", "Safety controller issues"),
-        ("other", "其他 / Other"),
+        ("other", "Other"),
     ),
     "online": (
         ("solved_without_changes", "Solved without changing"),
-        ("replaced_parts", "更换备件 / Replaced Spare Parts"),
-        ("software_upgrade", "软件升级 / Software Upgrade"),
+        ("replaced_parts", "Replaced Spare Parts"),
+        ("software_upgrade", "Software Upgrade"),
         ("software_fix", "Software fix"),
-        ("other", "其他 / Other"),
+        ("other", "Other"),
     ),
 }
 
@@ -137,14 +137,26 @@ def change_robot_status(
     changed_at = datetime.now(timezone.utc).isoformat()
     card_id = (employee or {}).get("card_id")
 
+    payload = {
+        "status": new_status,
+        "updated_at": changed_at,
+        "updated_by": card_id,
+    }
+
+    if direction == "offline":
+        # Дашборд показывает «CURRENT ISSUE» из самой карточки робота,
+        # поэтому тип проблемы и заметку пишем и сюда, а не только в журнал.
+        payload["type_problem"] = type_problem
+        payload["problem_note"] = problem_note or ""
+    else:
+        # Робот вернулся в работу — текущая проблема больше не актуальна.
+        payload["type_problem"] = None
+        payload["problem_note"] = None
+
     updated = rest_patch(
         ROBOTS_TABLE,
         params={"id": f"eq.{robot['id']}"},
-        payload={
-            "status": new_status,
-            "updated_at": changed_at,
-            "updated_by": card_id,
-        },
+        payload=payload,
     )
 
     if updated is None:
