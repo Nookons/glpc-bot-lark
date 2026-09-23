@@ -36,12 +36,19 @@ from error_parser import parse_error_message
 from logging_config import setup_logging
 import bot_lease
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
-from pending_photos import TARGET_HOOK_URL, forward_error, handle_incoming_photo
-from supabase_storage import download_json, upload_json
+from pending_photos import (
+    TARGET_HOOK_URL,
+    forward_error,
+    handle_incoming_photo,
+    send_error_with_photo,
+    send_photo,
+)
+from supabase_storage import download_json, upload_json, upload_photo_and_get_url
 import robot_status
 from sendToDataBase import (
     WAREHOUSE,
     count_robot_errors_in_shift,
+    set_exception_photo,
     notify_user,
     send_to_data_base,
     set_notifier,
@@ -172,6 +179,12 @@ STATS_TOKEN = os.environ.get("STATS_TOKEN", "").strip()
 
 # Сколько секунд дать текущему апдейту дописаться при остановке контейнера.
 SHUTDOWN_GRACE_SECONDS = _env_int("SHUTDOWN_GRACE_SECONDS", 3)
+
+# К ошибке какой давности можно прикрепить присланное фото (секунды).
+PHOTO_ATTACH_WINDOW = _env_int("PHOTO_ATTACH_WINDOW", 600)
+
+# Сколько держим фото, ожидая текст ошибки, прежде чем переслать отдельно.
+PHOTO_HOLD_SECONDS = _env_int("PHOTO_HOLD_SECONDS", 90)
 
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
@@ -639,6 +652,7 @@ def _deletion_loop():
     while True:
         try:
             _drain_pending_deletions()
+            flush_expired_photos()
         except Exception:
             logger.exception("Ошибка при удалении служебных сообщений")
 
@@ -1141,12 +1155,184 @@ def _handle_cancel(chat_id, sender, reply_to):
     if pending:
         _delete_quiet(chat_id, pending.get("prompt_message_id"))
 
+    waiting_photo = take_pending_photo(chat_id, sender.get("id"))
+
+    if waiting_photo:
+        # Фото ждало текст ошибки, но его отменили — пересылаем как есть.
+        flush_pending_photo(chat_id, sender.get("id"), waiting_photo)
+        return
+
     _send(
         chat_id,
         "✖️ Cancelled." if pending else "Nothing to cancel.",
         reply_to_message_id=reply_to,
         delete_after=CONFIRM_TTL_SECONDS,
     )
+
+
+# ============================================================
+# ФОТО И ЗАПИСЬ ОБ ОШИБКЕ
+# ============================================================
+#
+# Сотрудник присылает текст ошибки и фото — в любом порядке. Бот собирает
+# это в одну запись: фото уходит в Supabase Storage, ссылка пишется в запись,
+# а в Lark уходит одна карточка (картинкой или ссылкой).
+
+_pending_photo = {}   # (chat_id, user_id) -> данные фото, ждущего текст
+_last_error = {}      # (chat_id, user_id) -> последняя запись сотрудника
+_photo_lock = threading.Lock()
+
+
+def _photo_key(chat_id, user_id):
+    return (int(chat_id), int(user_id))
+
+
+def put_pending_photo(chat_id, user_id, path, message_id, caption=None):
+    """Запоминаем фото, к которому ещё может прийти текст ошибки."""
+    with _photo_lock:
+        _pending_photo[_photo_key(chat_id, user_id)] = {
+            "path": path,
+            "message_id": message_id,
+            "caption": caption or "",
+            "expires": time.time() + PHOTO_HOLD_SECONDS,
+        }
+
+
+def take_pending_photo(chat_id, user_id):
+    """Забираем ожидающее фото (если оно ещё актуально)."""
+    key = _photo_key(chat_id, user_id)
+
+    with _photo_lock:
+        data = _pending_photo.pop(key, None)
+
+    if not data:
+        return None
+
+    if time.time() - (data["expires"] - PHOTO_HOLD_SECONDS) > PHOTO_HOLD_SECONDS * 4:
+        return None
+
+    return data
+
+
+def expired_pending_photos():
+    """Фото, для которых текст ошибки так и не пришёл."""
+    now = time.time()
+    due = []
+
+    with _photo_lock:
+        for key, data in list(_pending_photo.items()):
+            if data.get("expires", 0) <= now:
+                due.append((key, _pending_photo.pop(key)))
+
+    return due
+
+
+def remember_last_error(chat_id, user_id, saved, parsed, table_lines):
+    """Запоминаем последнюю запись: к ней прикрепится фото, если придёт позже."""
+    if not isinstance(saved, dict):
+        return
+
+    glpc_id = saved.get("glpc_id")
+
+    if not glpc_id:
+        return
+
+    with _photo_lock:
+        _last_error[_photo_key(chat_id, user_id)] = {
+            "glpc_id": glpc_id,
+            "parsed": parsed,
+            "table_lines": table_lines,
+            "at": time.time(),
+        }
+
+
+def recent_last_error(chat_id, user_id):
+    """Последняя запись сотрудника, если она ещё не «остыла»."""
+    key = _photo_key(chat_id, user_id)
+
+    with _photo_lock:
+        data = _last_error.get(key)
+
+    if not data:
+        return None
+
+    if time.time() - data.get("at", 0) > PHOTO_ATTACH_WINDOW:
+        return None
+
+    return data
+
+
+def store_photo_for_record(saved, photo_path):
+    """Кладём фото в Storage и прописываем ссылку в запись. Возвращает URL."""
+    url = upload_photo_and_get_url(
+        photo_path,
+        object_name=os.path.basename(photo_path),
+    )
+
+    if not url:
+        logger.error("Не удалось сохранить фото для записи: %s", photo_path)
+        return None
+
+    if saved.get("glpc_id"):
+        set_exception_photo("exceptions_glpc", saved["glpc_id"], url)
+
+    if saved.get("exception_id"):
+        set_exception_photo("exceptions", saved["exception_id"], url)
+
+    return url
+
+
+def flush_pending_photo(chat_id, user_id, data):
+    """Фото осталось без текста ошибки — пересылаем его отдельно."""
+    employee_name = get_employee_name(user_id)
+
+    if employee_name:
+        caption = f"📷 Photo from {employee_name}"
+    else:
+        caption = "📷 Photo from Telegram"
+
+    if data.get("caption"):
+        caption = f"{caption}\n{data['caption']}"
+
+    mode = send_photo(data["path"], caption, console)
+
+    logger.info(
+        "Фото переслано отдельно (не нашлось текста ошибки): chat=%s user=%s mode=%s",
+        chat_id,
+        user_id,
+        mode,
+    )
+
+    if mode["mode"] == "none":
+        _send(
+            chat_id,
+            "⚠️ Can't forward the photo to Lark right now (see logs).",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+    elif not SEND_CONFIRMATION:
+        pass
+    elif mode["mode"] == "lark":
+        _send(
+            chat_id,
+            "✅ Photo forwarded to Lark",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+    else:
+        _send(
+            chat_id,
+            "✅ Photo sent to Lark as a link\n"
+            "(Lark API quota exceeded — uploaded to Supabase Storage)",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+
+
+def flush_expired_photos():
+    """Периодическая задача: отдаём фото, которые так и не дождались текста."""
+    for (chat_id, user_id), data in expired_pending_photos():
+        try:
+            flush_pending_photo(chat_id, user_id, data)
+        except Exception:
+            logger.exception("Не удалось переслать отложенное фото")
 
 
 # ============================================================
@@ -1403,6 +1589,24 @@ def handle_error_text(chat_id, sender, text, message_id):
         )
         return
 
+    save_and_forward_error(chat_id, sender, parsed, message_id, employee_name)
+
+
+def save_and_forward_error(
+    chat_id,
+    sender,
+    parsed,
+    message_id,
+    employee_name,
+    photo_path: str = None,
+):
+    """
+    Сохраняет ошибку и пересылает её в Lark.
+
+    Если для сотрудника ждёт фото (прислал раньше текста) или фото передано
+    аргументом (текст был в подписи) — оно прикрепляется к этой же записи,
+    и в Lark уходит одно сообщение: карточка ошибки + фото.
+    """
     shift_date, shift_name = get_current_shift()
 
     data_obj = {
@@ -1425,9 +1629,8 @@ def handle_error_text(chat_id, sender, text, message_id):
     saved = send_to_data_base(parsed, data_obj, chat_id)
 
     if isinstance(saved, dict) and saved.get("robot_missing"):
-        # Робота нет в списке склада: в базу писать нечего, но саму ошибку
-        # отправляем в Lark как обычную карточку. Факт «робота нет в системе»
-        # в Lark не пишем — об этом сообщаем только сотруднику в Telegram.
+        # Робота нет в списке склада: записать нечего, но ошибку показываем
+        # смене. Факт «робота нет в системе» в Lark не пишем.
         pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
 
         forward_error(parsed, [
@@ -1436,6 +1639,13 @@ def handle_error_text(chat_id, sender, text, message_id):
             ("⚠️ Time", pretty),
             ("📝 Details", parsed["error_text"]),
         ])
+
+        if photo_path:
+            send_photo(
+                photo_path,
+                f"📷 {employee_name}: {parsed['error_text']}",
+                console,
+            )
 
         logger.warning(
             "Робот %s не найден в системе — ошибка переслана в Lark "
@@ -1467,7 +1677,31 @@ def handle_error_text(chat_id, sender, text, message_id):
         ("📊 Shift issues", str(count)),
     ]
 
-    forwarded = forward_error(parsed, table_lines)
+    # Фото, которое ждало текст ошибки (сотрудник прислал фото раньше).
+    waited_photo = take_pending_photo(chat_id, sender.get("id"))
+
+    if waited_photo and not photo_path:
+        photo_path = waited_photo.get("path")
+
+        logger.info(
+            "К ошибке робота %s прикреплено ожидавшее фото",
+            parsed["robot"],
+        )
+
+    photo_url = store_photo_for_record(saved, photo_path) if photo_path else None
+
+    if photo_path or photo_url:
+        mode = send_error_with_photo(
+            parsed,
+            table_lines,
+            photo_path=photo_path,
+            photo_url=photo_url,
+        )
+        forwarded = mode != "none"
+    else:
+        forwarded = forward_error(parsed, table_lines)
+
+    remember_last_error(chat_id, sender.get("id"), saved, parsed, table_lines)
 
     if count >= ERROR_THRESHOLD:
         notify_user(
@@ -1481,18 +1715,53 @@ def handle_error_text(chat_id, sender, text, message_id):
         )
     elif SEND_CONFIRMATION:
         suffix = "" if forwarded else " (Lark forward failed, see logs)"
+        with_photo = " + photo" if (photo_path or photo_url) else ""
 
         _send(
             chat_id,
-            f"✅ Saved: robot {parsed['robot']} — "
+            f"✅ Saved: robot {parsed['robot']}{with_photo} — "
             f"{truncate(parsed['error_text'], 300)}\n"
             f"📊 Shift issues: {count}{suffix}",
             delete_after=CONFIRM_TTL_SECONDS,
         )
 
 
+def attach_photo_to_last_error(chat_id, sender, recent, photo_path, message_id):
+    """Фото пришло после текста — прикрепляем его к последней записи."""
+    employee_name = get_employee_name(sender.get("id")) or _sender_title(sender)
+    robot = recent.get("parsed", {}).get("robot", "?")
+
+    result = send_photo(
+        photo_path,
+        f"📷 Robot {robot} · {employee_name}",
+        console,
+    )
+
+    if result.get("url") and recent.get("glpc_id"):
+        set_exception_photo("exceptions_glpc", recent["glpc_id"], result["url"])
+
+    logger.info(
+        "Фото прикреплено к последней ошибке робота %s (режим %s)",
+        robot,
+        result.get("mode"),
+    )
+
+    if SEND_CONFIRMATION:
+        _send(
+            chat_id,
+            f"✅ Photo attached to robot {robot}",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+
+
 def handle_photo(chat_id, sender, message, message_id):
-    """Фото: скачать из Telegram и переслать в Lark-группу."""
+    """
+    Фото: ищем текст ошибки рядом с ним и создаём одну запись.
+
+    Порядок: подпись к фото → недавняя ошибка этого же сотрудника
+    (текст был раньше) → ожидание текста (текст придёт следующим).
+    """
     sizes = message.get("photo") or []
 
     if not sizes:
@@ -1528,40 +1797,57 @@ def handle_photo(chat_id, sender, message, message_id):
         )
         return
 
-    employee_name = get_employee_name(sender.get("id"))
-
-    if employee_name:
-        caption = f"📷 Photo from {employee_name}"
-    else:
-        caption = f"📷 Photo from {_sender_title(sender)} (Telegram)"
-
     console.print(f"[cyan]📷 Фото сохранено: {destination}[/cyan]")
 
-    mode = handle_incoming_photo(destination, console, caption=caption)
+    caption = (message.get("caption") or "").strip()
+    employee_name = get_employee_name(sender.get("id"))
 
-    if mode == "lark":
-        if SEND_CONFIRMATION:
-            _send(
-                chat_id,
-                "✅ Photo forwarded to Lark",
-                reply_to_message_id=message_id,
-                delete_after=CONFIRM_TTL_SECONDS,
-            )
-    elif mode == "link":
-        _send(
+    # 1) В подписи целиком ошибка — создаём запись вместе с фото.
+    parsed = parse_error_message(caption) if caption else None
+
+    if parsed and parsed["robot"].isdigit() and employee_name:
+        logger.info("Ошибка из подписи к фото: robot=%s", parsed["robot"])
+        save_and_forward_error(
             chat_id,
-            "✅ Photo sent to Lark as a link\n"
-            "(Lark API quota exceeded — uploaded to Supabase Storage)",
-            reply_to_message_id=message_id,
-            delete_after=CONFIRM_TTL_SECONDS,
+            sender,
+            parsed,
+            message_id,
+            employee_name,
+            photo_path=destination,
         )
-    else:
-        _send(
+        return
+
+    # 2) Есть недавняя ошибка этого сотрудника — прикрепляем фото к ней.
+    recent = recent_last_error(chat_id, sender.get("id"))
+
+    if recent:
+        attach_photo_to_last_error(
             chat_id,
-            "⚠️ Can't forward the photo to Lark right now (see logs).",
-            reply_to_message_id=message_id,
-            delete_after=CONFIRM_TTL_SECONDS,
+            sender,
+            recent,
+            destination,
+            message_id,
         )
+        return
+
+    # 3) Держим фото: возможно, текст ошибки придёт следующим сообщением.
+    put_pending_photo(
+        chat_id,
+        sender.get("id"),
+        destination,
+        message_id,
+        caption,
+    )
+
+    _send(
+        chat_id,
+        "📷 Photo received.\n"
+        f"Send the error text in one message within {PHOTO_HOLD_SECONDS}s "
+        "and I'll combine it with the photo into one record "
+        "(or /cancel to forward the photo as is).",
+        reply_to_message_id=message_id,
+        delete_after=CONFIRM_TTL_SECONDS,
+    )
 
 
 def handle_update(update: dict, bot_username: str = None):
@@ -2154,9 +2440,11 @@ def main():
     # Старые фото из Telegram не копим на диске.
     start_images_janitor()
 
-    # Удаление служебных подтверждений («хвостов») через CONFIRM_TTL_SECONDS.
+    # Уборщик: удаляет подтверждения (если TTL > 0) и пересылает фото,
+    # которые так и не дождались текста ошибки.
+    start_deletion_worker()
+
     if CONFIRM_TTL_SECONDS > 0:
-        start_deletion_worker()
         console.print(
             f"[cyan]Подтверждения удаляются через "
             f"{CONFIRM_TTL_SECONDS}s[/cyan]"

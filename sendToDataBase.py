@@ -187,6 +187,30 @@ def rest_get(table: str, params: dict = None):
     return _rest_get(table, params)
 
 
+def set_exception_photo(table: str, row_id, photo_url: str):
+    """Прикрепляет ссылку на фото к уже созданной записи об ошибке."""
+    if not row_id or not photo_url:
+        return False
+
+    updated = rest_patch(
+        table,
+        params={"id": f"eq.{row_id}"},
+        payload={"photo_url": photo_url},
+    )
+
+    if not updated:
+        logger.error(
+            "Не удалось привязать фото к %s id=%s",
+            table,
+            row_id,
+        )
+        return False
+
+    logger.info("Фото привязано к %s id=%s", table, row_id)
+
+    return True
+
+
 def rest_post(table: str, payload: dict, ignore_conflict: bool = False):
     """Публичный доступ к POST /rest/v1/<table> (для других модулей)."""
     return _rest_post(table, payload, ignore_conflict=ignore_conflict)
@@ -838,4 +862,16 @@ def send_to_data_base(
         shift_name,
     )
 
-    return saved
+    def _row_id(rows):
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0].get("id")
+
+        return None
+
+    return {
+        "status": "saved",
+        "rows": saved,
+        "glpc_id": _row_id(saved_old),
+        "exception_id": _row_id(saved),
+        "robot": str(table_lines.get("robot")),
+    }

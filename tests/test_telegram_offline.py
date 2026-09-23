@@ -181,7 +181,13 @@ def fake_unlink_user(telegram_id):
 
 def fake_send_to_data_base(parsed, data_obj, chat_id):
     DB_CALLS.append({"parsed": parsed, "data": data_obj, "chat_id": chat_id})
-    return [{"id": 1}]
+    return {
+        "status": "saved",
+        "rows": [{"id": 1}],
+        "glpc_id": 42,
+        "exception_id": 41,
+        "robot": parsed["robot"],
+    }
 
 
 def fake_count_robot_errors_in_shift(robot, shift_date, shift_name):
@@ -503,61 +509,198 @@ def test_not_saved_no_forward():
     check("not saved: подтверждения нет", sent == [], sent)
 
 
-def test_photo_flow():
+def test_photo_with_error_caption_creates_one_record():
     LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
 
-    sent = run(make_update(photo=True, caption="broken robot"))
+    original_combined = bot.send_error_with_photo
+    original_store = bot.store_photo_for_record
 
-    check("photo: фото обработано", len(PHOTO_CALLS) == 1, PHOTO_CALLS)
+    combined, stored = [], []
+
+    bot.send_error_with_photo = (
+        lambda parsed, lines, photo_path=None, photo_url=None: (
+            combined.append({"parsed": parsed, "path": photo_path}), "link"
+        )[1]
+    )
+    bot.store_photo_for_record = lambda saved, path: (
+        stored.append((saved.get("glpc_id"), path)), "https://storage/photo.jpg"
+    )[1]
+
+    try:
+        sent = run(make_update(
+            photo=True,
+            caption="Unable to drive: Security module failure. 3780",
+            thread_id=2,
+        ))
+    finally:
+        bot.send_error_with_photo = original_combined
+        bot.store_photo_for_record = original_store
+
+    check("photo caption: запись создана", len(DB_CALLS) == 1, DB_CALLS)
     check(
-        "photo: подпись с именем сотрудника",
-        PHOTO_CALLS and PHOTO_CALLS[0]["caption"] == "📷 Photo from Ivan Petrenko",
-        PHOTO_CALLS,
+        "photo caption: робот взят из подписи",
+        DB_CALLS and DB_CALLS[0]["parsed"]["robot"] == "3780",
+        DB_CALLS,
     )
     check(
-        "photo: подтверждение отправки в Lark",
-        len(sent) == 1 and "Photo forwarded" in sent[0]["text"],
+        "photo caption: фото привязано к записи",
+        stored and stored[0][0] == 42,
+        stored,
+    )
+    check(
+        "photo caption: в Lark ушло одно сообщение с фото",
+        len(combined) == 1 and combined[0]["path"],
+        combined,
+    )
+    check(
+        "photo caption: подтверждение помечает фото",
+        sent and "+ photo" in sent[0]["text"],
         sent,
     )
 
 
-def test_photo_delivery_modes():
+def test_photo_waits_for_text_then_combines():
     LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
 
-    original = bot.handle_incoming_photo
-    called = []
+    with bot._photo_lock:
+        bot._pending_photo.clear()
+        bot._last_error.clear()
+
+    original_combined = bot.send_error_with_photo
+    original_store = bot.store_photo_for_record
+
+    combined = []
+    bot.send_error_with_photo = (
+        lambda parsed, lines, photo_path=None, photo_url=None: (
+            combined.append(photo_path), "link"
+        )[1]
+    )
+    bot.store_photo_for_record = lambda saved, path: "https://storage/p.jpg"
 
     try:
-        for mode, marker in (
-            ("lark", "Photo forwarded to Lark"),
-            ("link", "as a link"),
-            ("none", "Can\'t forward the photo"),
-        ):
-            bot.handle_incoming_photo = (
-                lambda image_path, console=None, caption=None, _mode=mode: (
-                    called.append(_mode),
-                    _mode,
-                )[1]
-            )
-            sent = run(make_update(photo=True, caption="broken robot", thread_id=42))
-            check(
-                f"photo mode={mode}: ответ в Telegram",
-                len(sent) == 1 and marker in sent[0]["text"],
-                sent,
-            )
-            check(
-                f"photo mode={mode}: ответ ушёл в топик сообщения",
-                sent and sent[0]["thread_id"] == 42,
-                sent,
-            )
+        sent = run(make_update(photo=True, thread_id=2))
+
+        with bot._photo_lock:
+            queued = len(bot._pending_photo)
+
+        check(
+            "photo hold: фото отложено и есть подсказка",
+            queued == 1 and "Photo received" in sent[0]["text"],
+            (queued, sent),
+        )
+
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=2,
+        ))
     finally:
-        bot.handle_incoming_photo = original
+        bot.send_error_with_photo = original_combined
+        bot.store_photo_for_record = original_store
+
+        with bot._photo_lock:
+            bot._pending_photo.clear()
+            bot._last_error.clear()
+
+    check("photo hold: запись создана", len(DB_CALLS) == 1, DB_CALLS)
+    check(
+        "photo hold: ожидавшее фото прикреплено к записи",
+        combined and combined[0],
+        combined,
+    )
+    check(
+        "photo hold: подтверждение с фото",
+        any("+ photo" in item["text"] for item in sent),
+        sent,
+    )
+
+
+def test_photo_attaches_to_recent_error():
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    with bot._photo_lock:
+        bot._pending_photo.clear()
+        bot._last_error.clear()
+
+    run(make_update(
+        text="Unable to drive: Security module failure. 3780",
+        thread_id=2,
+    ))
 
     check(
-        "photo: обработчик вызывается во всех трёх режимах",
-        called == ["lark", "link", "none"],
-        called,
+        "photo after: последняя запись запомнена",
+        bot.recent_last_error(-500, 100) is not None,
     )
+
+    original_send = bot.send_photo
+    original_set = bot.set_exception_photo
+
+    captions, patched_photo = [], []
+    bot.send_photo = lambda path, caption=None, console=None: (
+        captions.append(caption), {"mode": "link", "url": "https://storage/p.jpg"}
+    )[1]
+    bot.set_exception_photo = lambda table, row_id, url: (
+        patched_photo.append((table, row_id, url)), True
+    )[1]
+
+    try:
+        sent = run(make_update(photo=True, thread_id=2))
+    finally:
+        bot.send_photo = original_send
+        bot.set_exception_photo = original_set
+
+        with bot._photo_lock:
+            bot._pending_photo.clear()
+            bot._last_error.clear()
+
+    check(
+        "photo after: фото привязано к последней записи",
+        patched_photo and patched_photo[0][0] == "exceptions_glpc"
+        and patched_photo[0][1] == 42,
+        patched_photo,
+    )
+    check(
+        "photo after: картинка ушла с номером робота",
+        captions and "3780" in (captions[0] or ""),
+        captions,
+    )
+    check(
+        "photo after: подтверждение о прикреплении",
+        sent and "attached" in sent[0]["text"],
+        sent,
+    )
+
+
+def test_flush_pending_photo_modes():
+    """Отложенное фото, не дождавшееся текста, уходит отдельно."""
+    LINKS[100] = "Ivan Petrenko"
+
+    for mode, marker in (
+        ("lark", "Photo forwarded"),
+        ("link", "as a link"),
+        ("none", "Can\'t forward"),
+    ):
+        original = bot.send_photo
+        bot.send_photo = (
+            lambda path, caption=None, console=None, _mode=mode: {
+                "mode": _mode,
+                "url": None,
+            }
+        )
+
+        try:
+            SENT.clear()
+            bot.flush_pending_photo(-500, 100, {"path": "x.jpg", "caption": "cap"})
+        finally:
+            bot.send_photo = original
+
+        check(
+            f"photo flush {mode}: ответ сотруднику",
+            any(marker in item["text"] for item in SENT),
+            (mode, SENT),
+        )
 
 
 def test_photo_fallback_logic():
@@ -2855,8 +2998,10 @@ def main():
         test_threshold_alert,
         test_bad_format,
         test_not_saved_no_forward,
-        test_photo_flow,
-        test_photo_delivery_modes,
+        test_photo_with_error_caption_creates_one_record,
+        test_photo_waits_for_text_then_combines,
+        test_photo_attaches_to_recent_error,
+        test_flush_pending_photo_modes,
         test_photo_fallback_logic,
         test_ignored_cases,
         test_commands,
