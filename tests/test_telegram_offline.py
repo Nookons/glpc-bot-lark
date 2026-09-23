@@ -2129,7 +2129,7 @@ def test_lease_edge_cases_and_polling_guard():
         "status": "acquired",
         "holder": holder,
     }
-    bot.start_polling_and_reports = lambda holder: started.append(holder)
+    bot.start_polling_and_reports = lambda holder, mode=None: started.append(holder)
 
     try:
         bot.standby_loop("me-9", interval=0)

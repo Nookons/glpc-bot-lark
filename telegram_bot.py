@@ -1647,7 +1647,7 @@ def standby_loop(holder: str, interval: int = 10):
                 "[bold green]Лиз освободился — этот инстанс стал "
                 "опрашивающим[/bold green]"
             )
-            start_polling_and_reports(holder)
+            start_polling_and_reports(holder, result.get("status"))
             return
 
         LEASE_STATUS = f"standby ({result.get('holder')})"
