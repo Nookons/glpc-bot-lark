@@ -575,8 +575,8 @@ def test_commands():
 
     sent = run(make_update(text="/stats"))
     check(
-        "stats: статистика смены",
-        len(sent) == 1 and "Shift statistics" in sent[0]["text"] and "Total exceptions: 2" in sent[0]["text"],
+        "stats: отвечает (вид отчёта проверяется отдельно)",
+        len(sent) == 1,
         sent,
     )
 
@@ -1063,6 +1063,59 @@ def _report_data_stub(payloads, default=None):
     return fake, calls
 
 
+def test_stats_command_matches_report():
+    """`/stats` должен отдавать тот же вид, что и отчёт за смену."""
+    original = sr.shift_report_data
+
+    fake, calls = _report_data_stub({
+        ("2026-09-23", "day"): {
+            "total": 14,
+            "robots": {"3638": 3, "3680": 2},
+            "types": {"Unable to drive": 12, "Other": 2},
+            "employees": {"Huseyn": 12, "Dmytro": 2},
+            "downtime_minutes": 88,
+            "maintenance": [("3638", 3)],
+        },
+        ("2026-09-22", "night"): {
+            "total": 23,
+            "robots": {},
+            "types": {},
+            "employees": {},
+            "downtime_minutes": 0,
+            "maintenance": [],
+        },
+    })
+
+    sr.shift_report_data = fake
+
+    try:
+        sent = run(make_update(text="/stats 2026-09-23 day"))
+    finally:
+        sr.shift_report_data = original
+
+    text = sent[0]["text"] if sent else ""
+
+    check("stats: тот же заголовок отчёта", "Shift report · GLP-C · 23.09.2026 · Day" in text, text)
+    check("stats: итоги и простой", "Total 14 exceptions" in text and "Downtime 1h 28m" in text, text)
+    check("stats: динамика к прошлой смене", "vs previous shift (22.09.2026 night) -9 ▼" in text, text)
+    check("stats: обслуживание", "Maintenance (3+ per shift): 3638 (3)" in text, text)
+    check(
+        "stats: топы типов и людей",
+        "Unable to drive — 12 (86%)" in text and "Huseyn (12) · Dmytro (2)" in text,
+        text,
+    )
+    check(
+        "stats: смена и предыдущая смена запрошены",
+        calls == [("2026-09-23", "day"), ("2026-09-22", "night")],
+        calls,
+    )
+    check(
+        "stats: ответ ушёл в топик запроса",
+        sent and sent[0]["thread_id"] is None,
+        sent,
+    )
+
+
 def test_report_previous_shift():
     check(
         "report: день -> ночь предыдущего дня",
@@ -1271,6 +1324,7 @@ def main():
         test_cyrillic_layout_command_works,
         test_send_fallback_to_monitored_topic,
         test_send_fallback_guarded_by_allow_list,
+        test_stats_command_matches_report,
         test_report_previous_shift,
         test_report_formatting,
         test_report_metrics_and_text,

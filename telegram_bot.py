@@ -43,7 +43,7 @@ from sendToDataBase import (
     table_exists,
 )
 from shift import get_current_shift
-from shift_report import start_shift_scheduler
+from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
 from telegram_store import (
     get_employee_name,
     link_user,
@@ -618,36 +618,14 @@ def _handle_whoami(chat_id, sender, reply_to):
 
 
 def _stats_text(shift_date: str, shift_name: str) -> str:
-    total, by_robot, by_type = shift_stats(shift_date, shift_name)
+    """
+    Статистика смены в Telegram.
 
-    lines = [
-        "📊 Shift statistics",
-        "",
-        f"📅 Date: {shift_date}",
-        f"🕐 Shift: {shift_name}",
-        "",
-        f"Total exceptions: {total}",
-    ]
-
-    if by_robot:
-        lines.append("")
-        lines.append("🤖 By robot:")
-        for robot, count in sorted(
-            by_robot.items(),
-            key=lambda item: (-item[1], item[0]),
-        )[:15]:
-            lines.append(f"  • Robot {robot}: {count}")
-
-    if by_type:
-        lines.append("")
-        lines.append("⚠️ By issue type:")
-        for issue_type, count in sorted(
-            by_type.items(),
-            key=lambda item: (-item[1], item[0]),
-        )[:15]:
-            lines.append(f"  • {issue_type}: {count}")
-
-    return "\n".join(lines)
+    Используется тот же билдер, что и для отчёта в Lark: итоги, простой,
+    динамика к прошлой смене, роботы на обслуживание и топы — чтобы вид
+    не разъезжался между командой и автоматическим отчётом.
+    """
+    return build_shift_summary(shift_date, shift_name)
 
 
 def _handle_stats(chat_id, args, reply_to):
