@@ -16,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from logging_config import setup_logging
+from text_utils import TELEGRAM_TEXT_LIMIT, truncate
 
 
 # .env должен быть загружен до чтения токена ниже.
@@ -26,6 +27,10 @@ logger = setup_logging(__name__)
 
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Telegram Bot API отдаёт боту файлы до 20 МБ; страхуемся от «тяжёлых» фото,
+# чтобы не вычитывать гигабайты в память.
+MAX_FILE_MB = int(os.environ.get("TELEGRAM_MAX_FILE_MB", "25"))
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 _FILE_BASE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
@@ -135,6 +140,8 @@ def send_message(
     message_thread_id — топик форум-группы: без него сообщение уйдёт
     в «General», а не в тот топик, откуда пришла ошибка.
     """
+    text = truncate(text, TELEGRAM_TEXT_LIMIT)
+
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -257,17 +264,39 @@ def download_file(file_path: str, destination: str):
     url = f"{_FILE_BASE}/{file_path}"
 
     try:
-        response = requests.get(url, timeout=60)
+        response = requests.get(url, timeout=60, stream=True)
         response.raise_for_status()
+
+        declared_size = int(response.headers.get("Content-Length") or 0)
+
+        if declared_size and declared_size > MAX_FILE_MB * 1024 * 1024:
+            logger.error(
+                "Файл %s слишком большой: %s байт (лимит %s МБ)",
+                file_path,
+                declared_size,
+                MAX_FILE_MB,
+            )
+            response.close()
+            return None
+
+        content = response.content
     except requests.exceptions.RequestException as e:
         logger.error("Telegram file download failed: %s", e)
+        return None
+
+    if len(content) > MAX_FILE_MB * 1024 * 1024:
+        logger.error(
+            "Файл %s превысил лимит %s МБ после скачивания",
+            file_path,
+            MAX_FILE_MB,
+        )
         return None
 
     try:
         os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
 
         with open(destination, "wb") as f:
-            f.write(response.content)
+            f.write(content)
     except OSError as e:
         logger.error("Failed to write %s: %s", destination, e)
         return None

@@ -37,6 +37,7 @@ from logging_config import setup_logging
 import bot_lease
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import TARGET_HOOK_URL, forward_error, handle_incoming_photo
+from supabase_storage import download_json, upload_json
 import robot_status
 from sendToDataBase import (
     WAREHOUSE,
@@ -49,6 +50,7 @@ from sendToDataBase import (
 )
 from shift import get_current_shift
 from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
+from text_utils import truncate
 from telegram_store import (
     get_employee,
     get_employee_name,
@@ -145,6 +147,31 @@ CONFIRM_TTL_SECONDS = _env_int("TELEGRAM_CONFIRM_TTL", 10)
 
 # Сколько ждём описание причины при смене статуса робота.
 STATUS_FLOW_TTL_SECONDS = _env_int("TELEGRAM_STATUS_FLOW_TTL", 300)
+
+# Как часто standby-инстанс пробует забрать освободившийся лиз.
+STANDBY_RETRY_SECONDS = _env_int("BOT_STANDBY_RETRY", 10)
+
+# Как часто отдельный поток продлевает лиз. Обработка фото может занять
+# минуты, поэтому heartbeat нельзя делать только в цикле опроса.
+LEASE_HEARTBEAT_SECONDS = _env_int("BOT_LEASE_HEARTBEAT", 15)
+
+# Если опрашивающий инстанс не делал getUpdates дольше этого времени —
+# /health отдаёт 503, чтобы Railway перезапустил контейнер.
+POLL_STALL_SECONDS = _env_int("POLL_STALL_SECONDS", 180)
+
+# Где храним подтверждённый offset Telegram (чтобы после перезапуска
+# Telegram не переотдал уже обработанные апдейты = дубли).
+OFFSET_BUCKET = os.environ.get("SUPABASE_STATE_BUCKET", "bot-state")
+OFFSET_OBJECT = "telegram-offset.json"
+
+# Сколько дней хранить скачанные из Telegram фото (0 — не удалять).
+IMAGES_RETENTION_DAYS = _env_int("IMAGES_RETENTION_DAYS", 7)
+
+# Необязательный токен для HTTP-эндпоинта /shift_stats.
+STATS_TOKEN = os.environ.get("STATS_TOKEN", "").strip()
+
+# Сколько секунд дать текущему апдейту дописаться при остановке контейнера.
+SHUTDOWN_GRACE_SECONDS = _env_int("SHUTDOWN_GRACE_SECONDS", 3)
 
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
@@ -250,17 +277,49 @@ def now_warsaw() -> datetime:
 # MESSAGE DEDUPLICATION / AGE
 # ============================================================
 
-def _already_processed(message_id) -> bool:
+def _is_processed(key) -> bool:
+    """Уже обрабатывали этот апдейт в этом процессе?"""
     with _seen_lock:
-        if message_id in _seen_message_ids:
-            return True
+        return key in _seen_message_ids
 
-        _seen_message_ids[message_id] = True
+
+def _mark_processed(key) -> None:
+    """
+    Помечает апдейт обработанным.
+
+    Вызывается ТОЛЬКО после успешной обработки: иначе разовый сбой БД
+    «съел» бы сообщение навсегда, потому что повторная доставка была бы
+    отброшена как дубль.
+    """
+    if not key:
+        return
+
+    with _seen_lock:
+        _seen_message_ids[key] = True
+        _seen_message_ids.move_to_end(key)
 
         if len(_seen_message_ids) > _SEEN_LIMIT:
             _seen_message_ids.popitem(last=False)
 
-        return False
+
+def _update_key(update: dict) -> str:
+    """Ключ апдейта для дедупа: (chat_id, message_id) или id нажатия кнопки."""
+    callback = update.get("callback_query")
+
+    if callback:
+        callback_id = callback.get("id")
+
+        return f"cb:{callback_id}" if callback_id else ""
+
+    message = update.get("message") or update.get("edited_message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+
+    if chat_id is None or message_id is None:
+        return ""
+
+    # Ключ именно (чат, сообщение): в разных чатах id пересекаются.
+    return f"{chat_id}:{message_id}"
 
 
 def _is_message_too_old(unix_seconds) -> bool:
@@ -331,10 +390,35 @@ def parse_command(text: str, bot_username: str = None):
 _topic_names = {}      # (chat_id, thread_id) -> name
 _routes = {}           # chat_id -> thread_id последнего сообщения
 _hinted_threads = set()
+_chat_types = {}       # chat_id -> тип чата (supergroup/private/...)
+
+# Общие словари пишутся из потока опроса и читаются из Flask/нотификатора.
+_routes_lock = threading.Lock()
 
 
 def _chat_key(chat_id) -> int:
     return int(chat_id)
+
+
+def _set_route(chat_id, thread_id, chat_type: str = None):
+    """Запоминаем, в какой топик отвечать и что это за чат."""
+    key = _chat_key(chat_id)
+
+    with _routes_lock:
+        _routes[key] = thread_id
+
+        if chat_type:
+            _chat_types[key] = chat_type
+
+
+def _route_thread(chat_id):
+    with _routes_lock:
+        return _routes.get(_chat_key(chat_id))
+
+
+def _route_chat_type(chat_id):
+    with _routes_lock:
+        return _chat_types.get(_chat_key(chat_id))
 
 
 def remember_topic(chat_id, thread_id, name):
@@ -450,7 +534,7 @@ def _send(
     delete_after — через сколько секунд удалить это сообщение (0/None — не удалять).
     """
     if thread_id is None:
-        thread_id = _routes.get(_chat_key(chat_id))
+        thread_id = _route_thread(chat_id)
 
     result = tg.send_message(
         chat_id,
@@ -463,10 +547,14 @@ def _send(
 
     if result is None:
         fallback = TELEGRAM_TOPIC_ID
+        # Откат нужен только для групп: в личке ответ в группу отправлять
+        # нельзя. Раньше условие требовало непустой белый список чатов,
+        # из-за чего в конфиге «все чаты» откат не срабатывал вообще.
+        is_group = _route_chat_type(chat_id) in ("group", "supergroup")
 
         if (
             fallback is not None
-            and _chat_key(chat_id) in ALLOWED_CHAT_IDS
+            and (is_group or _chat_key(chat_id) in ALLOWED_CHAT_IDS)
             and (thread_id is None or int(thread_id) != int(fallback))
         ):
             logger.warning(
@@ -496,7 +584,7 @@ def _send_action(chat_id, action="typing"):
     return tg.send_chat_action(
         chat_id,
         action,
-        message_thread_id=_routes.get(_chat_key(chat_id)),
+        message_thread_id=_route_thread(chat_id),
     )
 
 
@@ -557,6 +645,63 @@ def _deletion_loop():
         time.sleep(1)
 
 
+def cleanup_old_images() -> int:
+    """Удаляет фото из IMAGES_DIR старше IMAGES_RETENTION_DAYS."""
+    if IMAGES_RETENTION_DAYS <= 0:
+        return 0
+
+    cutoff = time.time() - IMAGES_RETENTION_DAYS * 86400
+    removed = 0
+
+    try:
+        names = os.listdir(_IMAGES_DIR)
+    except OSError:
+        return 0
+
+    for name in names:
+        path = os.path.join(_IMAGES_DIR, name)
+
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            logger.warning("Не удалось удалить старый файл %s", path)
+
+    if removed:
+        logger.info(
+            "Очистка %s: удалено файлов старше %s дней — %s",
+            _IMAGES_DIR,
+            IMAGES_RETENTION_DAYS,
+            removed,
+        )
+
+    return removed
+
+
+def images_janitor_loop(interval_seconds: int = 3600):
+    """Раз в час убираем старые фото, чтобы диск не разрастался."""
+    while True:
+        try:
+            cleanup_old_images()
+            sweep_pending_status()
+        except Exception:
+            logger.exception("Ошибка очистки старых фото")
+
+        time.sleep(interval_seconds)
+
+
+def start_images_janitor() -> threading.Thread:
+    thread = threading.Thread(
+        target=images_janitor_loop,
+        name="images-janitor",
+        daemon=True,
+    )
+    thread.start()
+
+    return thread
+
+
 def start_deletion_worker() -> threading.Thread:
     thread = threading.Thread(
         target=_deletion_loop,
@@ -566,6 +711,35 @@ def start_deletion_worker() -> threading.Thread:
     thread.start()
 
     return thread
+
+
+def load_saved_offset():
+    """Последний подтверждённый offset из Storage (None — нет/ошибка)."""
+    data = download_json(OFFSET_BUCKET, OFFSET_OBJECT)
+
+    if not data:
+        return None
+
+    try:
+        return int(data.get("offset"))
+    except (TypeError, ValueError):
+        logger.warning("Некорректный сохранённый offset: %r", data)
+        return None
+
+
+def save_offset(offset) -> bool:
+    """Сохраняет offset, чтобы Telegram не переотдал обработанные апдейты."""
+    if offset is None:
+        return False
+
+    return upload_json(
+        OFFSET_BUCKET,
+        OFFSET_OBJECT,
+        {
+            "offset": int(offset),
+            "saved_at": datetime.now(WARSAW_TZ).strftime("%d.%m.%Y %H:%M:%S"),
+        },
+    )
 
 
 def _handle_wrong_topic(chat_id, thread_id, reason):
@@ -631,21 +805,53 @@ def set_pending_status(chat_id, user_id, data: dict):
         )
 
 
+def take_pending_status(chat_id, user_id):
+    """
+    Атомарно забирает незавершённый флоу (single-flight).
+
+    Именно забирает, а не читает: иначе две копии одного сообщения (повторная
+    доставка апдейта, двойной тап) успевают обе пройти проверку и статус
+    меняется дважды с двумя записями в журнале и двумя карточками в Lark.
+    """
+    key = _pending_key(chat_id, user_id)
+
+    with _pending_status_lock:
+        data = _pending_status.pop(key, None)
+
+    if not data:
+        return None
+
+    if data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
 def peek_pending_status(chat_id, user_id):
-    """Незавершённый флоу пользователя (просроченные отбрасываются)."""
+    """Незавершённый флоу без изъятия (для проверок и логов)."""
     key = _pending_key(chat_id, user_id)
 
     with _pending_status_lock:
         data = _pending_status.get(key)
 
-        if not data:
-            return None
+    if not data or data.get("expires", 0) < time.time():
+        return None
 
-        if data.get("expires", 0) < time.time():
-            _pending_status.pop(key, None)
-            return None
+    return dict(data)
 
-        return dict(data)
+
+def sweep_pending_status() -> int:
+    """Удаляет просроченные незавершённые флоу, чтобы словарь не рос."""
+    now = time.time()
+    removed = 0
+
+    with _pending_status_lock:
+        for key, data in list(_pending_status.items()):
+            if data.get("expires", 0) < now:
+                _pending_status.pop(key, None)
+                removed += 1
+
+    return removed
 
 
 def clear_pending_status(chat_id, user_id):
@@ -744,8 +950,12 @@ def handle_status_callback(callback: dict):
         tg.answer_callback_query(callback_id)
         return
 
+    if callback_id and _is_processed(f"cb:{callback_id}"):
+        tg.answer_callback_query(callback_id, "Already handled")
+        return
+
     thread_id = message.get("message_thread_id")
-    _routes[_chat_key(chat_id)] = thread_id
+    _set_route(chat_id, thread_id, chat.get("type"))
 
     if not _chat_allowed(chat_id):
         tg.answer_callback_query(callback_id, "This chat is not allowed")
@@ -848,6 +1058,10 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
     note = (note or "").strip()
 
     if not note:
+        # Флоу уже изъят из состояния (single-flight) — возвращаем его,
+        # чтобы сотрудник мог дописать причину следующим сообщением.
+        set_pending_status(chat_id, sender.get("id"), pending)
+
         _send(
             chat_id,
             "✍️ Please describe the reason in one message (or /cancel).",
@@ -957,7 +1171,7 @@ def _show_console_message(chat, sender, message_type: str, extra_rows=None):
     table.add_row("📝 Тип", message_type)
     table.add_row(
         "🧵 Топик",
-        str(_routes.get(_chat_key(chat.get("id")))) if chat.get("id") is not None else "-",
+        str(_route_thread(chat.get("id"))) if chat.get("id") is not None else "-",
     )
 
     for label, value in extra_rows or []:
@@ -1059,7 +1273,9 @@ def _stats_text(shift_date: str, shift_name: str) -> str:
     динамика к прошлой смене, роботы на обслуживание и топы — чтобы вид
     не разъезжался между командой и автоматическим отчётом.
     """
-    return build_shift_summary(shift_date, shift_name)
+    metrics = shift_metrics(shift_date, shift_name)
+
+    return build_shift_summary(shift_date, shift_name, metrics)
 
 
 def _handle_stats(chat_id, args, reply_to):
@@ -1068,22 +1284,44 @@ def _handle_stats(chat_id, args, reply_to):
     shift_date = parts[0] if len(parts) > 0 else None
     shift_name = parts[1] if len(parts) > 1 else None
 
+    usage = (
+        "Usage: /stats [YYYY-MM-DD] [day|night]\n"
+        "Example: /stats 2026-03-08 night"
+    )
+
     if not shift_date and not shift_name:
         shift_date, shift_name = get_current_shift()
     elif not shift_date or not shift_name or shift_name not in ("day", "night"):
+        _send(chat_id, usage, reply_to_message_id=reply_to)
+        return
+
+    try:
+        datetime.strptime(shift_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
         _send(
             chat_id,
-            "Usage: /stats [YYYY-MM-DD] [day|night]\n"
-            "Example: /stats 2026-03-08 night",
+            f"⚠️ Bad date: {shift_date!r}\n\n{usage}",
             reply_to_message_id=reply_to,
         )
         return
 
-    _send(
-        chat_id,
-        _stats_text(shift_date, shift_name),
-        reply_to_message_id=reply_to,
-    )
+    try:
+        text = _stats_text(shift_date, shift_name)
+    except Exception:
+        logger.exception(
+            "Не удалось собрать статистику смены %s/%s",
+            shift_date,
+            shift_name,
+        )
+        _send(
+            chat_id,
+            "⚠️ Can't build the shift stats right now (see logs).",
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    _send(chat_id, text, reply_to_message_id=reply_to)
 
 
 def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool:
@@ -1121,7 +1359,7 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
         return True
 
     if command == "id":
-        thread_id = _routes.get(_chat_key(chat_id))
+        thread_id = _route_thread(chat_id)
         name = topic_name(chat_id, thread_id)
         allowed, reason = topic_allowed(chat_id, thread_id)
 
@@ -1246,7 +1484,8 @@ def handle_error_text(chat_id, sender, text, message_id):
 
         _send(
             chat_id,
-            f"✅ Saved: robot {parsed['robot']} — {parsed['error_text']}\n"
+            f"✅ Saved: robot {parsed['robot']} — "
+            f"{truncate(parsed['error_text'], 300)}\n"
             f"📊 Shift issues: {count}{suffix}",
             delete_after=CONFIRM_TTL_SECONDS,
         )
@@ -1326,7 +1565,21 @@ def handle_photo(chat_id, sender, message, message_id):
 
 
 def handle_update(update: dict, bot_username: str = None):
-    """Обрабатывает один апдейт Telegram."""
+    """
+    Обрабатывает один апдейт Telegram.
+
+    Метка «обработано» ставится только при успешном завершении: если
+    обработка упала, повторная доставка апдейта не будет отброшена как дубль.
+    """
+    key = _update_key(update)
+
+    _handle_update_inner(update, bot_username)
+
+    _mark_processed(key)
+
+
+def _handle_update_inner(update: dict, bot_username: str = None):
+    """Разбор апдейта без учёта дедупликации."""
     callback = update.get("callback_query")
 
     if callback:
@@ -1354,9 +1607,10 @@ def handle_update(update: dict, bot_username: str = None):
         return
 
     message_id = message.get("message_id")
+    key = _update_key(update)
 
-    if message_id is not None and _already_processed(message_id):
-        logger.info("Duplicate message %s, skipping", message_id)
+    if key and _is_processed(key):
+        logger.info("Апдейт %s уже обработан, пропускаю", key)
         return
 
     if _is_message_too_old(message.get("date")):
@@ -1372,7 +1626,7 @@ def handle_update(update: dict, bot_username: str = None):
     _learn_topic_from_message(chat_id, message)
 
     # Все ответы бота уходят в тот же топик.
-    _routes[_chat_key(chat_id)] = thread_id
+    _set_route(chat_id, thread_id, chat.get("type"))
 
     text = message.get("text")
     caption = message.get("caption")
@@ -1477,7 +1731,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         _send(chat_id, hint, reply_to_message_id=message_id)
         return
 
-    pending = peek_pending_status(chat_id, sender.get("id"))
+    pending = take_pending_status(chat_id, sender.get("id"))
 
     if pending:
         # Это описание причины для смены статуса, а не сообщение об ошибке.
@@ -1520,6 +1774,9 @@ LEASE_HOLDER = None
 LEASE_STATUS = "starting"
 LEASE_MODE = "unknown"   # acquired / taken-over / no-table / held-by-other
 
+# Когда последний раз успешно вызывали getUpdates (для /health).
+_LAST_POLL_AT = 0.0
+
 # Статус таблицы привязок (проверяется один раз на старте, чтобы
 # /health не дёргал Supabase на каждый запрос).
 USERS_TABLE_OK = None
@@ -1536,7 +1793,10 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
     """
     global LEASE_STATUS
 
-    offset = None
+    offset = load_saved_offset()
+
+    if offset is not None:
+        logger.info("Продолжаю с сохранённого offset=%s", offset)
 
     logger.info(
         "Telegram polling started (bot=%s, holder=%s)",
@@ -1544,17 +1804,42 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
         lease_holder,
     )
 
-    while stop_event is None or not stop_event.is_set():
-        if lease_holder and not bot_lease.refresh(lease_holder):
-            LEASE_STATUS = "lease-lost"
-            logger.error(
-                "Лиз опроса потерян — останавливаю polling, "
-                "чтобы не дублировать сообщения"
-            )
-            return
+    global _LAST_POLL_AT
 
-        # Таймаут меньше TTL лиза: цикл успевает продлить лиз с запасом.
-        updates = tg.get_updates(offset=offset, timeout=20)
+    while stop_event is None or not stop_event.is_set():
+        if lease_holder:
+            try:
+                state = bot_lease.check(lease_holder)
+            except Exception:
+                # Проверка лиза не должна убивать поток опроса.
+                logger.exception("Ошибка проверки лиза — продолжаю опрос")
+                state = "error"
+
+            if state == "lost":
+                LEASE_STATUS = "lease-lost"
+                logger.error(
+                    "Лиз опроса потерян — останавливаю polling, "
+                    "чтобы не дублировать сообщения"
+                )
+                return
+
+            if state == "error":
+                # Транзиентный сбой базы: молча замолчать хуже, чем
+                # продолжить опрос — лиз при этом не продлевается.
+                logger.warning(
+                    "Не удалось продлить лиз (база недоступна) — "
+                    "продолжаю опрос"
+                )
+
+        try:
+            # Таймаут меньше TTL лиза: цикл успевает продлить лиз с запасом.
+            updates = tg.get_updates(offset=offset, timeout=20)
+        except Exception:
+            logger.exception("Ошибка getUpdates — пауза и повтор")
+            time.sleep(3)
+            continue
+
+        _LAST_POLL_AT = time.time()
 
         if updates is None:
             # Ошибка сети/токена — пауза и повтор.
@@ -1570,10 +1855,40 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
             try:
                 handle_update(update, BOT_USERNAME)
             except Exception:
+                # Метка не ставится: при повторной доставке обработаем снова.
                 logger.exception("Failed to handle update %s", update_id)
+
+        if updates:
+            # Фиксируем offset, чтобы после перезапуска Telegram не прислал
+            # эти же апдейты повторно.
+            save_offset(offset)
 
         if not updates:
             time.sleep(0.2)
+
+
+def lease_heartbeat_loop(holder: str):
+    """
+    Продлевает лиз отдельным потоком.
+
+    В цикле опроса check() вызывается раз за итерацию, а один апдейт с фото
+    может занять больше минуты — без отдельного heartbeat лиз успел бы
+    протухнуть и его забрал бы standby-сосед (два опрашивающих = дубли).
+    """
+    while True:
+        time.sleep(LEASE_HEARTBEAT_SECONDS)
+
+        try:
+            state = bot_lease.check(holder)
+        except Exception:
+            logger.exception("Ошибка heartbeat лиза — повторю позже")
+            continue
+
+        if state == "lost":
+            logger.error(
+                "Лиз опроса потерян (heartbeat) — цикл опроса остановится сам"
+            )
+            return
 
 
 def start_polling(lease_holder: str = None) -> threading.Thread:
@@ -1588,22 +1903,6 @@ def start_polling(lease_holder: str = None) -> threading.Thread:
     return thread
 
 
-def start_polling_and_reports(holder: str, lease_mode: str = None):
-    """Этот инстанс выиграл лиз: опрашиваем Telegram и шлём отчёты за смену."""
-    global LEASE_HOLDER, LEASE_STATUS, LEASE_MODE
-
-    LEASE_HOLDER = holder
-    LEASE_STATUS = "poller"
-
-    if lease_mode:
-        LEASE_MODE = lease_mode
-
-    # Отчёт за смену шлёт только опрашивающий инстанс, иначе будут дубли.
-    start_shift_scheduler()
-
-    start_polling(holder)
-
-
 def install_shutdown_handler(holder: str):
     """
     На SIGTERM/SIGINT отпускаем лиз, чтобы после деплоя новый контейнер
@@ -1611,6 +1910,13 @@ def install_shutdown_handler(holder: str):
     """
     def handler(signum, _frame):
         logger.info("Сигнал %s — отпускаю лиз опроса и завершаюсь", signum)
+
+        try:
+            # Даём текущему апдейту дописаться: резкий выход рвёт запись
+            # посередине (например, exceptions записан, exceptions_glpc — нет).
+            time.sleep(SHUTDOWN_GRACE_SECONDS)
+        except Exception:
+            pass
 
         try:
             bot_lease.release(holder)
@@ -1626,31 +1932,87 @@ def install_shutdown_handler(holder: str):
             signal.signal(sig, handler)
 
 
-def standby_loop(holder: str, interval: int = 10):
+def standby_loop(holder: str, interval: int = None) -> bool:
     """
-    Ждём, когда лиз освободится, и тогда становимся опрашивающим.
+    Ждём, когда освободится лиз. True — получили его.
 
-    Так второй инстанс (например, локальный) может висеть запущенным и
-    подхватить работу, если серверный умрёт.
+    Опрос запускает не эта функция, а poller_supervisor: жизненный цикл
+    polling живёт в одном месте и его нельзя случайно запустить дважды.
     """
-    global LEASE_STATUS
+    global LEASE_STATUS, LEASE_MODE
+
+    interval = STANDBY_RETRY_SECONDS if interval is None else interval
 
     logger.info("Standby: жду освобождения лиза опроса (%s)", holder)
 
     while True:
         time.sleep(interval)
 
-        result = bot_lease.acquire(holder)
+        try:
+            result = bot_lease.acquire(holder)
+        except Exception:
+            logger.exception("Ошибка получения лиза — повторю позже")
+            LEASE_STATUS = "standby (error)"
+            continue
 
         if result["acquired"]:
-            console.print(
-                "[bold green]Лиз освободился — этот инстанс стал "
-                "опрашивающим[/bold green]"
-            )
-            start_polling_and_reports(holder, result.get("status"))
-            return
+            LEASE_MODE = result["status"]
+            return True
 
         LEASE_STATUS = f"standby ({result.get('holder')})"
+
+
+def poller_supervisor(holder: str, acquired: bool = False):
+    """
+    Единственный владелец жизненного цикла опроса.
+
+    Держим лиз — опрашиваем Telegram и шлём отчёты; потеряли лиз — уходим в
+    standby и ждём его снова. Так инстанс не может «зависнуть» без опроса.
+    """
+    global LEASE_HOLDER, LEASE_STATUS
+
+    LEASE_HOLDER = holder
+    scheduler_started = False
+
+    while True:
+        if acquired:
+            LEASE_STATUS = "poller"
+
+            if not scheduler_started:
+                # Отчёт за смену шлёт только опрашивающий инстанс.
+                start_shift_scheduler()
+                scheduler_started = True
+
+            threading.Thread(
+                target=lease_heartbeat_loop,
+                args=(holder,),
+                name="lease-heartbeat",
+                daemon=True,
+            ).start()
+
+            try:
+                start_polling(holder).join()
+            except Exception:
+                logger.exception("Поток опроса упал")
+
+            acquired = False
+            LEASE_STATUS = "standby (lease lost)"
+            logger.warning("Опрос остановлен (лиз потерян) — перехожу в standby")
+            continue
+
+        try:
+            got_lease = standby_loop(holder)
+        except Exception:
+            logger.exception("Ошибка ожидания лиза — повторю через паузу")
+            LEASE_STATUS = "standby (error)"
+            time.sleep(STANDBY_RETRY_SECONDS)
+            continue
+
+        if got_lease:
+            acquired = True
+            console.print(
+                "[bold green]Лиз получен — начинаю опрашивать Telegram[/bold green]"
+            )
 
 
 # ============================================================
@@ -1659,19 +2021,44 @@ def standby_loop(holder: str, interval: int = 10):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
+    """
+    Liveness-сигнал для Railway.
+
+    503 — опрашивающий инстанс завис или потерял лиз: контейнер надо
+    перезапустить. Standby (лиз у соседа) — это нормально, отдаём 200.
+    """
+    now = time.time()
+    healthy = True
+    reason = "ok"
+
+    if LEASE_STATUS == "poller":
+        if _LAST_POLL_AT and (now - _LAST_POLL_AT) > POLL_STALL_SECONDS:
+            healthy, reason = False, "poller stalled"
+    elif LEASE_STATUS == "lease-lost" or "error" in str(LEASE_STATUS):
+        healthy, reason = False, str(LEASE_STATUS)
+
+    payload = {
+        "status": "ok" if healthy else "degraded",
+        "reason": reason,
         "bot": BOT_USERNAME,
         "users_table": USERS_TABLE_OK,
         "poller": LEASE_STATUS,
         "poller_holder": LEASE_HOLDER,
         "lease": LEASE_MODE,
+        "last_poll_seconds_ago": (
+            round(now - _LAST_POLL_AT) if _LAST_POLL_AT else None
+        ),
         "time": now_warsaw().strftime("%d.%m.%Y %H:%M:%S"),
-    })
+    }
+
+    return jsonify(payload), (200 if healthy else 503)
 
 
 @app.route("/shift_stats", methods=["GET"])
 def shift_stats_endpoint():
+    if STATS_TOKEN and request.args.get("token") != STATS_TOKEN:
+        return jsonify({"error": "forbidden"}), 403
+
     shift_date = request.args.get("date")
     shift_name = request.args.get("shift")
 
@@ -1760,6 +2147,9 @@ def main():
             "[/yellow]"
         )
 
+    # Старые фото из Telegram не копим на диске.
+    start_images_janitor()
+
     # Удаление служебных подтверждений («хвостов») через CONFIRM_TTL_SECONDS.
     if CONFIRM_TTL_SECONDS > 0:
         start_deletion_worker()
@@ -1770,32 +2160,32 @@ def main():
 
     # Один Telegram — один опрашивающий. Иначе Telegram отдаёт одни и те же
     # сообщения обоим инстансам и они обрабатываются дважды (дубли).
-    global LEASE_STATUS
+    global LEASE_STATUS, LEASE_MODE
     holder = bot_lease.holder_id()
     lease = bot_lease.acquire(holder)
 
+    LEASE_MODE = lease["status"]
     install_shutdown_handler(holder)
 
     if lease["acquired"]:
-        LEASE_MODE = lease["status"]
         console.print(
             f"[green]Опрашиваю Telegram (лиз: {lease['status']})[/green]"
         )
-        start_polling_and_reports(holder, lease["status"])
     else:
         LEASE_STATUS = f"standby ({lease.get('holder')})"
-        LEASE_MODE = lease["status"]
         console.print(
             f"[bold yellow]Telegram уже опрашивает другой инстанс "
             f"({lease.get('holder')}) — этот процесс в режиме standby, "
             f"сообщения он не обрабатывает.[/bold yellow]"
         )
-        threading.Thread(
-            target=standby_loop,
-            args=(holder,),
-            name="lease-standby",
-            daemon=True,
-        ).start()
+
+    # Жизненный цикл опроса: держим лиз — опрашиваем, потеряли — снова ждём.
+    threading.Thread(
+        target=poller_supervisor,
+        args=(holder, lease["acquired"]),
+        name="poller-supervisor",
+        daemon=True,
+    ).start()
 
     port = int(os.environ.get("PORT", 7777))
 

@@ -26,10 +26,11 @@ import os
 import threading
 import time
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
+from supabase_storage import download_json, upload_json
 from pending_photos import TARGET_HOOK_URL
 from sendToDataBase import WAREHOUSE, shift_report_data
 from logging_config import setup_logging
@@ -61,6 +62,9 @@ MAINTENANCE_THRESHOLD = _env_int("ERROR_THRESHOLD", 3)
 
 # С какого числа исключений за смену карточка становится оранжевой.
 REPORT_WARN_TOTAL = _env_int("REPORT_WARN_TOTAL", 5)
+
+# Bucket для маркеров «отчёт за смену отправлен».
+REPORT_BUCKET = os.environ.get("SUPABASE_REPORT_BUCKET", "bot-reports")
 
 # Отчёт отправляется в течение этого окна после конца смены.
 REPORT_WINDOW_MINUTES = _env_int("REPORT_WINDOW_MINUTES", 15)
@@ -101,8 +105,15 @@ def _get_reportable_shift(now: datetime):
 
 
 def previous_shift(shift_date: str, shift_name: str):
-    """(date, name) смены, которая была перед указанной."""
-    date = datetime.strptime(shift_date, "%Y-%m-%d").date()
+    """(date, name) смены перед указанной. None — дата некорректна."""
+    try:
+        date = datetime.strptime(str(shift_date), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректная дата смены %r — сравнение с прошлой сменой пропускаю",
+            shift_date,
+        )
+        return None
 
     if shift_name == "day":
         # День D идёт после ночи, начавшейся D-1.
@@ -139,7 +150,10 @@ def format_duration(minutes) -> str:
     return f"{hours}h {rest:02d}m"
 
 
-def format_delta(delta: int) -> str:
+def format_delta(delta) -> str:
+    if delta is None:
+        return "—"
+
     if delta > 0:
         return f"+{delta} ▲"
 
@@ -211,20 +225,25 @@ def shift_metrics(shift_date: str, shift_name: str) -> dict:
         maintenance_threshold=MAINTENANCE_THRESHOLD,
     )
 
-    prev_date, prev_name = previous_shift(shift_date, shift_name)
+    if data is None:
+        return None
 
-    previous = shift_report_data(
-        prev_date,
-        prev_name,
-        maintenance_threshold=MAINTENANCE_THRESHOLD,
-    )
+    previous_key = previous_shift(shift_date, shift_name)
+    previous = None
+
+    if previous_key:
+        previous = shift_report_data(
+            previous_key[0],
+            previous_key[1],
+            maintenance_threshold=MAINTENANCE_THRESHOLD,
+        )
 
     data["previous"] = {
-        "date": prev_date,
-        "shift": prev_name,
-        "total": previous["total"],
+        "date": previous_key[0] if previous_key else None,
+        "shift": previous_key[1] if previous_key else None,
+        "total": previous["total"] if previous else None,
     }
-    data["delta"] = data["total"] - previous["total"]
+    data["delta"] = data["total"] - previous["total"] if previous else None
 
     return data
 
@@ -258,6 +277,12 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
     """Текстовый вариант отчёта."""
     metrics = metrics or shift_metrics(shift_date, shift_name)
 
+    if metrics is None:
+        return (
+            "⚠️ Can't read the shift data right now (database error). "
+            "Please try again in a minute."
+        )
+
     header = report_title(shift_date, shift_name)
     total = metrics["total"]
 
@@ -272,8 +297,9 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
         f"Total {total} exceptions · {len(metrics['robots'])} robots · "
         f"{len(metrics['employees'])} employees",
         f"Downtime {format_duration(metrics['downtime_minutes'])} · "
-        f"vs previous shift ({_pretty_date(previous['date'])} {previous['shift']}) "
-        f"{format_delta(metrics['delta'])}",
+        f"vs previous shift "
+        f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
+        f"{previous['shift'] or ''}) {format_delta(metrics['delta'])}",
         "",
         f"⚠️ Maintenance ({MAINTENANCE_THRESHOLD}+ per shift): "
         f"{_maintenance_line(metrics['maintenance'])}",
@@ -288,9 +314,12 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
     return "\n".join(lines)
 
 
-def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None) -> dict:
-    """Интерактивная карточка Lark."""
+def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None):
+    """Интерактивная карточка Lark. None — данных нет (ошибка БД)."""
     metrics = metrics or shift_metrics(shift_date, shift_name)
+
+    if metrics is None:
+        return None
 
     card = {
         "config": {"wide_screen_mode": True},
@@ -326,7 +355,8 @@ def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None) -> 
                 f"**employees** {len(metrics['employees'])}\n"
                 f"**Downtime** {format_duration(metrics['downtime_minutes'])}\n"
                 f"**vs previous shift** "
-                f"({_pretty_date(previous['date'])} {previous['shift']}): "
+                f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
+                f"{previous['shift'] or ''}): "
                 f"**{format_delta(metrics['delta'])}**"
             ),
         },
@@ -382,13 +412,58 @@ def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None) -> 
 # SENDING
 # ============================================================
 
-def send_shift_report(shift_date: str, shift_name: str):
+def report_marker_name(shift_date: str, shift_name: str) -> str:
+    return f"{shift_date}-{shift_name}.json"
+
+
+def report_already_sent(shift_date: str, shift_name: str) -> bool:
+    """True — отчёт за эту смену уже уходил (маркер в Supabase Storage)."""
+    marker = download_json(
+        REPORT_BUCKET,
+        report_marker_name(shift_date, shift_name),
+    )
+
+    return bool(marker)
+
+
+def mark_report_sent(shift_date: str, shift_name: str) -> bool:
+    """Ставит маркер, что отчёт за смену отправлен."""
+    return upload_json(
+        REPORT_BUCKET,
+        report_marker_name(shift_date, shift_name),
+        {
+            "shift_date": shift_date,
+            "shift_name": shift_name,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def send_shift_report(shift_date: str, shift_name: str, force: bool = False):
     """
     Отправляет отчёт за смену в целевую группу.
 
-    Сначала карточкой, при отказе — текстом.
+    Сначала карточкой, при отказе — текстом. Повторная отправка за ту же
+    смену блокируется маркером: перезапуск бота внутри окна отчёта не должен
+    прислать дубль.
     """
+    if not force and report_already_sent(shift_date, shift_name):
+        logger.warning(
+            "Отчёт за %s/%s уже отправлялся — пропускаю, чтобы не дублировать",
+            shift_date,
+            shift_name,
+        )
+        return {"skipped": True, "reason": "already-sent"}
+
     metrics = shift_metrics(shift_date, shift_name)
+
+    if metrics is None:
+        logger.error(
+            "Отчёт за %s/%s не отправляю: не удалось прочитать данные смены",
+            shift_date,
+            shift_name,
+        )
+        return {"skipped": True, "reason": "db-error"}
 
     logger.info(
         "Sending shift report: date=%s shift=%s total=%s downtime=%sm",
@@ -403,6 +478,7 @@ def send_shift_report(shift_date: str, shift_name: str):
 
     if hook_ok(result):
         logger.info("Shift report sent as card: %s/%s", shift_date, shift_name)
+        mark_report_sent(shift_date, shift_name)
         return result
 
     logger.warning("Card rejected (%s) — отправляю текстовый отчёт", result)
@@ -417,12 +493,25 @@ def send_shift_report(shift_date: str, shift_name: str):
         result,
     )
 
+    if hook_ok(result):
+        mark_report_sent(shift_date, shift_name)
+
     return result
 
 
 # ============================================================
 # SCHEDULER
 # ============================================================
+
+def _report_sent_ok(result) -> bool:
+    """Считать ли отчёт доставленным (для отметки «уже отправлен»)."""
+    if isinstance(result, dict) and result.get("skipped"):
+        # Маркер «уже отправляли» — повторять не нужно;
+        # ошибка чтения данных — нужно (попробуем в следующем цикле).
+        return result.get("reason") == "already-sent"
+
+    return hook_ok(result)
+
 
 def _scheduler_loop():
     """Фоновый цикл: проверяет время и шлёт отчёт раз за смену."""
@@ -434,8 +523,12 @@ def _scheduler_loop():
             reportable = _get_reportable_shift(now)
 
             if reportable and reportable not in sent:
-                sent.add(reportable)
-                send_shift_report(*reportable)
+                result = send_shift_report(*reportable)
+
+                # Отмечаем смену отправленной только при успехе: иначе
+                # неудачная отправка больше никогда не повторится.
+                if _report_sent_ok(result):
+                    sent.add(reportable)
         except Exception:
             logger.exception("Shift report scheduler error")
 
@@ -491,7 +584,7 @@ def main():
         print(build_shift_summary(shift_date, shift_name, metrics))
 
     if args.send:
-        result = send_shift_report(shift_date, shift_name)
+        result = send_shift_report(shift_date, shift_name, force=True)
         print("\n--- отправлено в Lark ---")
         print(json.dumps(result, ensure_ascii=False))
 

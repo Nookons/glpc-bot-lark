@@ -89,6 +89,27 @@ def _headers() -> dict:
     }
 
 
+def _json_or_none(response, table: str, action: str):
+    """
+    Разбирает JSON-ответ PostgREST.
+
+    Не-JSON (HTML от прокси, пустое тело, обрезанный ответ) — это ошибка, а
+    не «пустой результат»: возвращаем None, чтобы вызывающий код не принял
+    сбой за «данных нет».
+    """
+    try:
+        return response.json()
+    except ValueError:
+        logger.error(
+            "%s %s: ответ не JSON (HTTP %s, %s байт)",
+            action,
+            table,
+            response.status_code,
+            len(response.content or b""),
+        )
+        return None
+
+
 def _rest_get(table: str, params: dict = None):
     """
     GET /rest/v1/<table>. Возвращает JSON (список или объект)
@@ -106,7 +127,7 @@ def _rest_get(table: str, params: dict = None):
 
         response.raise_for_status()
 
-        return response.json()
+        return _json_or_none(response, table, "GET")
 
     except requests.exceptions.RequestException as e:
         logger.error("GET %s failed: %s", table, e)
@@ -137,7 +158,7 @@ def _rest_post(table: str, payload: dict):
 
         logger.info("POST %s -> %s", table, response.status_code)
 
-        return response.json()
+        return _json_or_none(response, table, "POST")
 
     except requests.exceptions.RequestException as e:
         logger.error("POST %s failed: %s", table, e)
@@ -178,7 +199,7 @@ def rest_upsert(table: str, payload: dict, on_conflict: str):
 
         logger.info("UPSERT %s -> %s", table, response.status_code)
 
-        return response.json()
+        return _json_or_none(response, table, "UPSERT")
 
     except requests.exceptions.RequestException as e:
         logger.error("UPSERT %s failed: %s", table, e)
@@ -245,7 +266,7 @@ def rest_patch(table: str, params: dict, payload: dict):
 
         logger.info("PATCH %s -> %s", table, response.status_code)
 
-        return response.json()
+        return _json_or_none(response, table, "PATCH")
 
     except requests.exceptions.RequestException as e:
         logger.error("PATCH %s failed: %s", table, e)
@@ -376,6 +397,15 @@ def shift_report_data(
         warehouse=warehouse,
         limit=2000,
     )
+
+    if rows is None:
+        # Ошибка запроса: выдавать это за «смена без исключений» нельзя.
+        logger.error(
+            "Не удалось получить исключения за %s/%s — метрики недоступны",
+            shift_date,
+            shift_name,
+        )
+        return None
 
     by_robot: dict = {}
     by_type: dict = {}
@@ -573,7 +603,7 @@ def send_to_data_base(
     end_time = (
         now
         + timedelta(
-            minutes=best_match["solving_time"]
+            minutes=int(best_match.get("solving_time") or 0)
         )
     )
 
@@ -601,7 +631,7 @@ def send_to_data_base(
     if not robot_data:
         obj = {
             "robot_number": table_lines['robot'],
-            "employee_id": employee["card_id"],
+            "employee_id": employee.get("card_id"),
             "warehouse": WAREHOUSE,
         }
 
@@ -655,19 +685,19 @@ def send_to_data_base(
     obj = {
         "workstation_id": None,
 
-        "robot_id": robot["id"],
+        "robot_id": robot.get("id"),
 
-        "handle_by": employee["card_id"],
+        "handle_by": employee.get("card_id"),
 
         "start_time": now_iso,
 
         "end_time": end_time_iso,
 
-        "exception_id": best_match["id"],
+        "exception_id": best_match.get("id"),
 
         "shift_type": shift_name,
 
-        "warehouse": employee["home_warehouse"],
+        "warehouse": employee.get("home_warehouse"),
     }
 
     # ========================================================
@@ -675,45 +705,33 @@ def send_to_data_base(
     # ========================================================
 
     old_obj = {
-        "error_robot": robot["robot_number"],
+        "error_robot": robot.get("robot_number"),
 
-        "add_by": employee["card_id"],
+        "add_by": employee.get("card_id"),
 
-        "device_type": robot["robot_type"],
+        "device_type": robot.get("robot_type"),
 
-        "employee": employee["user_name"],
+        "employee": employee.get("user_name"),
 
         "error_end_time": end_time_iso,
 
         "error_start_time": now_iso,
 
-        "first_column": best_match[
-            "issue_sub_type"
-        ],
+        "first_column": best_match.get("issue_sub_type"),
 
-        "issue_description": best_match[
-            "issue_description"
-        ],
+        "issue_description": best_match.get("issue_description"),
 
-        "issue_type": best_match[
-            "issue_type"
-        ],
+        "issue_type": best_match.get("issue_type"),
 
-        "recovery_title": best_match[
-            "recovery_title"
-        ],
+        "recovery_title": best_match.get("recovery_title"),
 
-        "second_column": best_match[
-            "issue_sub_type"
-        ],
+        "second_column": best_match.get("issue_sub_type"),
 
-        "solving_time": best_match[
-            "solving_time"
-        ],
+        "solving_time": int(best_match.get("solving_time") or 0),
 
         "uniq_key": (
-            f"{employee['user_name']}."
-            f"{robot['robot_number']}."
+            f"{employee.get('user_name')}."
+            f"{robot.get('robot_number')}."
             f"{now_iso}"
         ),
 

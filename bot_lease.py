@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 
 from datetime import datetime, timedelta, timezone
 
@@ -48,7 +49,12 @@ LEASE_NAME = os.environ.get("BOT_LEASE_NAME", "glpc-bot-telegram")
 LEASE_TTL_SECONDS = int(os.environ.get("BOT_LEASE_TTL", "60"))
 
 _table_ok = None
+_table_checked_at = 0.0
 _warned_no_table = False
+
+# Если таблицы нет, проверяем её снова раз в 5 минут: миграцию могли
+# применить без перезапуска бота.
+_TABLE_RECHECK_SECONDS = 300
 
 
 def holder_id() -> str:
@@ -68,7 +74,9 @@ def _now_iso() -> str:
 def _is_stale(heartbeat_at, ttl: int) -> bool:
     """Просрочен ли heartbeat соседа (нечитаемое время считаем живым)."""
     if not heartbeat_at:
-        return False
+        # Пустой/битый heartbeat — лиз считаем брошенным, иначе он
+        # «залипнет» навсегда и опрос не переедет на живой инстанс.
+        return True
 
     try:
         moment = datetime.fromisoformat(str(heartbeat_at).replace("Z", "+00:00"))
@@ -82,19 +90,28 @@ def _is_stale(heartbeat_at, ttl: int) -> bool:
 
 
 def _has_table() -> bool:
-    global _table_ok
+    global _table_ok, _table_checked_at
 
-    if _table_ok is None:
-        _table_ok = table_exists(TABLE)
+    now = time.time()
 
-        if _table_ok:
-            logger.info("Лиз единственного инстанса: таблица %s найдена", TABLE)
-        else:
-            logger.warning(
-                "Таблицы %s нет — защита от двойного запуска выключена. "
-                "Выполните sql/bot_leases.sql и перезапустите бота.",
-                TABLE,
-            )
+    if _table_ok is True:
+        return True
+
+    if _table_ok is False and now - _table_checked_at < _TABLE_RECHECK_SECONDS:
+        return False
+
+    _table_ok = table_exists(TABLE)
+    _table_checked_at = now
+
+    if _table_ok:
+        logger.info("Лиз единственного инстанса: таблица %s найдена", TABLE)
+    else:
+        logger.warning(
+            "Таблицы %s нет — защита от двойного запуска выключена. "
+            "Выполните sql/bot_leases.sql (проверю снова через %s с).",
+            TABLE,
+            _TABLE_RECHECK_SECONDS,
+        )
 
     return _table_ok
 
@@ -111,20 +128,56 @@ def _read_row():
     return rows[0] if rows else {}
 
 
-def refresh(holder: str = None, ttl: int = None) -> bool:
-    """Продлевает лиз. False — лиз больше не наш (или база недоступна)."""
+def check(holder: str = None) -> str:
+    """
+    Состояние лиза: "ok" | "lost" | "error".
+
+    * "ok"    — лиз наш, heartbeat продлён;
+    * "lost"  — лиз забрал другой инстанс или строку удалили: опрос надо
+                немедленно прекратить, иначе будут дубли;
+    * "error" — база недоступна (транзиентно): опрос прекращать нельзя,
+                иначе бот замолчит из-за сетевого сбоя.
+
+    Без таблицы лиза всегда "ok" (защита выключена, но работать надо).
+    """
     holder = holder or holder_id()
 
     if not _has_table():
-        return True
+        return "ok"
 
-    updated = rest_patch(
+    row = _read_row()
+
+    if row is None:
+        return "error"
+
+    if not row:
+        return "lost"
+
+    if str(row.get("holder") or "") != holder:
+        return "lost"
+
+    renewed = rest_patch(
         TABLE,
         params={"name": f"eq.{LEASE_NAME}", "holder": f"eq.{holder}"},
         payload={"heartbeat_at": _now_iso()},
     )
 
-    return bool(updated)
+    if renewed is None:
+        return "error"
+
+    # Пустой ответ = строку лиза удалили или она уже не наша.
+    return "ok" if renewed else "lost"
+
+
+def refresh(holder: str = None, ttl: int = None) -> bool:
+    """
+    Продлевает лиз. False — лиз потерян (нужно прекратить опрос).
+
+    Транзиентная ошибка базы возвращает True: продолжать опрос безопаснее,
+    чем молча остановиться.
+    """
+    return check(holder) != "lost"
+
 
 
 def release(holder: str = None) -> bool:
@@ -188,7 +241,7 @@ def acquire(holder: str = None, ttl: int = None) -> dict:
             },
         )
 
-        if created is not None:
+        if created:
             logger.info("Лиз опроса занят (создан): %s", holder)
             return {"acquired": True, "status": "acquired", "holder": holder}
 

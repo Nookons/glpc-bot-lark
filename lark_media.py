@@ -8,6 +8,7 @@ import base64
 import requests
 
 from getToken import get_tenant_access_token
+from text_utils import LARK_TEXT_LIMIT, truncate
 
 LARK_HOOK_SECRET = os.environ.get("LARK_HOOK_SECRET", "")
 
@@ -54,6 +55,30 @@ def _hook_payload_extra():
     return {"timestamp": timestamp, "sign": sign}
 
 
+def _hook_post(url: str, payload: dict):
+    """
+    POST в webhook с защитой от таймаутов и не-JSON ответов.
+
+    Возвращает dict: при сбое — {"code": -1, ...}, чтобы вызывающий код
+    увидел неуспех (hook_ok) и сработал fallback, а не получил исключение.
+    """
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+    except requests.exceptions.RequestException as e:
+        logger.error("Lark webhook недоступен: %s", e)
+        return {"code": -1, "msg": str(e)}
+
+    try:
+        return response.json()
+    except ValueError:
+        logger.error(
+            "Lark webhook вернул не-JSON (HTTP %s, %s байт)",
+            response.status_code,
+            len(response.content or b""),
+        )
+        return {"code": -1, "msg": f"non-json HTTP {response.status_code}"}
+
+
 def hook_ok(result) -> bool:
     """Успешен ли ответ webhook: старая схема StatusCode, новая — code."""
     if not isinstance(result, dict):
@@ -66,22 +91,22 @@ def send_card_via_hook(hook_url: str, card: dict):
     """Отправляет интерактивную карточку в группу через webhook."""
     payload = {"msg_type": "interactive", "card": card}
     payload.update(_hook_payload_extra())
-    resp = requests.post(hook_url, json=payload, timeout=15)
-    return resp.json()
+    return _hook_post(hook_url, payload)
 
 
 def send_text_via_hook(hook_url: str, text: str):
-    payload = {"msg_type": "text", "content": {"text": text}}
+    payload = {
+        "msg_type": "text",
+        "content": {"text": truncate(text, LARK_TEXT_LIMIT)},
+    }
     payload.update(_hook_payload_extra())
-    resp = requests.post(hook_url, json=payload, timeout=10)
-    return resp.json()
+    return _hook_post(hook_url, payload)
 
 
 def send_image_via_hook(hook_url: str, image_key: str):
     payload = {"msg_type": "image", "content": {"image_key": image_key}}
     payload.update(_hook_payload_extra())
-    resp = requests.post(hook_url, json=payload, timeout=10)
-    return resp.json()
+    return _hook_post(hook_url, payload)
 
 
 def send_post_via_hook(hook_url: str, image_key: str, text: str):
@@ -100,8 +125,7 @@ def send_post_via_hook(hook_url: str, image_key: str, text: str):
         },
     }
     payload.update(_hook_payload_extra())
-    resp = requests.post(hook_url, json=payload, timeout=10)
-    return resp.json()
+    return _hook_post(hook_url, payload)
 
 
 def send_post_with_image_and_text(chat_id: str, image_key: str, text: str):

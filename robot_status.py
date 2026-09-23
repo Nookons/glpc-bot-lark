@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from sendToDataBase import WAREHOUSE, rest_get, rest_patch, rest_post
 from logging_config import setup_logging
+from text_utils import VALUE_LIMIT, truncate
 
 
 logger = setup_logging(__name__)
@@ -159,7 +160,7 @@ def change_robot_status(
         payload=payload,
     )
 
-    if updated is None:
+    if not updated:
         logger.error(
             "Не удалось изменить статус робота #%s",
             robot.get("robot_number"),
@@ -233,7 +234,7 @@ def build_status_card(
     """Карточка для Lark-группы."""
     spec = DIRECTIONS[direction]
     robot = result["robot"]
-    note = result.get("problem_note") or "—"
+    note = truncate(result.get("problem_note") or "—", VALUE_LIMIT)
 
     return {
         "config": {"wide_screen_mode": True},

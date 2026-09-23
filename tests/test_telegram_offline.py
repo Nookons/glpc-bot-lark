@@ -13,6 +13,7 @@ Telegram API, Supabase и Lark-хук подменяются заглушкам�
 import json
 import os
 import signal
+import threading
 import sys
 import tempfile
 import time
@@ -28,6 +29,11 @@ os.environ["TELEGRAM_TOPIC_NAME"] = ""
 os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
 import telegram_api as tg  # noqa: E402
+
+# Настоящая send_message нужна для проверки обрезки текста:
+# дальше в файле tg.send_message подменяется заглушкой.
+REAL_SEND_MESSAGE = tg.send_message
+
 import telegram_bot as bot  # noqa: E402
 import bot_lease  # noqa: E402
 import robot_status  # noqa: E402
@@ -213,6 +219,10 @@ bot.resolve_employee_name = fake_resolve_employee_name
 bot.link_user = fake_link_user
 bot.unlink_user = fake_unlink_user
 bot.send_to_data_base = fake_send_to_data_base
+
+# Offset Telegram в тестах не читаем и не пишем в настоящий Storage.
+bot.load_saved_offset = lambda: None
+bot.save_offset = lambda offset: True
 bot.count_robot_errors_in_shift = fake_count_robot_errors_in_shift
 bot.forward_error = fake_forward_error
 bot.handle_incoming_photo = fake_handle_incoming_photo
@@ -798,6 +808,7 @@ def reset_topics(topic_id=None, topic_name=""):
     bot._topic_names.clear()
     bot._routes.clear()
     bot._hinted_threads.clear()
+    bot._chat_types.clear()
 
 
 def test_topic_filter_by_id():
@@ -1039,34 +1050,56 @@ def test_send_fallback_to_monitored_topic():
     )
 
 
-def test_send_fallback_guarded_by_allow_list():
-    """Без чата в белом списке ответ не должен улетать в группу."""
+def test_send_fallback_scoped_to_groups():
+    """Откат в отслеживаемый топик — только для групп, не для лички."""
     reset_topics(topic_id=555)
 
     original_allowed = bot.ALLOWED_CHAT_IDS
     original_send = tg.send_message
-    bot.ALLOWED_CHAT_IDS = {999}
+    bot.ALLOWED_CHAT_IDS = set()
 
     calls = []
 
     def always_fail(chat_id, text, reply_to_message_id=None, disable_notification=False,
                     message_thread_id=None, reply_markup=None):
-        calls.append(message_thread_id)
+        calls.append((chat_id, message_thread_id))
         return None
 
     tg.send_message = always_fail
 
     try:
-        result = bot._send(-500, "привет")
+        bot._set_route(-500, 2, "supergroup")
+        bot._send(-500, "привет")
+        group_calls = list(calls)
+
+        calls.clear()
+        bot._set_route(100500, None, "private")
+        bot._send(100500, "привет")
+        private_calls = list(calls)
+
+        calls.clear()
+        bot._set_route(777, 2, None)
+        bot._send(777, "привет")
+        unknown_calls = list(calls)
     finally:
         tg.send_message = original_send
         bot.ALLOWED_CHAT_IDS = original_allowed
         reset_topics()
 
     check(
-        "fallback: чужие чаты не получают ответ в группу",
-        result is None and calls == [None],
-        calls,
+        "fallback: группа получает ответ в отслеживаемый топик",
+        group_calls == [(-500, 2), (-500, 555)],
+        group_calls,
+    )
+    check(
+        "fallback: в личке ответ в группу не уходит",
+        private_calls == [(100500, None)],
+        private_calls,
+    )
+    check(
+        "fallback: неизвестный чат без белого списка не получает откат",
+        unknown_calls == [(777, 2)],
+        unknown_calls,
     )
 
 
@@ -1765,6 +1798,250 @@ def _iso(seconds_ago=0):
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def test_text_truncation_helpers():
+    from text_utils import TELEGRAM_TEXT_LIMIT, truncate
+
+    check("truncate: короткий текст не трогаем", truncate("abc", 10) == "abc")
+    check("truncate: длинный обрезается", truncate("x" * 100, 20).endswith("…"), truncate("x" * 100, 20))
+    check("truncate: длина не превышает лимит", len(truncate("x" * 100, 20)) <= 20)
+    check("truncate: None -> пустая строка", truncate(None) == "")
+
+    # Telegram отклоняет сообщения > 4096: проверяем, что обрезаем до отправки.
+    original_call = tg.call
+    payloads = []
+
+    tg.call = lambda method, payload=None, timeout=40: (
+        payloads.append((method, payload)), {"message_id": 1}
+    )[1]
+
+    try:
+        REAL_SEND_MESSAGE(-500, "y" * 10_000)
+    finally:
+        tg.call = original_call
+
+    sent_text = payloads[0][1]["text"] if payloads else ""
+    check(
+        "telegram: длинный текст обрезается перед отправкой",
+        len(sent_text) <= TELEGRAM_TEXT_LIMIT and sent_text.endswith("…"),
+        len(sent_text),
+    )
+
+
+def test_stats_command_validates_date():
+    sent = run(make_update(text="/stats 2026-99-99 day"))
+    check(
+        "stats: некорректная дата — подсказка, а не падение",
+        len(sent) == 1 and "Bad date" in sent[0]["text"] and "Usage" in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/stats abc day"))
+    check(
+        "stats: мусор вместо даты — подсказка",
+        len(sent) == 1 and "Bad date" in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/stats 2026-09-23"))
+    check(
+        "stats: без смены — общая подсказка",
+        len(sent) == 1 and "Usage: /stats" in sent[0]["text"],
+        sent,
+    )
+
+
+def test_images_janitor_removes_old_files():
+    import tempfile
+
+    old_dir = bot._IMAGES_DIR
+    tmp = tempfile.mkdtemp(prefix="glpc-janitor-")
+
+    old_file = os.path.join(tmp, "old.jpg")
+    fresh_file = os.path.join(tmp, "fresh.jpg")
+
+    with open(old_file, "wb") as f:
+        f.write(b"old")
+    with open(fresh_file, "wb") as f:
+        f.write(b"fresh")
+
+    past = time.time() - (bot.IMAGES_RETENTION_DAYS + 1) * 86400
+    os.utime(old_file, (past, past))
+
+    bot._IMAGES_DIR = tmp
+
+    try:
+        removed = bot.cleanup_old_images()
+    finally:
+        bot._IMAGES_DIR = old_dir
+
+    check("janitor: старое фото удалено", removed == 1, removed)
+    check("janitor: старое фото исчезло", not os.path.exists(old_file))
+    check("janitor: свежее фото осталось", os.path.exists(fresh_file))
+
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_shift_stats_endpoint_token():
+    client = bot.app.test_client()
+    original_token = bot.STATS_TOKEN
+
+    try:
+        bot.STATS_TOKEN = ""
+        response = client.get("/shift_stats?date=2026-09-23&shift=day")
+        check(
+            "stats endpoint: без токена открыт (обратная совместимость)",
+            response.status_code == 200,
+            response.status_code,
+        )
+
+        bot.STATS_TOKEN = "s3cret"
+        forbidden = client.get("/shift_stats?date=2026-09-23&shift=day")
+        allowed = client.get("/shift_stats?date=2026-09-23&shift=day&token=s3cret")
+
+        check(
+            "stats endpoint: с токеном закрыт",
+            forbidden.status_code == 403,
+            forbidden.status_code,
+        )
+        check(
+            "stats endpoint: с правильным токеном открыт",
+            allowed.status_code == 200,
+            allowed.status_code,
+        )
+    finally:
+        bot.STATS_TOKEN = original_token
+
+
+def test_update_key_and_dedupe_after_success():
+    message_update = make_update(text="/help", message_id=4242, chat_id=-500)
+    check(
+        "dedupe: ключ = чат:сообщение",
+        bot._update_key(message_update) == "-500:4242",
+        bot._update_key(message_update),
+    )
+
+    callback_update = make_callback("st:offline:3542:other")
+    check(
+        "dedupe: ключ кнопки",
+        bot._update_key(callback_update).startswith("cb:"),
+        bot._update_key(callback_update),
+    )
+
+    # Один и тот же апдейт дважды: второй раз пропускаем.
+    update = make_update(text="/help", message_id=5252)
+    run(update)
+    first = len(SENT)
+    run(update)
+    check(
+        "dedupe: повторный апдейт не обрабатывается",
+        first == 1 and SENT == [] or len(SENT) == 0,
+        (first, SENT),
+    )
+
+
+def test_polling_persists_offset():
+    """После батча offset уходит в Storage, чтобы Telegram не переотдал его."""
+    import threading as _threading
+
+    stop = _threading.Event()
+    saved = []
+    batches = [[make_update(text="/help", message_id=6262)]]
+
+    def fake_get_updates(offset=None, timeout=30):
+        if batches:
+            return batches.pop(0)
+        stop.set()
+        return []
+
+    original_updates = tg.get_updates
+    original_save = bot.save_offset
+    original_load = bot.load_saved_offset
+
+    tg.get_updates = fake_get_updates
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+    bot.load_saved_offset = lambda: None
+
+    try:
+        bot.polling_loop(stop, None)
+    finally:
+        tg.get_updates = original_updates
+        bot.save_offset = original_save
+        bot.load_saved_offset = original_load
+
+    check(
+        "offset: сохранён после обработки батча",
+        saved and saved[0] and saved[0] > 0,
+        saved,
+    )
+
+
+def test_report_sent_ok_semantics():
+    check(
+        "report retry: маркер already-sent не повторяем",
+        sr._report_sent_ok({"skipped": True, "reason": "already-sent"}) is True,
+    )
+    check(
+        "report retry: ошибка БД — повторяем",
+        sr._report_sent_ok({"skipped": True, "reason": "db-error"}) is False,
+    )
+    check(
+        "report retry: отказ хука — повторяем",
+        sr._report_sent_ok({"code": 9499, "msg": "bad"}) is False,
+    )
+    check(
+        "report retry: успех — отметка",
+        sr._report_sent_ok({"code": 0, "msg": "success"}) is True,
+    )
+
+
+def test_health_reports_degraded():
+    client = bot.app.test_client()
+
+    original_status = bot.LEASE_STATUS
+    original_last_poll = bot._LAST_POLL_AT
+
+    try:
+        bot.LEASE_STATUS = "standby (someone-else)"
+        response = client.get("/health")
+        check(
+            "health: standby — сервис здоров",
+            response.status_code == 200,
+            response.status_code,
+        )
+
+        bot.LEASE_STATUS = "poller"
+        bot._LAST_POLL_AT = time.time() - (bot.POLL_STALL_SECONDS + 30)
+        response = client.get("/health")
+        payload = response.get_json()
+        check(
+            "health: зависший poller -> 503",
+            response.status_code == 503 and payload.get("reason") == "poller stalled",
+            (response.status_code, payload),
+        )
+
+        bot.LEASE_STATUS = "lease-lost"
+        response = client.get("/health")
+        check(
+            "health: потеря лиза -> 503",
+            response.status_code == 503,
+            response.status_code,
+        )
+
+        bot.LEASE_STATUS = "poller"
+        bot._LAST_POLL_AT = time.time()
+        response = client.get("/health")
+        check(
+            "health: живой poller -> 200",
+            response.status_code == 200,
+            response.status_code,
+        )
+    finally:
+        bot.LEASE_STATUS = original_status
+        bot._LAST_POLL_AT = original_last_poll
+
+
 def test_missing_robot_is_queued_and_reported():
     """send_to_data_base: нет робота -> в очередь на добавление + маркер для Lark."""
     import sendToDataBase as stdb
@@ -2099,18 +2376,18 @@ def test_lease_edge_cases_and_polling_guard():
     )
 
     # Потеря лиза останавливает polling.
-    original_refresh = bot_lease.refresh
+    original_check = bot_lease.check
     original_updates = tg.get_updates
     updates_called = []
 
-    bot_lease.refresh = lambda holder=None, ttl=None: False
+    bot_lease.check = lambda holder=None: "lost"
     tg.get_updates = lambda offset=None, timeout=30: (updates_called.append(offset), [])[1]
 
     try:
         bot.LEASE_STATUS = "poller"
         bot.polling_loop(None, "me-7")
     finally:
-        bot_lease.refresh = original_refresh
+        bot_lease.check = original_check
         tg.get_updates = original_updates
 
     check(
@@ -2119,31 +2396,157 @@ def test_lease_edge_cases_and_polling_guard():
         (updates_called, bot.LEASE_STATUS),
     )
 
-    # Standby подхватывает освободившийся лиз.
+    # Транзиентный сбой базы НЕ должен останавливать опрос.
+    states = ["error", "error", "lost"]
+    original_check = bot_lease.check
+    original_updates = tg.get_updates
+    updates_called = []
+
+    bot_lease.check = lambda holder=None: states.pop(0) if states else "lost"
+    tg.get_updates = lambda offset=None, timeout=30: (updates_called.append(offset), [])[1]
+
+    try:
+        bot.polling_loop(None, "me-8")
+    finally:
+        bot_lease.check = original_check
+        tg.get_updates = original_updates
+
+    check(
+        "lease: сбой базы не останавливает опрос",
+        len(updates_called) == 2,
+        updates_called,
+    )
+
+    # Standby возвращает True, когда лиз получен.
     original_acquire = bot_lease.acquire
-    original_start = bot.start_polling_and_reports
-    started = []
+    bot_lease.acquire = lambda holder=None: {
+        "acquired": True,
+        "status": "taken-over",
+        "holder": holder,
+    }
+
+    try:
+        got = bot.standby_loop("me-9", interval=0)
+    finally:
+        bot_lease.acquire = original_acquire
+
+    check("lease: standby получает лиз", got is True, got)
+
+    # Супервизор: потеряли лиз -> standby -> снова опрашиваем.
+    original_acquire = bot_lease.acquire
+    original_polling = bot.start_polling
+    original_scheduler = bot.start_shift_scheduler
+    original_retry = bot.STANDBY_RETRY_SECONDS
+
+    poll_starts, scheduler_starts = [], []
+
+    class _FakeThread:
+        def join(self):
+            return None
 
     bot_lease.acquire = lambda holder=None: {
         "acquired": True,
-        "status": "acquired",
+        "status": "taken-over",
         "holder": holder,
     }
-    bot.start_polling_and_reports = lambda holder, mode=None: started.append(holder)
+    bot.STANDBY_RETRY_SECONDS = 0
+    bot.start_polling = lambda holder=None: (poll_starts.append(holder), _FakeThread())[1]
+    bot.start_shift_scheduler = lambda: scheduler_starts.append(True)
 
     try:
-        bot.standby_loop("me-9", interval=0)
+        worker = threading.Thread(
+            target=bot.poller_supervisor,
+            args=("me-77", True),
+            daemon=True,
+        )
+        worker.start()
+
+        deadline = time.time() + 5
+        while time.time() < deadline and len(poll_starts) < 2:
+            time.sleep(0.02)
     finally:
         bot_lease.acquire = original_acquire
-        bot.start_polling_and_reports = original_start
+        bot.start_polling = original_polling
+        bot.start_shift_scheduler = original_scheduler
+        bot.STANDBY_RETRY_SECONDS = original_retry
 
     check(
-        "lease: standby становится опрашивающим, когда лиз освободился",
-        started == ["me-9"],
-        started,
+        "supervisor: после потери лиза опрос запускается снова",
+        len(poll_starts) >= 2,
+        poll_starts,
+    )
+    check(
+        "supervisor: планировщик отчётов стартует ровно один раз",
+        scheduler_starts == [True],
+        scheduler_starts,
     )
 
     bot.LEASE_STATUS = "starting"
+
+
+def test_report_sent_only_once_per_shift():
+    """Перезапуск внутри окна отчёта не должен слать дубль."""
+    original_data = sr.shift_report_data
+    original_card = sr.send_card_via_hook
+    original_marker_get = sr.download_json
+    original_marker_put = sr.upload_json
+
+    fake, _ = _report_data_stub({
+        ("2026-09-23", "day"): {
+            "total": 4,
+            "robots": {"1": 4},
+            "types": {"X": 4},
+            "employees": {"A": 4},
+            "downtime_minutes": 20,
+            "maintenance": [],
+        },
+    })
+
+    sent = []
+    markers = {}
+
+    sr.shift_report_data = fake
+    sr.send_card_via_hook = lambda url, card: (sent.append("card"), {"code": 0})[1]
+    sr.download_json = lambda bucket, name: markers.get(name)
+    sr.upload_json = lambda bucket, name, payload: (
+        markers.update({name: payload}), True
+    )[1]
+
+    try:
+        sr.send_shift_report("2026-09-23", "day")
+        check("report: первая отправка проходит", sent == ["card"], sent)
+        check(
+            "report: маркер отправки поставлен",
+            "2026-09-23-day.json" in markers,
+            list(markers),
+        )
+
+        result = sr.send_shift_report("2026-09-23", "day")
+        check(
+            "report: повторная отправка блокируется маркером",
+            sent == ["card"] and isinstance(result, dict)
+            and result.get("skipped") is True,
+            (sent, result),
+        )
+
+        sr.send_shift_report("2026-09-23", "day", force=True)
+        check(
+            "report: force отправляет повторно",
+            sent == ["card", "card"],
+            sent,
+        )
+
+        sr.send_shift_report("2026-09-22", "night")
+        check(
+            "report: другая смена не блокируется",
+            sent == ["card", "card", "card"],
+            sent,
+        )
+    finally:
+        sr.shift_report_data = original_data
+        sr.send_card_via_hook = original_card
+        sr.download_json = original_marker_get
+        sr.upload_json = original_marker_put
 
 
 def test_report_previous_shift():
@@ -2292,6 +2695,11 @@ def test_report_send_fallback():
     original_data = sr.shift_report_data
     original_card = sr.send_card_via_hook
     original_text = sr.send_text_via_hook
+    original_marker_get = sr.download_json
+    original_marker_put = sr.upload_json
+
+    sr.download_json = lambda bucket, name: None
+    sr.upload_json = lambda bucket, name, payload: True
 
     fake, _ = _report_data_stub({
         ("2026-09-23", "day"): {
@@ -2324,6 +2732,8 @@ def test_report_send_fallback():
         sr.shift_report_data = original_data
         sr.send_card_via_hook = original_card
         sr.send_text_via_hook = original_text
+        sr.download_json = original_marker_get
+        sr.upload_json = original_marker_put
 
 
 def main():
@@ -2353,9 +2763,17 @@ def main():
         test_unknown_command_suggests,
         test_cyrillic_layout_command_works,
         test_send_fallback_to_monitored_topic,
-        test_send_fallback_guarded_by_allow_list,
+        test_send_fallback_scoped_to_groups,
         test_stats_command_matches_report,
         test_self_deleting_confirmations,
+        test_text_truncation_helpers,
+        test_stats_command_validates_date,
+        test_images_janitor_removes_old_files,
+        test_shift_stats_endpoint_token,
+        test_update_key_and_dedupe_after_success,
+        test_polling_persists_offset,
+        test_report_sent_ok_semantics,
+        test_health_reports_degraded,
         test_missing_robot_is_queued_and_reported,
         test_bot_forwards_missing_robot_to_lark,
         test_lease_acquire_and_refresh,
@@ -2372,6 +2790,7 @@ def main():
         test_report_empty_shift,
         test_report_card_structure_and_colors,
         test_report_send_fallback,
+        test_report_sent_only_once_per_shift,
         test_allow_list_bootstrap_commands,
         test_topic_not_configured,
     ]

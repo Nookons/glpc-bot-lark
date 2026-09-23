@@ -9,6 +9,7 @@ service-ключу и квоту Lark не трогает — в группу у
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 import re
@@ -33,7 +34,8 @@ BUCKET_PUBLIC = os.environ.get(
 # Время жизни signed URL (по умолчанию 1 год).
 SIGNED_URL_TTL = int(os.environ.get("SUPABASE_SIGNED_URL_TTL", "31536000"))
 
-_bucket_ok = None
+# Кэш созданных bucket'ов: {имя: bool}
+_buckets_ok = {}
 
 
 def _safe_object_name(name: str) -> str:
@@ -44,12 +46,10 @@ def _safe_object_name(name: str) -> str:
     return base or "photo.jpg"
 
 
-def ensure_bucket() -> bool:
-    """Создаёт bucket, если его ещё нет."""
-    global _bucket_ok
-
-    if _bucket_ok is not None:
-        return _bucket_ok
+def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
+    """Создаёт bucket с указанным именем, если его ещё нет."""
+    if _buckets_ok.get(bucket):
+        return True
 
     url = f"{SUPABASE_URL}/storage/v1/bucket"
 
@@ -57,29 +57,93 @@ def ensure_bucket() -> bool:
         response = requests.post(
             url,
             headers=supabase_headers(),
-            json={
-                "id": BUCKET,
-                "name": BUCKET,
-                "public": BUCKET_PUBLIC,
-            },
+            json={"id": bucket, "name": bucket, "public": public},
             timeout=15,
         )
     except requests.exceptions.RequestException as e:
-        logger.error("Storage: не удалось создать bucket %s: %s", BUCKET, e)
+        logger.error("Storage: не удалось создать bucket %s: %s", bucket, e)
         return False
 
     # 400/409 — bucket уже существует.
     if response.status_code in (200, 201, 400, 409):
-        _bucket_ok = True
+        _buckets_ok[bucket] = True
         return True
 
     logger.error(
         "Storage: bucket %s -> HTTP %s %s",
-        BUCKET,
+        bucket,
         response.status_code,
         response.text[:200],
     )
     return False
+
+
+def ensure_bucket() -> bool:
+    """Bucket для фото."""
+    return ensure_bucket_named(BUCKET, BUCKET_PUBLIC)
+
+
+def upload_json(bucket: str, name: str, payload: dict) -> bool:
+    """Кладёт JSON-объект в bucket (перезаписывая)."""
+    if not ensure_bucket_named(bucket, public=False):
+        return False
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{name}"
+
+    headers = supabase_headers()
+    headers["Content-Type"] = "application/json"
+    headers["x-upsert"] = "true"
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error("Storage: не удалось записать %s/%s: %s", bucket, name, e)
+        return False
+
+    if response.status_code not in (200, 201):
+        logger.error(
+            "Storage: запись %s/%s -> HTTP %s %s",
+            bucket,
+            name,
+            response.status_code,
+            response.text[:200],
+        )
+        return False
+
+    return True
+
+
+def download_json(bucket: str, name: str):
+    """Читает JSON-объект из bucket. None — нет объекта или ошибка."""
+    if not ensure_bucket_named(bucket, public=False):
+        return None
+
+    for url in (
+        f"{SUPABASE_URL}/storage/v1/object/{bucket}/{name}",
+        f"{SUPABASE_URL}/storage/v1/object/authenticated/{bucket}/{name}",
+    ):
+        try:
+            response = requests.get(url, headers=supabase_headers(), timeout=15)
+        except requests.exceptions.RequestException as e:
+            logger.error("Storage: не удалось прочитать %s/%s: %s", bucket, name, e)
+            return None
+
+        if response.status_code == 200:
+            try:
+                return json.loads(response.content.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                logger.error("Storage: повреждён JSON %s/%s", bucket, name)
+                return None
+
+        if response.status_code == 404:
+            return None
+
+    return None
 
 
 def upload_file(local_path: str, object_name: str = None) -> str:

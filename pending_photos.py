@@ -19,6 +19,7 @@ from lark_media import (
     upload_image,
 )
 from supabase_storage import upload_photo_and_get_url
+from text_utils import VALUE_LIMIT, truncate
 from logging_config import setup_logging
 
 
@@ -111,9 +112,12 @@ def forward_error(parsed: dict, table_lines=None) -> bool:
     plain_line = f"{parsed['error_type']}: {parsed['error_text']}. {parsed['robot']}"
 
     if table_lines:
-        text_block = "\n".join(f"{label}: {value}" for label, value in table_lines)
+        text_block = "\n".join(
+            f"{label}: {truncate(value, VALUE_LIMIT)}"
+            for label, value in table_lines
+        )
     else:
-        text_block = plain_line
+        text_block = truncate(plain_line, VALUE_LIMIT)
 
     result = send_text_via_hook(TARGET_HOOK_URL, text_block)
 
