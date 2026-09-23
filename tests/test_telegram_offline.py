@@ -1873,7 +1873,7 @@ def test_bot_forwards_missing_robot_to_lark():
 
     check(
         "robot missing: карточка всё равно ушла в Lark",
-        len(FORWARDED) == 1 and "not in the system" in flat,
+        len(FORWARDED) == 1 and "3884" in flat,
         FORWARDED,
     )
     check(
@@ -1883,8 +1883,10 @@ def test_bot_forwards_missing_robot_to_lark():
         flat,
     )
     check(
-        "robot missing: помечено, что в базу не сохраняли",
-        "NOT saved to the database" in flat,
+        "robot missing: в Lark нет пометки, что робота нет в системе",
+        "not in the system" not in flat
+        and "NOT saved" not in flat
+        and "missing" not in flat,
         flat,
     )
     check(
