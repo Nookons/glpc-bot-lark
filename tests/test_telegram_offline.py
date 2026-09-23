@@ -28,6 +28,7 @@ os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
 import telegram_api as tg  # noqa: E402
 import telegram_bot as bot  # noqa: E402
+import bot_lease  # noqa: E402
 import robot_status  # noqa: E402
 import shift_report as sr  # noqa: E402
 
@@ -1712,6 +1713,247 @@ def test_status_flow_cancel_and_fallbacks():
     LINKS.clear()
 
 
+# ============================================================
+# ЛИЗ ЕДИНСТВЕННОГО ОПРАШИВАЮЩЕГО (защита от дублей)
+# ============================================================
+
+def _lease_env(rows=None, post_result=None, patch_result=None, table=True):
+    """Заглушки Supabase для лиза + журнал вызовов."""
+    calls = {"get": [], "post": [], "patch": []}
+
+    original = (
+        bot_lease.table_exists,
+        bot_lease.rest_get,
+        bot_lease.rest_post,
+        bot_lease.rest_patch,
+    )
+
+    bot_lease._table_ok = None
+    bot_lease._warned_no_table = False
+
+    bot_lease.table_exists = lambda table_name: table
+    bot_lease.rest_get = lambda table_name, params=None: (
+        calls["get"].append(params), rows
+    )[1]
+    bot_lease.rest_post = lambda table_name, payload: (
+        calls["post"].append(payload), post_result
+    )[1]
+    bot_lease.rest_patch = lambda table_name, params, payload: (
+        calls["patch"].append((params, payload)), patch_result
+    )[1]
+
+    return calls, original
+
+
+def _lease_restore(original):
+    (
+        bot_lease.table_exists,
+        bot_lease.rest_get,
+        bot_lease.rest_post,
+        bot_lease.rest_patch,
+    ) = original
+
+    bot_lease._table_ok = None
+    bot_lease._warned_no_table = False
+
+
+def _iso(seconds_ago=0):
+    from datetime import datetime, timedelta, timezone
+
+    moment = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_lease_acquire_and_refresh():
+    # Свободный лиз занимаем вставкой строки.
+    calls, original = _lease_env(rows=[], post_result=[{"name": "glpc-bot-telegram"}])
+
+    try:
+        result = bot_lease.acquire("me-1")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: свободный лиз занимается",
+        result["acquired"] is True and result["status"] == "acquired",
+        result,
+    )
+    check(
+        "lease: строка создаётся с нашим holder",
+        calls["post"] and calls["post"][0]["holder"] == "me-1",
+        calls["post"],
+    )
+
+    # Продление своего лиза.
+    calls, original = _lease_env(
+        rows=[{"name": "glpc-bot-telegram", "holder": "me-1", "heartbeat_at": _iso()}],
+        patch_result=[{"name": "glpc-bot-telegram"}],
+    )
+
+    try:
+        renewed = bot_lease.refresh("me-1")
+    finally:
+        _lease_restore(original)
+
+    check("lease: свой лиз продлевается", renewed is True)
+    check(
+        "lease: продление фильтруется по holder",
+        calls["patch"] and calls["patch"][0][0].get("holder") == "eq.me-1",
+        calls["patch"],
+    )
+
+    # Продление, когда лиз уже не наш.
+    calls, original = _lease_env(
+        rows=[{"holder": "other", "heartbeat_at": _iso()}],
+        patch_result=None,
+    )
+
+    try:
+        renewed = bot_lease.refresh("me-1")
+    finally:
+        _lease_restore(original)
+
+    check("lease: чужой лиз продлить нельзя", renewed is False)
+
+
+def test_lease_held_by_other_and_takeover():
+    # Живой чужой лиз не трогаем.
+    calls, original = _lease_env(
+        rows=[{"holder": "live-1", "heartbeat_at": _iso(5)}],
+        patch_result=[{"holder": "me-2"}],
+    )
+
+    try:
+        result = bot_lease.acquire("me-2")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: живой чужой лиз — standby",
+        result["acquired"] is False
+        and result["status"] == "held-by-other"
+        and result["holder"] == "live-1",
+        result,
+    )
+    check("lease: чужой живой лиз не перезаписываем", calls["patch"] == [], calls["patch"])
+
+    # Просроченный лиз забираем.
+    calls, original = _lease_env(
+        rows=[{"holder": "dead-1", "heartbeat_at": _iso(10_000)}],
+        patch_result=[{"holder": "me-3"}],
+    )
+
+    try:
+        result = bot_lease.acquire("me-3")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: просроченный лиз забирается",
+        result["acquired"] is True and result["status"] == "taken-over",
+        result,
+    )
+    check(
+        "lease: замена идёт по прежнему holder",
+        calls["patch"] and calls["patch"][0][0].get("holder") == "eq.dead-1",
+        calls["patch"],
+    )
+
+    # Гонка: сосед успел забрать лиз первым.
+    calls, original = _lease_env(
+        rows=[{"holder": "dead-1", "heartbeat_at": _iso(10_000)}],
+        patch_result=None,
+    )
+
+    try:
+        result = bot_lease.acquire("me-4")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: проигранная гонка не даёт опрашивать",
+        result["acquired"] is False and result["status"] == "raced",
+        result,
+    )
+
+
+def test_lease_edge_cases_and_polling_guard():
+    # Таблицы нет — работаем с предупреждением (доступность важнее).
+    calls, original = _lease_env(rows=[], table=False)
+
+    try:
+        result = bot_lease.acquire("me-5")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: без таблицы бот работает, но с предупреждением",
+        result["acquired"] is True and result["status"] == "no-table",
+        result,
+    )
+
+    # Ошибка чтения — не опрашиваем, ждём следующей попытки.
+    calls, original = _lease_env(rows=None)
+
+    try:
+        result = bot_lease.acquire("me-6")
+    finally:
+        _lease_restore(original)
+
+    check(
+        "lease: ошибка чтения — в standby",
+        result["acquired"] is False and result["status"] == "error",
+        result,
+    )
+
+    # Потеря лиза останавливает polling.
+    original_refresh = bot_lease.refresh
+    original_updates = tg.get_updates
+    updates_called = []
+
+    bot_lease.refresh = lambda holder=None, ttl=None: False
+    tg.get_updates = lambda offset=None, timeout=30: (updates_called.append(offset), [])[1]
+
+    try:
+        bot.LEASE_STATUS = "poller"
+        bot.polling_loop(None, "me-7")
+    finally:
+        bot_lease.refresh = original_refresh
+        tg.get_updates = original_updates
+
+    check(
+        "lease: потеря лиза останавливает polling",
+        updates_called == [] and bot.LEASE_STATUS == "lease-lost",
+        (updates_called, bot.LEASE_STATUS),
+    )
+
+    # Standby подхватывает освободившийся лиз.
+    original_acquire = bot_lease.acquire
+    original_start = bot.start_polling_and_reports
+    started = []
+
+    bot_lease.acquire = lambda holder=None: {
+        "acquired": True,
+        "status": "acquired",
+        "holder": holder,
+    }
+    bot.start_polling_and_reports = lambda holder: started.append(holder)
+
+    try:
+        bot.standby_loop("me-9", interval=0)
+    finally:
+        bot_lease.acquire = original_acquire
+        bot.start_polling_and_reports = original_start
+
+    check(
+        "lease: standby становится опрашивающим, когда лиз освободился",
+        started == ["me-9"],
+        started,
+    )
+
+    bot.LEASE_STATUS = "starting"
+
+
 def test_report_previous_shift():
     check(
         "report: день -> ночь предыдущего дня",
@@ -1922,6 +2164,9 @@ def main():
         test_send_fallback_guarded_by_allow_list,
         test_stats_command_matches_report,
         test_self_deleting_confirmations,
+        test_lease_acquire_and_refresh,
+        test_lease_held_by_other_and_takeover,
+        test_lease_edge_cases_and_polling_guard,
         test_robot_status_module,
         test_offline_command_validation,
         test_status_flow_end_to_end,

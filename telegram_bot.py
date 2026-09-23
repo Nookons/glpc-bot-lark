@@ -33,6 +33,7 @@ from rich.table import Table
 import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
+import bot_lease
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import TARGET_HOOK_URL, forward_error, handle_incoming_photo
 import robot_status
@@ -1492,6 +1493,11 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
 
 BOT_USERNAME = None
 
+# Состояние лиза «единственного опрашивающего»: кто опрашивает Telegram
+# и в каком режиме находится этот процесс.
+LEASE_HOLDER = None
+LEASE_STATUS = "starting"
+
 # Статус таблицы привязок (проверяется один раз на старте, чтобы
 # /health не дёргал Supabase на каждый запрос).
 USERS_TABLE_OK = None
@@ -1499,13 +1505,32 @@ USERS_TABLE_OK = None
 USERS_TABLE = "telegram_users"
 
 
-def polling_loop(stop_event: threading.Event = None):
-    """Бесконечный long polling Telegram."""
+def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
+    """
+    Бесконечный long polling Telegram.
+
+    lease_holder — лиз, который нужно продлевать. Потеряли лиз — прекращаем
+    опрос: значит его забрал другой инстанс, и продолжать нельзя (будут дубли).
+    """
+    global LEASE_STATUS
+
     offset = None
 
-    logger.info("Telegram polling started (bot=%s)", BOT_USERNAME)
+    logger.info(
+        "Telegram polling started (bot=%s, holder=%s)",
+        BOT_USERNAME,
+        lease_holder,
+    )
 
     while stop_event is None or not stop_event.is_set():
+        if lease_holder and not bot_lease.refresh(lease_holder):
+            LEASE_STATUS = "lease-lost"
+            logger.error(
+                "Лиз опроса потерян — останавливаю polling, "
+                "чтобы не дублировать сообщения"
+            )
+            return
+
         updates = tg.get_updates(offset=offset, timeout=30)
 
         if updates is None:
@@ -1528,15 +1553,56 @@ def polling_loop(stop_event: threading.Event = None):
             time.sleep(0.2)
 
 
-def start_polling() -> threading.Thread:
+def start_polling(lease_holder: str = None) -> threading.Thread:
     thread = threading.Thread(
         target=polling_loop,
+        args=(None, lease_holder),
         name="telegram-polling",
         daemon=True,
     )
     thread.start()
 
     return thread
+
+
+def start_polling_and_reports(holder: str):
+    """Этот инстанс выиграл лиз: опрашиваем Telegram и шлём отчёты за смену."""
+    global LEASE_HOLDER, LEASE_STATUS
+
+    LEASE_HOLDER = holder
+    LEASE_STATUS = "poller"
+
+    # Отчёт за смену шлёт только опрашивающий инстанс, иначе будут дубли.
+    start_shift_scheduler()
+
+    start_polling(holder)
+
+
+def standby_loop(holder: str, interval: int = 60):
+    """
+    Ждём, когда лиз освободится, и тогда становимся опрашивающим.
+
+    Так второй инстанс (например, локальный) может висеть запущенным и
+    подхватить работу, если серверный умрёт.
+    """
+    global LEASE_STATUS
+
+    logger.info("Standby: жду освобождения лиза опроса (%s)", holder)
+
+    while True:
+        time.sleep(interval)
+
+        result = bot_lease.acquire(holder)
+
+        if result["acquired"]:
+            console.print(
+                "[bold green]Лиз освободился — этот инстанс стал "
+                "опрашивающим[/bold green]"
+            )
+            start_polling_and_reports(holder)
+            return
+
+        LEASE_STATUS = f"standby ({result.get('holder')})"
 
 
 # ============================================================
@@ -1549,6 +1615,8 @@ def health():
         "status": "ok",
         "bot": BOT_USERNAME,
         "users_table": USERS_TABLE_OK,
+        "poller": LEASE_STATUS,
+        "poller_holder": LEASE_HOLDER,
         "time": now_warsaw().strftime("%d.%m.%Y %H:%M:%S"),
     })
 
@@ -1643,9 +1711,6 @@ def main():
             "[/yellow]"
         )
 
-    # Отчёт за смену (в конце каждой смены шлёт метрики в целевую группу).
-    start_shift_scheduler()
-
     # Удаление служебных подтверждений («хвостов») через CONFIRM_TTL_SECONDS.
     if CONFIRM_TTL_SECONDS > 0:
         start_deletion_worker()
@@ -1654,7 +1719,28 @@ def main():
             f"{CONFIRM_TTL_SECONDS}s[/cyan]"
         )
 
-    start_polling()
+    # Один Telegram — один опрашивающий. Иначе Telegram отдаёт одни и те же
+    # сообщения обоим инстансам и они обрабатываются дважды (дубли).
+    global LEASE_STATUS
+    holder = bot_lease.holder_id()
+    lease = bot_lease.acquire(holder)
+
+    if lease["acquired"]:
+        console.print(f"[green]Опрашиваю Telegram (лиз: {holder})[/green]")
+        start_polling_and_reports(holder)
+    else:
+        LEASE_STATUS = f"standby ({lease.get('holder')})"
+        console.print(
+            f"[bold yellow]Telegram уже опрашивает другой инстанс "
+            f"({lease.get('holder')}) — этот процесс в режиме standby, "
+            f"сообщения он не обрабатывает.[/bold yellow]"
+        )
+        threading.Thread(
+            target=standby_loop,
+            args=(holder,),
+            name="lease-standby",
+            daemon=True,
+        ).start()
 
     port = int(os.environ.get("PORT", 7777))
 
