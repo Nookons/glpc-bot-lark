@@ -2065,7 +2065,11 @@ def shift_stats_endpoint():
     if not shift_date or not shift_name:
         shift_date, shift_name = get_current_shift()
 
-    total, by_robot, by_type = shift_stats(shift_date, shift_name)
+    try:
+        total, by_robot, by_type = shift_stats(shift_date, shift_name)
+    except Exception:
+        logger.exception("Ошибка /shift_stats для %s/%s", shift_date, shift_name)
+        return jsonify({"error": "database error"}), 503
 
     return jsonify({
         "shift_date": shift_date,

@@ -33,6 +33,7 @@ import telegram_api as tg  # noqa: E402
 # Настоящая send_message нужна для проверки обрезки текста:
 # дальше в файле tg.send_message подменяется заглушкой.
 REAL_SEND_MESSAGE = tg.send_message
+REAL_EDIT_MESSAGE_TEXT = tg.edit_message_text
 
 import telegram_bot as bot  # noqa: E402
 import bot_lease  # noqa: E402
@@ -2042,6 +2043,84 @@ def test_health_reports_degraded():
         bot._LAST_POLL_AT = original_last_poll
 
 
+def test_parser_and_count_guards():
+    from error_parser import parse_error_message
+
+    check("parser: None не роняет разбор", parse_error_message(None) is None)
+    check("parser: пустая строка", parse_error_message("   ") is None)
+
+    import sendToDataBase as stdb
+
+    original_get = stdb._rest_get
+    captured = {}
+
+    def fake_get(table, params=None):
+        captured["table"] = table
+        captured["params"] = params
+        return [{"error_robot": 3783}, {"error_robot": 3783}, {"error_robot": 1}]
+
+    stdb._rest_get = fake_get
+
+    try:
+        count = stdb.count_robot_errors_in_shift(3783, "2026-09-23", "day")
+    finally:
+        stdb._rest_get = original_get
+
+    check("count: считает только нужного робота", count == 2, count)
+    check(
+        "count: тянет только номер робота",
+        captured.get("params", {}).get("select") == "error_robot",
+        captured.get("params"),
+    )
+    check(
+        "count: фильтрует по складу",
+        captured.get("params", {}).get("warehouse") == "eq.GLP-C",
+        captured.get("params"),
+    )
+
+
+def test_stats_endpoint_handles_db_error():
+    client = bot.app.test_client()
+    original = bot.shift_stats
+
+    def boom(shift_date, shift_name):
+        raise RuntimeError("db down")
+
+    bot.shift_stats = boom
+
+    try:
+        response = client.get("/shift_stats?date=2026-09-23&shift=day")
+    finally:
+        bot.shift_stats = original
+
+    check(
+        "stats endpoint: ошибка БД -> 503 JSON, а не 500",
+        response.status_code == 503 and response.get_json().get("error"),
+        (response.status_code, response.get_data(as_text=True)[:80]),
+    )
+
+
+def test_edit_message_truncates():
+    original_call = tg.call
+    payloads = []
+
+    tg.call = lambda method, payload=None, timeout=40: (
+        payloads.append((method, payload)), {"message_id": 1}
+    )[1]
+
+    try:
+        REAL_EDIT_MESSAGE_TEXT(-500, 1, "z" * 10_000)
+    finally:
+        tg.call = original_call
+
+    text = payloads[0][1]["text"] if payloads else ""
+    check(
+        "telegram: editMessageText тоже обрезает текст",
+        text.endswith("…") and len(text) <= 4000,
+        len(text),
+    )
+
+
 def test_missing_robot_is_queued_and_reported():
     """send_to_data_base: нет робота -> в очередь на добавление + маркер для Lark."""
     import sendToDataBase as stdb
@@ -2774,6 +2853,9 @@ def main():
         test_polling_persists_offset,
         test_report_sent_ok_semantics,
         test_health_reports_degraded,
+        test_parser_and_count_guards,
+        test_stats_endpoint_handles_db_error,
+        test_edit_message_truncates,
         test_missing_robot_is_queued_and_reported,
         test_bot_forwards_missing_robot_to_lark,
         test_lease_acquire_and_refresh,

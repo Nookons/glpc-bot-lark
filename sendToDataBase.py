@@ -327,21 +327,33 @@ def count_robot_errors_in_shift(
     robot,
     shift_date: str,
     shift_name: str,
+    warehouse: str = WAREHOUSE,
 ):
     """
     Количество сохранённых исключений робота за смену.
-    Считаем по таблице exceptions_glpc (источник для отчётов).
-    """
-    data = get_shift_exceptions(shift_date, shift_name)
 
-    if not data:
+    Считаем по таблице exceptions_glpc (источник для отчётов). Берём только
+    номер робота, чтобы не тянуть текстовые поля на каждое сообщение.
+    """
+    rows = _rest_get(
+        "exceptions_glpc",
+        params={
+            "select": "error_robot",
+            "issue_data": f"eq.{shift_date}",
+            "shift_type": f"eq.{shift_name}",
+            "warehouse": f"eq.{warehouse}",
+            "limit": "5000",
+        },
+    )
+
+    if not rows:
         return 0
 
     robot_str = str(robot)
 
     return sum(
         1
-        for exc in data
+        for exc in rows
         if str(exc.get("error_robot")) == robot_str
     )
 
@@ -397,6 +409,14 @@ def shift_report_data(
         warehouse=warehouse,
         limit=2000,
     )
+
+    if rows is not None and len(rows) >= 2000:
+        logger.warning(
+            "За %s/%s вернулось %s строк (лимит) — метрики могут быть неполными",
+            shift_date,
+            shift_name,
+            len(rows),
+        )
 
     if rows is None:
         # Ошибка запроса: выдавать это за «смена без исключений» нельзя.
@@ -478,7 +498,7 @@ def find_best_template(
         scorer=fuzz.token_sort_ratio,
     )
 
-    if not match:
+    if not match or not match[0]:
         return None
 
     matched_title, score, index = match
@@ -571,6 +591,8 @@ def send_to_data_base(
         params={
             "select": "*",
             "user_name": f"eq.{table_lines['employee']}",
+            "order": "id.asc",
+            "limit": "1",
         },
     )
 
@@ -635,10 +657,18 @@ def send_to_data_base(
             "warehouse": WAREHOUSE,
         }
 
-        _rest_post(
+        queued = _rest_post(
             "robots_to_add",
             obj,
         )
+
+        if not queued:
+            # Строка уже могла быть в очереди (409) — это не ошибка,
+            # но если не вышло вообще, стоит знать.
+            logger.info(
+                "Робот #%s не добавлен в robots_to_add (возможно, уже в очереди)",
+                table_lines["robot"],
+            )
 
         logger.warning(
             "Robot not found: #%s",

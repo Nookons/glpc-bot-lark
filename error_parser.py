@@ -16,7 +16,10 @@ def parse_error_message(text: str):
     Чистая функция без побочных эффектов: сообщение об ошибке
     в чат отправляет вызывающий код (telegram_bot).
     """
-    text = text.strip()
+    if not text:
+        return None
+
+    text = str(text).strip()
 
     match = re.match(r"^([^:]+):\s*(.+)\.\s*([^.]+)$", text)
     if not match:

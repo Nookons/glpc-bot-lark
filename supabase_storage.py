@@ -226,9 +226,11 @@ def create_signed_url(object_name: str, expires_in: int = None):
         return None
 
     try:
-        signed = response.json().get("signedURL")
+        payload = response.json()
     except ValueError:
-        signed = None
+        payload = {}
+
+    signed = payload.get("signedURL") or payload.get("signedUrl")
 
     if not signed:
         logger.error("Storage: пустой signedURL в ответе")

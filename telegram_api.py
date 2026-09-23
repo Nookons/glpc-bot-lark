@@ -171,7 +171,7 @@ def edit_message_text(chat_id, message_id, text: str, reply_markup: dict = None)
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
+        "text": truncate(text, TELEGRAM_TEXT_LIMIT),
         "disable_web_page_preview": True,
     }
 
