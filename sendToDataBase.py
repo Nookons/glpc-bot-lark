@@ -68,6 +68,12 @@ def set_notifier(notify):
 def notify_user(chat_id, text):
     """Отправляет текст пользователю через notifier (или Lark API)."""
     if _notifier is None:
+        # Так быть не должно: в Telegram-боте notifier ставится на старте,
+        # а Lark API здесь получил бы Telegram chat_id и потратил квоту.
+        logger.warning(
+            "Notifier не задан — ответ уйдёт через Lark API (chat_id=%s)",
+            chat_id,
+        )
         send_text_message(chat_id, text)
         return
 
@@ -185,6 +191,50 @@ def _rest_post(table: str, payload: dict, ignore_conflict: bool = False):
 def rest_get(table: str, params: dict = None):
     """Публичный доступ к GET /rest/v1/<table> (для других модулей)."""
     return _rest_get(table, params)
+
+
+def rest_count(table: str, params: dict = None):
+    """
+    Точное число строк (PostgREST `Prefer: count=exact`).
+
+    Выгрузка строк и подсчёт в Python врут: PostgREST ограничивает ответ
+    (db-max-rows), и на больших сменах часть строк просто не доезжает.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    headers = _headers()
+    headers["Prefer"] = "count=exact"
+    headers["Range-Unit"] = "items"
+
+    query = dict(params or {})
+    query["select"] = "id"
+    query["limit"] = "0"
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=query,
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error("COUNT %s failed: %s", table, e)
+        return None
+
+    content_range = response.headers.get("Content-Range") or ""
+
+    if "/" not in content_range:
+        logger.error("COUNT %s: нет Content-Range (%s)", table, content_range)
+        return None
+
+    total = content_range.rsplit("/", 1)[1]
+
+    try:
+        return int(total)
+    except ValueError:
+        logger.error("COUNT %s: непонятный Content-Range %r", table, content_range)
+        return None
 
 
 def set_exception_photo(table: str, row_id, photo_url: str):
@@ -376,27 +426,28 @@ def count_robot_errors_in_shift(
     Считаем по таблице exceptions_glpc (источник для отчётов). Берём только
     номер робота, чтобы не тянуть текстовые поля на каждое сообщение.
     """
-    rows = _rest_get(
+    robot_str = str(robot).strip()
+
+    total = rest_count(
         "exceptions_glpc",
         params={
-            "select": "error_robot",
             "issue_data": f"eq.{shift_date}",
             "shift_type": f"eq.{shift_name}",
             "warehouse": f"eq.{warehouse}",
-            "limit": "5000",
+            "error_robot": f"eq.{robot_str}",
         },
     )
 
-    if not rows:
+    if total is None:
+        logger.warning(
+            "Не удалось посчитать ошибки робота %s за %s/%s",
+            robot_str,
+            shift_date,
+            shift_name,
+        )
         return 0
 
-    robot_str = str(robot)
-
-    return sum(
-        1
-        for exc in rows
-        if str(exc.get("error_robot")) == robot_str
-    )
+    return total
 
 
 def shift_stats(shift_date: str, shift_name: str):
@@ -860,9 +911,12 @@ def send_to_data_base(
     # SAVE OLD EXCEPTION
     # ========================================================
 
+    # ignore_conflict: при уникальном индексе по uniq_key повторная доставка
+    # апдейта даёт 409 — это «уже сохранено», а не ошибка.
     saved_old = _rest_post(
         "exceptions_glpc",
         old_obj,
+        ignore_conflict=True,
     )
 
     # ========================================================
@@ -883,7 +937,8 @@ def send_to_data_base(
 
     if not saved_old:
         logger.warning(
-            "New exception saved, but legacy (exceptions_glpc) failed"
+            "Запись в exceptions_glpc не добавлена "
+            "(уже есть или сбой) — отчёты по этой смене могут недосчитать её"
         )
 
     logger.info(

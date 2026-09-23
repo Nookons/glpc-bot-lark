@@ -68,6 +68,10 @@ STATUS_HISTORY_TABLE = "change_status_robots"
 ROBOTS_TABLE = "robots_maintenance_list"
 
 
+class StatusUnavailable(RuntimeError):
+    """Не удалось прочитать данные робота: база недоступна."""
+
+
 def reason_label(direction: str, code: str):
     """Подпись причины по её коду (или None)."""
     for item_code, label in REASONS.get(direction, ()):
@@ -77,8 +81,13 @@ def reason_label(direction: str, code: str):
     return None
 
 
-def find_robot(robot_number, warehouse: str = WAREHOUSE):
-    """Строка робота из robots_maintenance_list (или None)."""
+def find_robot(robot_number, warehouse: str = WAREHOUSE, strict: bool = False):
+    """
+    Строка робота из robots_maintenance_list (или None).
+
+    strict=True — при сбое чтения бросает StatusUnavailable: «робот не
+    найден» и «база недоступна» — разные вещи.
+    """
     try:
         number = int(str(robot_number).strip().lstrip("#"))
     except (TypeError, ValueError):
@@ -95,10 +104,18 @@ def find_robot(robot_number, warehouse: str = WAREHOUSE):
         },
     )
 
+    if rows is None:
+        logger.error("Не удалось найти робота #%s — база недоступна", robot_number)
+
+        if strict:
+            raise StatusUnavailable("robot lookup failed")
+
+        return None
+
     return rows[0] if rows else None
 
 
-def find_robot_by_id(robot_id):
+def find_robot_by_id(robot_id, strict: bool = False):
     """Строка робота по первичному ключу (нужна для callback-кнопок)."""
     try:
         key = int(robot_id)
@@ -109,6 +126,14 @@ def find_robot_by_id(robot_id):
         ROBOTS_TABLE,
         params={"select": "*", "id": f"eq.{key}", "limit": "1"},
     )
+
+    if rows is None:
+        logger.error("Не удалось прочитать робота id=%s — база недоступна", robot_id)
+
+        if strict:
+            raise StatusUnavailable("robot lookup failed")
+
+        return None
 
     return rows[0] if rows else None
 

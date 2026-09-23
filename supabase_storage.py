@@ -17,6 +17,7 @@ import time
 
 import requests
 
+from env_utils import env_int
 from sendToDataBase import SUPABASE_URL, supabase_headers
 from logging_config import setup_logging
 
@@ -33,7 +34,7 @@ BUCKET_PUBLIC = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Время жизни signed URL (по умолчанию 1 год).
-SIGNED_URL_TTL = int(os.environ.get("SUPABASE_SIGNED_URL_TTL", "31536000"))
+SIGNED_URL_TTL = env_int("SUPABASE_SIGNED_URL_TTL", 31536000)
 
 # Кэш созданных bucket'ов: {имя: bool}
 _buckets_ok = {}
@@ -81,8 +82,8 @@ def ensure_bucket_named(bucket: str, public: bool = False) -> bool:
         logger.error("Storage: не удалось создать bucket %s: %s", bucket, e)
         return False
 
-    # 400/409 — bucket уже существует.
-    if response.status_code in (200, 201, 400, 409):
+    # 409 — bucket уже существует; 200/201 — создали.
+    if response.status_code in (200, 201, 409):
         _buckets_ok[bucket] = True
         return True
 

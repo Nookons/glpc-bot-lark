@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
+from shift import DAY_END, DAY_START
 from supabase_storage import download_json, upload_json
 from pending_photos import TARGET_HOOK_URL
 from sendToDataBase import WAREHOUSE, shift_report_data
@@ -91,14 +92,13 @@ def _get_reportable_shift(now: datetime):
     hour = now.hour
     minute = now.minute
 
-    # Конец ночной смены: 06:00. Отчитываемся за ночную смену,
-    # которая началась вчера.
-    if hour == 6 and minute < REPORT_WINDOW_MINUTES:
+    # Конец ночной смены. Отчитываемся за ночную смену, начавшуюся вчера.
+    if hour == DAY_START and minute < REPORT_WINDOW_MINUTES:
         yesterday = now - timedelta(days=1)
         return yesterday.strftime("%Y-%m-%d"), "night"
 
-    # Конец дневной смены: 18:00.
-    if hour == 18 and minute < REPORT_WINDOW_MINUTES:
+    # Конец дневной смены.
+    if hour == DAY_END and minute < REPORT_WINDOW_MINUTES:
         return now.strftime("%Y-%m-%d"), "day"
 
     return None

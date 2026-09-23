@@ -25,6 +25,7 @@ import time
 
 from datetime import datetime, timedelta, timezone
 
+from env_utils import env_int
 from sendToDataBase import (
     rest_delete,
     rest_get,
@@ -46,7 +47,7 @@ LEASE_NAME = os.environ.get("BOT_LEASE_NAME", "glpc-bot-telegram")
 # Через сколько секунд без heartbeat лиз считается брошенным.
 # Небольшой TTL нужен, чтобы после деплоя новый контейнер быстро подхватил
 # работу, если старый не успел отпустить лиз сам.
-LEASE_TTL_SECONDS = int(os.environ.get("BOT_LEASE_TTL", "60"))
+LEASE_TTL_SECONDS = env_int("BOT_LEASE_TTL", 90)
 
 _table_ok = None
 _table_checked_at = 0.0

@@ -36,6 +36,7 @@ import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
 import bot_lease
+from env_utils import env_bool, env_int
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
     TARGET_HOOK_URL,
@@ -89,16 +90,7 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 def _env_int(name: str, default: int) -> int:
     """Читает целое из окружения; при мусоре возвращает default."""
-    raw = os.environ.get(name)
-
-    if raw is None or not str(raw).strip():
-        return default
-
-    try:
-        return int(str(raw).strip())
-    except ValueError:
-        logger.warning("Invalid %s=%r, using %s", name, raw, default)
-        return default
+    return env_int(name, default)
 
 
 def _env_int_opt(name: str):
@@ -116,12 +108,8 @@ def _env_int_opt(name: str):
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-
-    if raw is None or not str(raw).strip():
-        return default
-
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    """Читает булево из окружения."""
+    return env_bool(name, default)
 
 
 # Сколько ошибок робота за смену считается поводом для алерта.
@@ -173,6 +161,12 @@ LEASE_HEARTBEAT_SECONDS = _env_int("BOT_LEASE_HEARTBEAT", 15)
 # /health отдаёт 503, чтобы Railway перезапустил контейнер.
 POLL_STALL_SECONDS = _env_int("POLL_STALL_SECONDS", 180)
 
+# Сколько ждать первого опроса, прежде чем считать /health нездоровым.
+STARTUP_GRACE_SECONDS = _env_int("STARTUP_GRACE_SECONDS", 60)
+
+# Момент импорта модуля: нужен, чтобы отличить «ещё стартую» от «завис».
+_STARTED_AT = time.time()
+
 # Где храним подтверждённый offset Telegram (чтобы после перезапуска
 # Telegram не переотдал уже обработанные апдейты = дубли).
 OFFSET_BUCKET = os.environ.get("SUPABASE_STATE_BUCKET", "bot-state")
@@ -186,6 +180,10 @@ STATS_TOKEN = os.environ.get("STATS_TOKEN", "").strip()
 
 # Сколько секунд дать текущему апдейту дописаться при остановке контейнера.
 SHUTDOWN_GRACE_SECONDS = _env_int("SHUTDOWN_GRACE_SECONDS", 3)
+
+# Сколько раз пытаться обработать один апдейт, прежде чем пропустить его
+# (защита от «отравленного» сообщения, которое всегда падает).
+MAX_UPDATE_ATTEMPTS = _env_int("MAX_UPDATE_ATTEMPTS", 3)
 
 # К ошибке какой давности можно прикрепить присланное фото (секунды).
 PHOTO_ATTACH_WINDOW = _env_int("PHOTO_ATTACH_WINDOW", 600)
@@ -955,7 +953,17 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         return
 
     robot_number = args.split()[0]
-    robot = robot_status.find_robot(robot_number)
+
+    try:
+        robot = robot_status.find_robot(robot_number, strict=True)
+    except robot_status.StatusUnavailable:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
     spec = robot_status.DIRECTIONS[direction]
 
     if not robot:
@@ -1056,7 +1064,14 @@ def handle_status_callback(callback: dict):
         tg.answer_callback_query(callback_id, "Unknown reason")
         return
 
-    robot = robot_status.find_robot_by_id(robot_id)
+    try:
+        robot = robot_status.find_robot_by_id(robot_id, strict=True)
+    except robot_status.StatusUnavailable:
+        tg.answer_callback_query(
+            callback_id,
+            "Database unavailable — try again in a minute",
+        )
+        return
 
     if not robot:
         tg.answer_callback_query(callback_id, "Robot not found")
@@ -1136,7 +1151,20 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
         _send(chat_id, NOT_REGISTERED_HINT, reply_to_message_id=message_id)
         return
 
-    robot = robot_status.find_robot(pending["robot_number"])
+    try:
+        robot = robot_status.find_robot(pending["robot_number"], strict=True)
+    except robot_status.StatusUnavailable:
+        # База недоступна: возвращаем флоу, чтобы сотрудник просто повторил
+        # сообщение с причиной, и не теряем его текст.
+        set_pending_status(chat_id, sender.get("id"), pending)
+
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
 
     if not robot:
         clear_pending_status(chat_id, sender.get("id"))
@@ -2243,6 +2271,9 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
 
     global _LAST_POLL_AT, _CURRENT_OFFSET
 
+    # update_id -> сколько раз обработка уже падала
+    failed_attempts = {}
+
     while stop_event is None or not stop_event.is_set():
         if lease_holder:
             try:
@@ -2286,17 +2317,37 @@ def polling_loop(stop_event: threading.Event = None, lease_holder: str = None):
         for update in updates:
             update_id = update.get("update_id")
 
+            try:
+                handle_update(update, BOT_USERNAME)
+            except Exception:
+                attempts = failed_attempts.get(update_id, 0) + 1
+                failed_attempts[update_id] = attempts
+
+                logger.exception(
+                    "Не удалось обработать апдейт %s (попытка %s из %s)",
+                    update_id,
+                    attempts,
+                    MAX_UPDATE_ATTEMPTS,
+                )
+
+                if attempts >= MAX_UPDATE_ATTEMPTS:
+                    logger.error(
+                        "Апдейт %s пропускаю после %s попыток",
+                        update_id,
+                        attempts,
+                    )
+                    failed_attempts.pop(update_id, None)
+                else:
+                    # Апдейт НЕ подтверждаем: Telegram пришлёт его снова.
+                    break
+            else:
+                failed_attempts.pop(update_id, None)
+
             if update_id is not None:
                 offset = update_id + 1
                 _CURRENT_OFFSET = offset
 
-            try:
-                handle_update(update, BOT_USERNAME)
-            except Exception:
-                # Метка не ставится: при повторной доставке обработаем снова.
-                logger.exception("Failed to handle update %s", update_id)
-
-        if updates:
+        if updates and offset is not None:
             # Фиксируем offset, чтобы после перезапуска Telegram не прислал
             # эти же апдейты повторно.
             save_offset(offset)
@@ -2477,7 +2528,10 @@ def health():
     healthy = True
     reason = "ok"
 
-    if LEASE_STATUS == "poller":
+    if LEASE_STATUS == "starting":
+        if (now - _STARTED_AT) > STARTUP_GRACE_SECONDS:
+            healthy, reason = False, "not polling yet"
+    elif LEASE_STATUS == "poller":
         if _LAST_POLL_AT and (now - _LAST_POLL_AT) > POLL_STALL_SECONDS:
             healthy, reason = False, "poller stalled"
     elif LEASE_STATUS == "lease-lost" or "error" in str(LEASE_STATUS):
@@ -2600,6 +2654,13 @@ def main():
         console.print(f"[cyan]Allowed chats: {sorted(ALLOWED_CHAT_IDS)}[/cyan]")
 
     console.print(f"[cyan]Monitored topic: {monitored_topic_label()}[/cyan]")
+
+    if TELEGRAM_TOPIC_ID is None and not TELEGRAM_TOPIC_NAME:
+        console.print(
+            "[bold red]⚠️ Фильтр топика не задан: бот принимает сообщения "
+            "из ЛЮБОГО топика и любого чата. Задайте TELEGRAM_TOPIC_ID "
+            "(узнать: /id в нужном топике).[/bold red]"
+        )
 
     global USERS_TABLE_OK
     USERS_TABLE_OK = table_exists(USERS_TABLE)

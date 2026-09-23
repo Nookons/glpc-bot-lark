@@ -150,11 +150,11 @@ def fake_get_employee(telegram_id, strict=False):
     }
 
 
-def fake_find_robot(robot_number, warehouse=None):
+def fake_find_robot(robot_number, warehouse=None, strict=False):
     return ROBOTS.get(str(robot_number).strip().lstrip("#"))
 
 
-def fake_find_robot_by_id(robot_id):
+def fake_find_robot_by_id(robot_id, strict=False):
     for row in ROBOTS.values():
         if str(row.get("id")) == str(robot_id):
             return row
@@ -1219,6 +1219,57 @@ def test_supabase_notifier():
         lark_calls == [(-500, "fallback")],
         lark_calls,
     )
+
+
+def test_lark_hook_post_never_raises():
+    """Любой сбой вебхука -> {"code": -1}, а не исключение."""
+    import lark_media as lm
+    import requests as _requests
+
+    original_post = lm.requests.post
+
+    class _BadResponse:
+        status_code = 502
+        content = b"<html>bad gateway</html>"
+
+        def json(self):
+            raise ValueError("not json")
+
+    try:
+        # 1) сеть/таймаут
+        def boom(*args, **kwargs):
+            raise _requests.exceptions.Timeout("timed out")
+
+        lm.requests.post = boom
+        result = lm._hook_post("https://hook.example", {"msg_type": "text"})
+
+        check(
+            "hook: таймаут -> мягкая ошибка, без исключения",
+            isinstance(result, dict) and result.get("code") == -1,
+            result,
+        )
+
+        # 2) не-JSON ответ
+        lm.requests.post = lambda *args, **kwargs: _BadResponse()
+        result = lm._hook_post("https://hook.example", {"msg_type": "text"})
+
+        check(
+            "hook: не-JSON -> мягкая ошибка, без исключения",
+            isinstance(result, dict) and result.get("code") == -1,
+            result,
+        )
+
+        # 3) проверяем, что и обёртки не бросают
+        check(
+            "hook: send_text_via_hook не бросает",
+            lm.send_text_via_hook("https://hook.example", "текст").get("code") == -1,
+        )
+        check(
+            "hook: send_card_via_hook не бросает",
+            lm.send_card_via_hook("https://hook.example", {"a": 1}).get("code") == -1,
+        )
+    finally:
+        lm.requests.post = original_post
 
 
 def test_lark_hook_payload():
@@ -2445,6 +2496,81 @@ def test_update_key_and_dedupe_after_success():
     )
 
 
+def test_failed_update_is_retried_then_skipped():
+    """Падение обработки не подтверждает апдейт: Telegram пришлёт его снова."""
+    import threading as _threading
+
+    original_handle = bot.handle_update
+    original_save = bot.save_offset
+    original_load = bot.load_saved_offset
+    original_attempts = bot.MAX_UPDATE_ATTEMPTS
+
+    update = make_update(text="/help", message_id=8801)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("обработка упала")
+
+    # 1) одна попытка: апдейт не подтверждён
+    stop = _threading.Event()
+    saved, batches = [], [[update]]
+
+    def fake_get_updates(offset=None, timeout=30):
+        if batches:
+            return batches.pop(0)
+
+        stop.set()
+        return []
+
+    bot.handle_update = boom
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+    bot.load_saved_offset = lambda: None
+    bot.MAX_UPDATE_ATTEMPTS = 3
+
+    original_updates = tg.get_updates
+    tg.get_updates = fake_get_updates
+
+    try:
+        bot.polling_loop(stop, None)
+    finally:
+        tg.get_updates = original_updates
+
+    check(
+        "update retry: упавший апдейт не подтверждается",
+        saved == [],
+        saved,
+    )
+
+    # 2) три попытки: апдейт пропускается, offset двигается дальше
+    stop = _threading.Event()
+    saved, batches = [], [[update], [update], [update]]
+
+    bot.save_offset = lambda offset: (saved.append(offset), True)[1]
+
+    def fake_get_updates2(offset=None, timeout=30):
+        if batches:
+            return batches.pop(0)
+
+        stop.set()
+        return []
+
+    tg.get_updates = fake_get_updates2
+
+    try:
+        bot.polling_loop(stop, None)
+    finally:
+        tg.get_updates = original_updates
+        bot.handle_update = original_handle
+        bot.save_offset = original_save
+        bot.load_saved_offset = original_load
+        bot.MAX_UPDATE_ATTEMPTS = original_attempts
+
+    check(
+        "update retry: после лимита апдейт пропускается, offset едет дальше",
+        len(saved) == 1 and saved[0] == update["update_id"] + 1,
+        saved,
+    )
+
+
 def test_polling_persists_offset():
     """После батча offset уходит в Storage, чтобы Telegram не переотдал его."""
     import threading as _threading
@@ -2596,32 +2722,76 @@ def test_parser_and_count_guards():
 
     import sendToDataBase as stdb
 
-    original_get = stdb._rest_get
+    original_count = stdb.rest_count
     captured = {}
 
-    def fake_get(table, params=None):
+    def fake_count(table, params=None):
         captured["table"] = table
         captured["params"] = params
-        return [{"error_robot": 3783}, {"error_robot": 3783}, {"error_robot": 1}]
+        return 2
 
-    stdb._rest_get = fake_get
+    stdb.rest_count = fake_count
 
     try:
         count = stdb.count_robot_errors_in_shift(3783, "2026-09-23", "day")
     finally:
-        stdb._rest_get = original_get
+        stdb.rest_count = original_count
 
-    check("count: считает только нужного робота", count == 2, count)
+    check("count: возвращает точное число с базы", count == 2, count)
     check(
-        "count: тянет только номер робота",
-        captured.get("params", {}).get("select") == "error_robot",
+        "count: фильтрует по роботу, смене и складу",
+        captured.get("params", {}).get("error_robot") == "eq.3783"
+        and captured["params"].get("issue_data") == "eq.2026-09-23"
+        and captured["params"].get("shift_type") == "eq.day"
+        and captured["params"].get("warehouse") == "eq.GLP-C",
         captured.get("params"),
     )
-    check(
-        "count: фильтрует по складу",
-        captured.get("params", {}).get("warehouse") == "eq.GLP-C",
-        captured.get("params"),
-    )
+
+    stdb.rest_count = lambda table, params=None: None
+
+    try:
+        broken = stdb.count_robot_errors_in_shift(3783, "2026-09-23", "day")
+    finally:
+        stdb.rest_count = original_count
+
+    check("count: сбой подсчёта -> 0, без падения", broken == 0, broken)
+
+
+def test_rest_count_parses_content_range():
+    """Точный подсчёт читает Content-Range, а не считает строки в Python."""
+    import sendToDataBase as stdb
+
+    class _Resp:
+        status_code = 200
+        content = b"[]"
+        text = "[]"
+
+        def __init__(self, content_range):
+            self.headers = {"Content-Range": content_range} if content_range else {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    original_get = stdb.requests.get
+
+    try:
+        stdb.requests.get = lambda *a, **k: _Resp("*/42")
+        total = stdb.rest_count("exceptions_glpc", {"issue_data": "eq.2026-09-23"})
+
+        stdb.requests.get = lambda *a, **k: _Resp("0-0/7")
+        ranged = stdb.rest_count("exceptions_glpc")
+
+        stdb.requests.get = lambda *a, **k: _Resp(None)
+        missing = stdb.rest_count("exceptions_glpc")
+    finally:
+        stdb.requests.get = original_get
+
+    check("count: разбирает Content-Range */N", total == 42, total)
+    check("count: разбирает Content-Range 0-0/N", ranged == 7, ranged)
+    check("count: без Content-Range -> None", missing is None, missing)
 
 
 def test_stats_endpoint_handles_db_error():
@@ -3387,6 +3557,7 @@ def main():
         test_ignored_cases,
         test_commands,
         test_supabase_notifier,
+        test_lark_hook_post_never_raises,
         test_lark_hook_payload,
         test_polling_loop_and_offset,
         test_flask_endpoints,
@@ -3406,11 +3577,13 @@ def main():
         test_images_janitor_removes_old_files,
         test_shift_stats_endpoint_token,
         test_update_key_and_dedupe_after_success,
+        test_failed_update_is_retried_then_skipped,
         test_polling_persists_offset,
         test_report_sent_ok_semantics,
         test_health_reports_degraded,
         test_rest_post_ignores_conflict,
         test_parser_and_count_guards,
+        test_rest_count_parses_content_range,
         test_stats_endpoint_handles_db_error,
         test_edit_message_truncates,
         test_missing_robot_is_queued_and_reported,

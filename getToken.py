@@ -62,7 +62,14 @@ def get_tenant_access_token():
             )
             return None
 
-        tenant_token = data["tenant_access_token"]
-        tenant_token_expire = time.time() + data["expire"] - 60
+        token = data.get("tenant_access_token")
+        expire = data.get("expire")
+
+        if not token or not isinstance(expire, (int, float)):
+            logger.error("Lark token: неожиданный ответ %s", data)
+            return None
+
+        tenant_token = token
+        tenant_token_expire = time.time() + expire - 60
 
         return tenant_token

@@ -15,6 +15,7 @@ import time
 import requests
 from dotenv import load_dotenv
 
+from env_utils import env_int
 from logging_config import setup_logging
 from text_utils import TELEGRAM_TEXT_LIMIT, truncate
 
@@ -30,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
 # Telegram Bot API отдаёт боту файлы до 20 МБ; страхуемся от «тяжёлых» фото,
 # чтобы не вычитывать гигабайты в память.
-MAX_FILE_MB = int(os.environ.get("TELEGRAM_MAX_FILE_MB", "25"))
+MAX_FILE_MB = env_int("TELEGRAM_MAX_FILE_MB", 25)
 
 _API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 _FILE_BASE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
@@ -81,12 +82,21 @@ def call(method: str, payload: dict = None, timeout: int = 40):
 
         retry_after = (data.get("parameters") or {}).get("retry_after")
 
-        logger.error(
-            "Telegram %s error: code=%s description=%s",
-            method,
-            data.get("error_code"),
-            data.get("description"),
-        )
+        if data.get("error_code") == 409 and method == "getUpdates":
+            # Второй опрашивающий (например, во время выкатки) — это
+            # ожидаемая ситуация, а не сбой.
+            logger.warning(
+                "Telegram %s: %s",
+                method,
+                data.get("description"),
+            )
+        else:
+            logger.error(
+                "Telegram %s error: code=%s description=%s",
+                method,
+                data.get("error_code"),
+                data.get("description"),
+            )
 
         if retry_after and attempt < _MAX_FLOOD_RETRIES:
             wait = min(int(retry_after), 30) + 1

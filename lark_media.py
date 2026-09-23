@@ -8,39 +8,57 @@ import base64
 import requests
 
 from getToken import get_tenant_access_token
+from logging_config import setup_logging
 from text_utils import LARK_TEXT_LIMIT, truncate
+
+
+logger = setup_logging(__name__)
 
 LARK_HOOK_SECRET = os.environ.get("LARK_HOOK_SECRET", "")
 
 def upload_image(image_path: str) -> str:
+    """
+    Загружает картинку в Lark и возвращает image_key.
+
+    Это единственный вызов Lark API, который расходует квоту, поэтому все
+    ошибки заворачиваем в RuntimeError: вызывающий код поймает его и
+    отправит фото ссылкой через Supabase Storage.
+    """
     token = get_tenant_access_token()
-    with open(image_path, "rb") as f:
-        resp = requests.post(
-            "https://open.larksuite.com/open-apis/im/v1/images",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"image_type": "message"},
-            files={"image": f},
-            timeout=30,
+
+    if not token:
+        raise RuntimeError("Не удалось получить tenant_access_token")
+
+    try:
+        with open(image_path, "rb") as f:
+            resp = requests.post(
+                "https://open.larksuite.com/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"image_type": "message"},
+                files={"image": f},
+                timeout=30,
+            )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Lark im/v1/images недоступен: {e}") from e
+    except OSError as e:
+        raise RuntimeError(f"Не удалось прочитать {image_path}: {e}") from e
+
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Lark im/v1/images вернул не-JSON (HTTP {resp.status_code})"
         )
-    data = resp.json()
+
     if data.get("code") != 0:
         raise RuntimeError(f"Failed to upload image: {data}")
-    return data["data"]["image_key"]
 
+    image_key = (data.get("data") or {}).get("image_key")
 
-def send_image_message(chat_id: str, image_key: str):
-    token = get_tenant_access_token()
-    resp = requests.post(
-        "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "receive_id": chat_id,
-            "msg_type": "image",
-            "content": json.dumps({"image_key": image_key}),
-        },
-        timeout=10,
-    )
-    return resp.json()
+    if not image_key:
+        raise RuntimeError(f"Lark im/v1/images: пустой image_key: {data}")
+
+    return image_key
 
 
 def _hook_payload_extra():
@@ -126,27 +144,3 @@ def send_post_via_hook(hook_url: str, image_key: str, text: str):
     }
     payload.update(_hook_payload_extra())
     return _hook_post(hook_url, payload)
-
-
-def send_post_with_image_and_text(chat_id: str, image_key: str, text: str):
-    token = get_tenant_access_token()
-    content = {
-        "zh_cn": {
-            "title": "",
-            "content": [
-                [{"tag": "img", "image_key": image_key}],
-                [{"tag": "text", "text": text}],
-            ],
-        }
-    }
-    resp = requests.post(
-        "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "receive_id": chat_id,
-            "msg_type": "post",
-            "content": json.dumps(content),
-        },
-        timeout=10,
-    )
-    return resp.json()

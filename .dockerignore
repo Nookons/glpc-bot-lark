@@ -1,0 +1,17 @@
+# Ничего лишнего и никаких секретов в образ:
+# .railwayignore для docker build не действует.
+.env
+.env.*
+!.env.example
+.venv
+.git
+.gitignore
+.idea
+__pycache__
+.pycache
+*.pyc
+logs/
+images/
+errors.db
+tests/
+*.md

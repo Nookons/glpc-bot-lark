@@ -52,7 +52,8 @@ def send_text_message(chat_id: str, text: str):
             result.get("code"),
             result.get("msg"),
         )
-    else:
-        logger.info("Message sent to chat %s", chat_id)
+        return None
+
+    logger.info("Message sent to chat %s", chat_id)
 
     return result
