@@ -685,6 +685,107 @@ def test_photo_attaches_to_recent_error():
     )
 
 
+def test_user_commands_are_deleted():
+    """Команды боту бот затирает, сообщения об ошибках — нет."""
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    original_flag = bot.DELETE_USER_MESSAGES
+    bot.DELETE_USER_MESSAGES = True
+
+    try:
+        sent = run(make_update(text="/stats", message_id=9001, thread_id=2))
+        command_deleted = (-500, 9001) in DELETED
+
+        check("delete: команда удалена", command_deleted, DELETED)
+        check("delete: ответ на команду остался", len(sent) >= 1, sent)
+
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            message_id=9002,
+            thread_id=2,
+        ))
+        check(
+            "delete: сообщение об ошибке не трогаем",
+            (-500, 9002) not in DELETED,
+            DELETED,
+        )
+
+        run(make_update(text="/zzz", message_id=9003, thread_id=2))
+        check(
+            "delete: неизвестная команда тоже удалена",
+            (-500, 9003) in DELETED,
+            DELETED,
+        )
+
+        bot.DELETE_USER_MESSAGES = False
+        run(make_update(text="/help", message_id=9004, thread_id=2))
+        check(
+            "delete: при выключенном флаге команда остаётся",
+            (-500, 9004) not in DELETED,
+            DELETED,
+        )
+    finally:
+        bot.DELETE_USER_MESSAGES = original_flag
+
+
+def test_status_note_deleted_and_change_message_kept():
+    """При offline/online бот убирает команду и описание, а смену статуса — оставляет."""
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    original_flag = bot.DELETE_USER_MESSAGES
+    original_patch = robot_status.rest_patch
+    original_post = robot_status.rest_post
+    original_card = bot.send_card_via_hook
+
+    bot.DELETE_USER_MESSAGES = True
+    robot_status.rest_patch = lambda table, params, payload: [{}]
+    robot_status.rest_post = lambda table, payload: [{}]
+    bot.send_card_via_hook = lambda url, card: {"code": 0, "msg": "success"}
+
+    try:
+        sent = run(make_update(text="/offline 3783", message_id=9101, thread_id=2))
+        command_deleted = (-500, 9101) in DELETED
+        prompt_id = sent[0]["message_id"]
+
+        run(make_callback("st:offline:3542:other", message_id=prompt_id, thread_id=2))
+
+        with bot._pending_lock:
+            bot._pending_deletions.clear()
+
+        sent = run(make_update(text="сломался датчик", message_id=9102, thread_id=2))
+        note_deleted = (-500, 9102) in DELETED
+    finally:
+        bot.DELETE_USER_MESSAGES = original_flag
+        robot_status.rest_patch = original_patch
+        robot_status.rest_post = original_post
+        bot.send_card_via_hook = original_card
+        ROBOTS.clear()
+
+    check("status delete: команда /offline удалена", command_deleted, DELETED)
+    check("status delete: описание причины удалено", note_deleted, DELETED)
+
+    change_messages = [
+        item for item in sent if "Offline" in item["text"] and "Reason" in item["text"]
+    ]
+    check(
+        "status delete: сообщение о смене статуса отправлено",
+        bool(change_messages),
+        sent,
+    )
+
+    with bot._pending_lock:
+        queued = list(bot._pending_deletions)
+
+    check(
+        "status delete: сообщение о смене статуса не удаляется",
+        queued == [],
+        queued,
+    )
+
+
 def test_short_photo_link_and_redirect():
     from supabase_storage import PHOTO_LINK_BASE, short_photo_url
 
@@ -3092,6 +3193,8 @@ def main():
         test_threshold_alert,
         test_bad_format,
         test_not_saved_no_forward,
+        test_user_commands_are_deleted,
+        test_status_note_deleted_and_change_message_kept,
         test_short_photo_link_and_redirect,
         test_photo_forwarded_when_attachment_disabled,
         test_photo_with_error_caption_creates_one_record,

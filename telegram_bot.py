@@ -196,6 +196,10 @@ PHOTO_HOLD_SECONDS = _env_int("PHOTO_HOLD_SECONDS", 90)
 # photo_url). По умолчанию выключено: фото просто уходит в группу.
 PHOTO_ATTACH_ENABLED = _env_bool("PHOTO_ATTACH_ENABLED", False)
 
+# Удалять ли сообщения сотрудников: команды боту и описание причины
+# при смене статуса (бот — админ группы, права позволяют).
+DELETE_USER_MESSAGES = _env_bool("DELETE_USER_MESSAGES", True)
+
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
@@ -906,6 +910,23 @@ def _delete_quiet(chat_id, message_id) -> bool:
     return tg.delete_message(chat_id, message_id)
 
 
+def _delete_user_message(chat_id, message_id) -> bool:
+    """
+    Убирает сообщение сотрудника (команду или описание причины).
+
+    Сообщения об ошибках не трогаем: их видит смена, и они источник записи.
+    """
+    if not DELETE_USER_MESSAGES or message_id is None:
+        return False
+
+    deleted = tg.delete_message(chat_id, message_id)
+
+    if deleted:
+        logger.info("Сообщение сотрудника %s удалено", message_id)
+
+    return deleted
+
+
 def status_usage(direction: str) -> str:
     return (
         f"Usage: /{direction} <robot number>\n"
@@ -922,7 +943,7 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         return
 
     if not args:
-        _send(chat_id, status_usage(direction), reply_to_message_id=message_id)
+        _send(chat_id, status_usage(direction))
         return
 
     robot_number = args.split()[0]
@@ -933,7 +954,6 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         _send(
             chat_id,
             f"⚠️ Robot {robot_number} not found in {WAREHOUSE}.",
-            reply_to_message_id=message_id,
         )
         return
 
@@ -945,10 +965,11 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
             f"ℹ️ Robot {robot.get('robot_number')} is already "
             f"{robot.get('status')}.\n"
             f"Use /{other} {robot.get('robot_number')} if that is wrong.",
-            reply_to_message_id=message_id,
         )
         return
 
+    # Команду сотрудника бот удалит, поэтому подсказку шлём отдельным
+    # сообщением без reply-привязки.
     _send(
         chat_id,
         f"{spec['emoji']} Robot {robot.get('robot_number')} · "
@@ -956,7 +977,6 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         f"Status: {robot.get('status')} → {spec['new_status']}\n"
         "\n"
         "Choose the reason:",
-        reply_to_message_id=message_id,
         reply_markup=reasons_keyboard(direction, robot.get("id")),
     )
 
@@ -1146,6 +1166,7 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
     # Убираем свои сообщения: в чате остаётся только сообщение сотрудника.
     _delete_quiet(chat_id, pending.get("prompt_message_id"))
 
+    # Информация о смене статуса остаётся в чате — её видят все.
     _send(
         chat_id,
         "\n".join([
@@ -1153,7 +1174,6 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict):
             f"Reason: {pending['type_problem']}",
             f"Note: {note}",
         ]),
-        delete_after=CONFIRM_TTL_SECONDS,
     )
 
     _notify_lark_status(direction, result, employee.get("user_name"))
@@ -2060,6 +2080,8 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         )
 
         if _handle_command(chat_id, sender, normalized, args, message_id, chat):
+            # Команда отработана — затираем её, чтобы чат не зарастал.
+            _delete_user_message(chat_id, message_id)
             return
 
         suggestion = suggest_command(normalized)
@@ -2076,6 +2098,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             )
 
         _send(chat_id, hint, reply_to_message_id=message_id)
+        _delete_user_message(chat_id, message_id)
         return
 
     pending = take_pending_status(chat_id, sender.get("id"))
@@ -2089,6 +2112,9 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         )
 
         finish_status_change(chat_id, sender, text, message_id, pending)
+
+        # Описание причины бот тоже забирает себе.
+        _delete_user_message(chat_id, message_id)
         return
 
     parsed = parse_error_message(text)
