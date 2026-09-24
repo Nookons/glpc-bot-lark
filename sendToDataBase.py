@@ -193,6 +193,37 @@ def rest_get(table: str, params: dict = None):
     return _rest_get(table, params)
 
 
+def rest_get_all(table: str, params: dict = None, page: int = 1000, max_pages: int = 10):
+    """
+    Читает таблицу постранично.
+
+    PostgREST отдаёт не больше `db-max-rows` строк за запрос (в проекте это
+    ~4000), поэтому «взять всё» одним запросом нельзя: молча получишь
+    обрезанные данные. None — сбой чтения.
+    """
+    rows = []
+
+    for index in range(max_pages):
+        chunk = rest_get(
+            table,
+            params={
+                **(params or {}),
+                "limit": str(page),
+                "offset": str(index * page),
+            },
+        )
+
+        if chunk is None:
+            return None
+
+        rows.extend(chunk)
+
+        if len(chunk) < page:
+            break
+
+    return rows
+
+
 def rest_count(table: str, params: dict = None):
     """
     Точное число строк (PostgREST `Prefer: count=exact`).

@@ -35,11 +35,13 @@ from rich.table import Table
 import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
+import analytics
 import bot_lease
 import digests
 import robot_card
 from env_utils import env_bool, env_int
 from robot_queue import start_queue_autoclose
+from analytics import start_weekly_scheduler
 from digests import start_digest_scheduler
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
@@ -219,8 +221,9 @@ BOOTSTRAP_COMMANDS = ("id", "help", "start")
 
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
 KNOWN_COMMANDS = (
-    "reg", "unreg", "whoami", "stats", "robot", "digest", "id", "help",
-    "start", "offline", "online", "cancel",
+    "reg", "unreg", "whoami", "stats", "robot", "digest", "top",
+    "downtime", "week", "id", "help", "start", "offline", "online",
+    "cancel",
 )
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
@@ -307,6 +310,9 @@ HELP_TEXT = (
     "/stats [date] [day|night] — shift statistics\n"
     "/robot <number> — robot card: status, downtime, history\n"
     "/digest — maintenance digest (stale offline, add-robot queue)\n"
+    "/top [day|week|month] — top issues and robots\n"
+    "/downtime [days] — longest total downtime and MTTR\n"
+    "/week — weekly report preview\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
     "/cancel — cancel the current action\n"
@@ -1750,6 +1756,18 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
         _handle_digest(chat_id, reply_to)
         return True
 
+    if command == "top":
+        _handle_top(chat_id, args, reply_to)
+        return True
+
+    if command == "downtime":
+        _handle_downtime(chat_id, args, reply_to)
+        return True
+
+    if command == "week":
+        _handle_week(chat_id, reply_to)
+        return True
+
     if command in STATUS_DIRECTIONS:
         _handle_status_command(chat_id, sender, command, args, reply_to)
         return True
@@ -2019,6 +2037,79 @@ def _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id):
         )
 
     _delete_quiet(chat_id, message_id)
+
+
+def _handle_top(chat_id, args, reply_to):
+    """Топ типов проблем и роботов за период (/top day|week|month)."""
+    raw = (args or "").strip().split()
+    period = raw[0].lower() if raw else analytics.DEFAULT_PERIOD
+
+    if not analytics.period_days(period):
+        _send(
+            chat_id,
+            "Usage: /top [day|week|month]\nExample: /top week",
+            reply_to_message_id=reply_to,
+        )
+        return
+
+    report = analytics.top_report(period)
+
+    if report is None:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    _send(
+        chat_id,
+        analytics.format_top_report(report),
+        reply_to_message_id=reply_to,
+    )
+
+
+def _handle_downtime(chat_id, args, reply_to):
+    """Топ роботов по суммарному простою (/downtime [дни])."""
+    raw = (args or "").strip().split()
+    days = raw[0] if raw else "7"
+
+    if not days.isdigit() or not (1 <= int(days) <= 90):
+        _send(
+            chat_id,
+            "Usage: /downtime [days 1..90]\nExample: /downtime 7",
+            reply_to_message_id=reply_to,
+        )
+        return
+
+    report = analytics.downtime_report(int(days))
+
+    if report is None:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    _send(
+        chat_id,
+        analytics.format_downtime_report(report, int(days)),
+        reply_to_message_id=reply_to,
+    )
+
+
+def _handle_week(chat_id, reply_to):
+    """Предпросмотр недельного отчёта (в Lark он уходит по расписанию)."""
+    text = analytics.weekly_text()
+
+    _send(
+        chat_id,
+        text or "No data for the weekly report.",
+        reply_to_message_id=reply_to,
+    )
 
 
 def _handle_digest(chat_id, reply_to):
@@ -2917,6 +3008,9 @@ def poller_supervisor(holder: str, acquired: bool = False):
 
                 if digests.DIGEST_ENABLED:
                     start_digest_scheduler()
+
+                if analytics.WEEKLY_REPORT_ENABLED:
+                    start_weekly_scheduler()
 
                 scheduler_started = True
 

@@ -316,12 +316,28 @@ def downtime_metrics(shift_date: str, shift_name: str) -> dict:
     if intervals is None:
         return {"available": False}
 
+    # MTTR считаем по ремонтам, которые начались И закончились в этой смене:
+    # иначе закрытие старой заявки (робот стоял месяцами) раздувает среднее
+    # и делает цифру несравнимой между сменами.
     recovered = [
-        item for item in intervals if start <= item["end"] < end
+        item for item in intervals
+        if start <= item["start"] and item["end"] < end
+    ]
+
+    # Отдельно — заявки, которые закрыли в эту смену, но открыли раньше.
+    legacy = [
+        item for item in intervals
+        if item["start"] < start and start <= item["end"] < end
     ]
 
     if not recovered:
-        return {"available": True, "count": 0, "mttr_seconds": None, "longest": None}
+        return {
+            "available": True,
+            "count": 0,
+            "legacy": len(legacy),
+            "mttr_seconds": None,
+            "longest": None,
+        }
 
     durations = [item["seconds"] for item in recovered]
     longest = max(recovered, key=lambda item: item["seconds"])
@@ -329,6 +345,7 @@ def downtime_metrics(shift_date: str, shift_name: str) -> dict:
     return {
         "available": True,
         "count": len(recovered),
+        "legacy": len(legacy),
         "mttr_seconds": int(sum(durations) / len(durations)),
         "longest": {
             "robot": longest.get("robot"),
@@ -346,6 +363,12 @@ def downtime_line(metrics: dict) -> str:
         return None
 
     if not downtime.get("count"):
+        if downtime.get("legacy"):
+            return (
+                f"🛠 {downtime['legacy']} older repair(s) closed this shift "
+                "(started earlier)"
+            )
+
         return "🛠 MTTR: no robot came back online this shift"
 
     line = (

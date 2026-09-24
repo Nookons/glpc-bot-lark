@@ -4833,6 +4833,359 @@ def test_digest_due_and_command():
         sent,
     )
 
+# ============================================================
+# СПРИНТ 3: АНАЛИТИКА (/top, /downtime, /week)
+# ============================================================
+
+def test_analytics_top_report():
+    """Топ типов проблем и роботов за период."""
+    import analytics
+
+    original = analytics.rest_get_all
+
+    rows = [
+        {"error_robot": 3750, "issue_type": "Unable to drive"},
+        {"error_robot": 3750, "issue_type": "Unable to drive"},
+        {"error_robot": 3750, "issue_type": "Obstacle avoidance"},
+        {"error_robot": 3421, "issue_type": "Unable to drive"},
+        {"error_robot": None, "issue_type": None},
+    ]
+
+    analytics.rest_get_all = lambda table, params=None, page=1000, max_pages=10: rows
+
+    try:
+        week = analytics.top_report("week")
+        month = analytics.top_report("month")
+    finally:
+        analytics.rest_get_all = original
+
+    check(
+        "top: считает типы и роботов",
+        week["total"] == 5
+        and week["issues"][0] == ("Unable to drive", 3)
+        and week["robots"][0] == ("3750", 3),
+        week,
+    )
+    check(
+        "top: пустой тип не теряется",
+        ("unknown", 1) in week["issues"],
+        week["issues"],
+    )
+    check("top: период влияет на окно", month["days"] == 30, month["days"])
+
+    text = analytics.format_top_report(week)
+    check(
+        "top: текст с итогом и топами",
+        "Top for the last 7 day(s)" in text
+        and "Total: 5" in text
+        and "Unable to drive" in text
+        and "#3750" in text,
+        text,
+    )
+    check(
+        "top: пустой период подписан честно",
+        "No exceptions in this period." in analytics.format_top_report(
+            {"period": "day", "days": 1, "since": None, "total": 0,
+             "issues": [], "robots": []}
+        ),
+    )
+    check(
+        "top: неизвестный период -> подсказка",
+        "Usage: /top" in analytics.format_top_report(None),
+    )
+    check("top: неизвестный период не считается", analytics.top_report("year") is None)
+
+    analytics.rest_get_all = lambda table, params=None, page=1000, max_pages=10: None
+
+    try:
+        broken = analytics.top_report("week")
+    finally:
+        analytics.rest_get_all = original
+
+    check("top: сбой чтения -> None, а не пустой отчёт", broken is None, broken)
+
+
+def test_analytics_downtime_report():
+    """Простой: MTTR по ремонтам периода + отдельно «старые» заявки."""
+    import analytics
+
+    from datetime import datetime, timedelta, timezone
+
+    original = analytics.downtime_intervals
+    now = datetime(2026, 9, 24, 6, 0, tzinfo=timezone.utc)
+
+    intervals = [
+        # починен в периоде, начался в периоде: 2 часа
+        {"robot": 1, "start": now - timedelta(days=2),
+         "end": now - timedelta(days=2) + timedelta(hours=2), "seconds": 7200.0,
+         "type_problem": "Other"},
+        # починен в периоде, начался в периоде: 6 часов
+        {"robot": 2, "start": now - timedelta(days=3),
+         "end": now - timedelta(days=3) + timedelta(hours=6), "seconds": 21600.0,
+         "type_problem": "Other"},
+        # закрыт в периоде, но открыт 40 дней назад (старая заявка)
+        {"robot": 3, "start": now - timedelta(days=40),
+         "end": now - timedelta(days=1), "seconds": 40 * 86400.0,
+         "type_problem": "Other"},
+        # закрылся до периода — не считается
+        {"robot": 4, "start": now - timedelta(days=30),
+         "end": now - timedelta(days=20), "seconds": 10 * 86400.0,
+         "type_problem": "Other"},
+    ]
+
+    analytics.downtime_intervals = lambda: intervals
+
+    try:
+        report = analytics.downtime_report(7, now)
+    finally:
+        analytics.downtime_intervals = original
+
+    check(
+        "downtime: MTTR только по ремонтам, начатым в периоде",
+        report["repairs"] == 2 and report["mttr_seconds"] == 4 * 3600,
+        report,
+    )
+    check(
+        "downtime: старая заявка считается отдельно",
+        report["legacy"] == 1 and report["legacy_longest"]["robot"] == 3,
+        report,
+    )
+    check(
+        "downtime: топ не раздувается старой заявкой",
+        [robot for robot, _ in report["top"]] == [2, 1],
+        report["top"],
+    )
+
+    text = analytics.format_downtime_report(report, 7)
+    check(
+        "downtime: текст с MTTR, старой заявкой и топом",
+        "Repairs started: 2" in text
+        and "MTTR 4h 00m" in text
+        and "Also closed: 1 older repair(s)" in text
+        and "#2" in text,
+        text,
+    )
+
+    analytics.downtime_intervals = lambda: None
+
+    try:
+        broken = analytics.downtime_report(7, now)
+    finally:
+        analytics.downtime_intervals = original
+
+    check("downtime: сбой чтения -> None", broken is None, broken)
+    check(
+        "downtime: подсказка по формату при отсутствии данных",
+        "Usage: /downtime" in analytics.format_downtime_report(None),
+    )
+
+
+def test_analytics_weekly_and_schedule():
+    """Недельный отчёт: текст, отправка, маркер и расписание."""
+    import analytics
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    monday = datetime(2026, 9, 28, 9, 0, tzinfo=warsaw)
+
+    check("weekly: тест опирается на понедельник", monday.weekday() == 0)
+
+    original = (
+        analytics.top_report,
+        analytics.downtime_report,
+        analytics.retirement_candidates,
+        analytics.send_text_via_hook,
+        analytics.was_sent,
+        analytics.mark_sent,
+        analytics.WEEKLY_REPORT_ENABLED,
+    )
+
+    analytics.top_report = lambda period="week", now=None: {
+        "period": "week", "days": 7, "since": None, "total": 464,
+        "issues": [("Unable to drive", 311)], "robots": [("3750", 13)],
+    }
+    analytics.downtime_report = lambda days=7, now=None: {
+        "days": days, "repairs": 18, "mttr_seconds": 85200,
+        "top": [(3432, {"seconds": 306300.0, "count": 1})], "legacy": 27,
+        "legacy_longest": {"robot": 132, "seconds": 7815000.0},
+    }
+    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None: [
+        (97, 3, 262402.0),
+    ]
+
+    try:
+        text = analytics.weekly_text(now=monday)
+    finally:
+        (
+            analytics.top_report,
+            analytics.downtime_report,
+            analytics.retirement_candidates,
+            analytics.send_text_via_hook,
+            analytics.was_sent,
+            analytics.mark_sent,
+            analytics.WEEKLY_REPORT_ENABLED,
+        ) = original
+
+    check(
+        "weekly: есть итоги, простой и кандидаты",
+        "Weekly report" in text
+        and "Exceptions: 464" in text
+        and "Repairs started: 18" in text
+        and "also closed: 27" in text
+        and "#97" in text,
+        text,
+    )
+
+    # отправка + маркер
+    hooks, marked = [], []
+
+    analytics.top_report = lambda period="week", now=None: {
+        "period": "week", "days": 7, "since": None, "total": 1,
+        "issues": [], "robots": [],
+    }
+    analytics.downtime_report = lambda days=7, now=None: None
+    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None: []
+    analytics.send_text_via_hook = lambda url, text: hooks.append(text) or {"code": 0}
+    analytics.was_sent = lambda now: False
+    analytics.mark_sent = lambda now: marked.append(now.strftime("%Y-%m-%d")) or True
+
+    try:
+        result = analytics.send_weekly_report(monday)
+    finally:
+        (
+            analytics.top_report,
+            analytics.downtime_report,
+            analytics.retirement_candidates,
+            analytics.send_text_via_hook,
+            analytics.was_sent,
+            analytics.mark_sent,
+            analytics.WEEKLY_REPORT_ENABLED,
+        ) = original
+
+    check(
+        "weekly: отчёт ушёл в Lark и день помечен",
+        result["sent"] is True and len(hooks) == 1 and marked == ["2026-09-28"],
+        (result, marked),
+    )
+
+    # флаг выключен -> никогда не пора
+    analytics.WEEKLY_REPORT_ENABLED = False
+    analytics.was_sent = lambda now: False
+
+    try:
+        off = analytics.weekly_due(monday)
+    finally:
+        analytics.WEEKLY_REPORT_ENABLED = original[6]
+        analytics.was_sent = original[4]
+
+    check("weekly: по умолчанию выключен", off is False)
+
+    # включён, но не время
+    analytics.WEEKLY_REPORT_ENABLED = True
+    analytics.was_sent = lambda now: False
+    analytics._last_sent_monday = None
+
+    try:
+        tuesday = monday.replace(day=29)
+        early = analytics.weekly_due(monday.replace(hour=analytics.WEEKLY_REPORT_HOUR - 1))
+        not_monday = analytics.weekly_due(tuesday)
+        ready = analytics.weekly_due(monday)
+
+        analytics._last_sent_monday = "2026-09-28"
+        repeated = analytics.weekly_due(monday)
+
+        analytics._last_sent_monday = None
+        analytics.was_sent = lambda now: True
+        after_restart = analytics.weekly_due(monday)
+    finally:
+        analytics.WEEKLY_REPORT_ENABLED = original[6]
+        analytics.was_sent = original[4]
+        analytics._last_sent_monday = None
+
+    check("weekly: до часа отправки не шлём", early is False)
+    check("weekly: не понедельник — не шлём", not_monday is False)
+    check("weekly: в понедельник после часа — шлём", ready is True)
+    check("weekly: второй раз в тот же день не шлём", repeated is False)
+    check("weekly: маркер отменяет повтор после перезапуска", after_restart is False)
+
+
+def test_analytics_commands():
+    """/top, /downtime, /week в Telegram."""
+    import analytics
+
+    original_top = analytics.top_report
+    original_downtime = analytics.downtime_report
+    original_week = analytics.weekly_text
+
+    analytics.top_report = lambda period="week", now=None: {
+        "period": period, "days": analytics.period_days(period), "since": None,
+        "total": 3, "issues": [("Unable to drive", 3)], "robots": [("3750", 2)],
+    }
+    analytics.downtime_report = lambda days=7, now=None: {
+        "days": days, "repairs": 1, "mttr_seconds": 3600,
+        "top": [(1, {"seconds": 3600.0, "count": 1})], "legacy": 0,
+        "legacy_longest": None,
+    }
+    analytics.weekly_text = lambda days=7, now=None: "📊 Weekly report · GLP-C"
+
+    try:
+        week = run(make_update(text="/top", message_id=9701, thread_id=2))
+        month = run(make_update(text="/top month", message_id=9702, thread_id=2))
+        bad = run(make_update(text="/top year", message_id=9703, thread_id=2))
+        downtime = run(make_update(text="/downtime 7", message_id=9704, thread_id=2))
+        bad_days = run(make_update(text="/downtime abc", message_id=9705, thread_id=2))
+        weekly = run(make_update(text="/week", message_id=9706, thread_id=2))
+    finally:
+        analytics.top_report = original_top
+        analytics.downtime_report = original_downtime
+        analytics.weekly_text = original_week
+
+    check(
+        "analytics: /top по умолчанию неделя",
+        week and "Top for the last 7 day(s)" in week[0]["text"],
+        week,
+    )
+    check(
+        "analytics: /top month переключает период",
+        month and "Top for the last 30 day(s)" in month[0]["text"],
+        month,
+    )
+    check(
+        "analytics: /top с мусором — подсказка",
+        bad and "Usage: /top" in bad[0]["text"],
+        bad,
+    )
+    check(
+        "analytics: /downtime показывает MTTR",
+        downtime and "MTTR 1h 00m" in downtime[0]["text"],
+        downtime,
+    )
+    check(
+        "analytics: /downtime с мусором — подсказка",
+        bad_days and "Usage: /downtime" in bad_days[0]["text"],
+        bad_days,
+    )
+    check(
+        "analytics: /week присылает сводку",
+        weekly and "Weekly report" in weekly[0]["text"],
+        weekly,
+    )
+
+    analytics.weekly_text = lambda days=7, now=None: ""
+
+    try:
+        empty = run(make_update(text="/week", message_id=9707, thread_id=2))
+    finally:
+        analytics.weekly_text = original_week
+
+    check(
+        "analytics: /week без данных отвечает честно",
+        empty and "No data" in empty[0]["text"],
+        empty,
+    )
+
 
 def main():
     tests = [
@@ -4931,6 +5284,10 @@ def main():
         test_digest_build_stale_and_queue,
         test_digest_send_and_marker,
         test_digest_due_and_command,
+        test_analytics_top_report,
+        test_analytics_downtime_report,
+        test_analytics_weekly_and_schedule,
+        test_analytics_commands,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
