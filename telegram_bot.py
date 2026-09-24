@@ -17,6 +17,7 @@ error_parser.py / shift.py / sendToDataBase.py без изменений.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import os
 import re
@@ -151,6 +152,59 @@ TELEGRAM_TOPIC_NAME = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
 # Отвечать ли в чужом топике подсказкой (один раз на топик).
 WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
 
+# ============================================================
+# ТОПИКИ ФОРУМА ПО НАЗНАЧЕНИЮ
+# ============================================================
+#
+# Один топик — один смысл. В топике ошибок («Ex GLPC») не должно быть ничего,
+# кроме ошибок: статусы роботов, статистика и служебные ответы уходят в свои
+# топики.
+#
+# Значение переменной — id топика (надёжно; узнать: /id в этом топике) или
+# его имя (сработает, если бот видел сервисное сообщение о создании топика).
+TOPIC_RAW = {
+    "error": os.environ.get("TELEGRAM_TOPIC_ID", "").strip(),
+    "status": os.environ.get("TELEGRAM_TOPIC_STATUS", "").strip(),
+    "stats": os.environ.get("TELEGRAM_TOPIC_STATS", "").strip(),
+    "service": os.environ.get("TELEGRAM_TOPIC_SERVICE", "").strip(),
+}
+
+TOPIC_KINDS = ("error", "status", "stats", "service")
+
+TOPIC_TITLES = {
+    "error": "Ex GLPC (errors)",
+    "status": "Robot status",
+    "stats": "Stats",
+    "service": "Service",
+}
+
+# В топике ошибок — только ошибки: ответы на команды уходят в свой топик.
+ERROR_TOPIC_STRICT = _env_bool("TELEGRAM_ERROR_TOPIC_STRICT", True)
+
+# Короткая самоудаляющаяся подсказка «ответ в другом топике»: без неё
+# сотрудник, написавший /offline в топике ошибок, не поймёт, куда пропал ответ.
+MOVED_HINT = _env_bool("TELEGRAM_MOVED_HINT", True)
+
+# К какому топику относится ответ на команду.
+COMMAND_TOPICS = {
+    "start": "service",
+    "help": "service",
+    "id": "service",
+    "topics": "service",
+    "reg": "service",
+    "unreg": "service",
+    "whoami": "service",
+    "cancel": "status",
+    "offline": "status",
+    "online": "status",
+    "robot": "status",
+    "stats": "stats",
+    "top": "stats",
+    "downtime": "stats",
+    "week": "stats",
+    "digest": "stats",
+}
+
 # Через сколько секунд удалять свои служебные подтверждения
 # («сохранено», «фото переслано»). 0 — не удалять.
 CONFIRM_TTL_SECONDS = _env_int("TELEGRAM_CONFIRM_TTL", 10)
@@ -222,8 +276,8 @@ BOOTSTRAP_COMMANDS = ("id", "help", "start")
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
 KNOWN_COMMANDS = (
     "reg", "unreg", "whoami", "stats", "robot", "digest", "top",
-    "downtime", "week", "id", "help", "start", "offline", "online",
-    "cancel",
+    "downtime", "week", "topics", "id", "help", "start", "offline",
+    "online", "cancel",
 )
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
@@ -313,6 +367,7 @@ HELP_TEXT = (
     "/top [day|week|month] — top issues and robots\n"
     "/downtime [days] — longest total downtime and MTTR\n"
     "/week — weekly report preview\n"
+    "/topics — which topic is used for what\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
     "/cancel — cancel the current action\n"
@@ -555,6 +610,148 @@ def _learn_topic_from_message(chat_id, message):
         )
 
 
+def _topic_by_name(name, chat_id=None):
+    """thread_id топика по имени (из сервисных сообщений форума)."""
+    wanted = str(name or "").strip().casefold()
+
+    if not wanted:
+        return None
+
+    for (key_chat, thread_id), known in list(_topic_names.items()):
+        if chat_id is not None and int(key_chat) != int(chat_id):
+            continue
+
+        if (known or "").strip().casefold() == wanted:
+            return thread_id
+
+    return None
+
+
+def topic_thread(kind: str, chat_id=None):
+    """
+    Настроенный thread_id топика для вида сообщений.
+
+    None — топик не настроен (или имя ещё не выучено). Это не ошибка:
+    вызывающий код отвечает в топик-источник, как раньше.
+    """
+    kind = str(kind or "").strip().lower()
+
+    if kind not in TOPIC_KINDS:
+        return None
+
+    if kind == "error":
+        if TELEGRAM_TOPIC_ID is not None:
+            return TELEGRAM_TOPIC_ID
+
+        return _topic_by_name(TELEGRAM_TOPIC_NAME, chat_id)
+
+    raw = TOPIC_RAW.get(kind, "")
+
+    if not raw:
+        return None
+
+    digits = raw.lstrip("-")
+
+    if digits.isdigit():
+        return int(raw)
+
+    return _topic_by_name(raw, chat_id)
+
+
+def topic_map(chat_id=None) -> dict:
+    return {kind: topic_thread(kind, chat_id) for kind in TOPIC_KINDS}
+
+
+def topic_title(kind: str, chat_id=None) -> str:
+    """«Ex GLPC (errors)» или «Ex GLPC (errors) #2» — для подсказок и логов."""
+    thread_id = topic_thread(kind, chat_id)
+    name = topic_name(chat_id, thread_id) if thread_id else None
+
+    if name:
+        return f"{name!r}"
+
+    return TOPIC_TITLES.get(kind, kind)
+
+
+_reply_kind = threading.local()
+
+
+@contextlib.contextmanager
+def reply_kind(kind: str):
+    """
+    Контекст: сообщения внутри блока относятся к топику `kind`.
+
+    Нужен, чтобы не протаскивать параметр через каждый обработчик: команда
+    целиком выполняется внутри своего вида топика.
+    """
+    previous = getattr(_reply_kind, "value", None)
+    _reply_kind.value = kind
+
+    try:
+        yield kind
+    finally:
+        _reply_kind.value = previous
+
+
+def current_reply_kind():
+    return getattr(_reply_kind, "value", None)
+
+
+def _hint_moved(chat_id, kind: str, origin_thread=None) -> bool:
+    """
+    Короткая самоудаляющаяся подсказка «ответ в другом топике».
+
+    Нужна, когда сотрудник пишет в топик ошибок, а ответ по правилам уходит
+    в другой топик: без подсказки выглядит так, будто бот не ответил.
+    """
+    if not MOVED_HINT or not kind or kind == "error":
+        return False
+
+    origin = _route_thread(chat_id) if origin_thread is None else origin_thread
+    target = _reply_thread(chat_id, kind)
+
+    if origin is None or target is None or int(origin) == int(target):
+        return False
+
+    _send(
+        chat_id,
+        f"➡️ The answer is in the {TOPIC_TITLES.get(kind, kind)} topic.",
+        thread_id=origin,
+        delete_after=CONFIRM_TTL_SECONDS,
+    )
+
+    return True
+
+
+def _reply_thread(chat_id, kind: str = None):
+    """
+    Куда отправлять сообщение вида `kind`.
+
+    По умолчанию — туда, откуда пришло сообщение (как раньше). Исключение:
+    топик ошибок. В нём по условию только ошибки, поэтому ответы на команды
+    уходят в свой топик (status/stats/service), а если он не настроен — в
+    служебный, и лишь в крайнем случае остаются на месте.
+    """
+    origin = _route_thread(chat_id)
+
+    if not kind or not ERROR_TOPIC_STRICT:
+        return origin
+
+    error_thread = topic_thread("error", chat_id)
+
+    if error_thread is None or origin is None:
+        return origin
+
+    if int(origin) != int(error_thread):
+        return origin
+
+    return (
+        topic_thread(kind, chat_id)
+        or topic_thread("service", chat_id)
+        or origin
+    )
+
+
 def monitored_topic_label() -> str:
     """Человекочитаемое описание отслеживаемого топика."""
     if TELEGRAM_TOPIC_ID is not None:
@@ -604,10 +801,14 @@ def _send(
     disable_notification=False,
     delete_after: int = None,
     reply_markup: dict = None,
+    kind: str = None,
 ):
     """
     Отправка с автоопределением топика: ответ уходит в тот же топик,
     откуда пришло сообщение (для форум-групп).
+
+    kind — к какому топику относится сообщение ("error", "status", "stats",
+    "service"). В топике ошибок не-ошибочные ответы уходят в свой топик.
 
     Если в этот топик отправить нельзя (например, General закрыт —
     Telegram отвечает TOPIC_CLOSED), повторяем в отслеживаемый топик,
@@ -615,8 +816,11 @@ def _send(
 
     delete_after — через сколько секунд удалить это сообщение (0/None — не удалять).
     """
+    if kind is None:
+        kind = current_reply_kind()
+
     if thread_id is None:
-        thread_id = _route_thread(chat_id)
+        thread_id = _reply_thread(chat_id, kind)
 
     result = tg.send_message(
         chat_id,
@@ -1451,6 +1655,11 @@ def store_photo_for_record(saved, photo_path):
 
 def flush_pending_photo(chat_id, user_id, data):
     """Фото осталось без текста ошибки — пересылаем его отдельно."""
+    with reply_kind("error"):
+        return _flush_pending_photo_inner(chat_id, user_id, data)
+
+
+def _flush_pending_photo_inner(chat_id, user_id, data):
     employee_name = get_employee_name(user_id)
 
     if employee_name:
@@ -1723,7 +1932,25 @@ def _handle_stats(chat_id, args, reply_to):
 
 
 def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool:
-    """Обрабатывает команду. True, если команда распознана."""
+    """
+    Обрабатывает команду. True, если команда распознана.
+
+    Вид топика берётся из COMMAND_TOPICS: в топике ошибок ответы на команды
+    не появляются — они уходят в свой топик (статусы/статистика/служебный).
+    """
+    kind = COMMAND_TOPICS.get(command, "service")
+
+    if command in STATUS_DIRECTIONS:
+        kind = "status"
+
+    with reply_kind(kind):
+        return _handle_command_inner(
+            chat_id, sender, command, args, reply_to, chat
+        )
+
+
+def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -> bool:
+    """Тело обработки команд (внутри выбранного вида топика)."""
     if command in ("start", "help"):
         _send(
             chat_id,
@@ -1754,6 +1981,10 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
 
     if command == "digest":
         _handle_digest(chat_id, reply_to)
+        return True
+
+    if command == "topics":
+        _handle_topics(chat_id, reply_to)
         return True
 
     if command == "top":
@@ -2037,6 +2268,41 @@ def _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id):
         )
 
     _delete_quiet(chat_id, message_id)
+
+
+def _handle_topics(chat_id, reply_to):
+    """Показывает, какой топик за что отвечает (настройка и проверка)."""
+    lines = ["🗂 Topic routing", ""]
+
+    roles = {
+        "error": "errors are read and answered here",
+        "status": "/offline, /online, /robot, status changes",
+        "stats": "/stats, /top, /downtime, /week, /digest",
+        "service": "/help, /id, /reg, warnings",
+    }
+
+    for kind in TOPIC_KINDS:
+        thread_id = topic_thread(kind, chat_id)
+        name = topic_name(chat_id, thread_id) if thread_id else None
+
+        if thread_id is None:
+            shown = "NOT configured" if kind != "error" else "not set (any topic)"
+        else:
+            shown = f"id {thread_id}" + (f" · {name!r}" if name else "")
+
+        lines.append(f"{TOPIC_TITLES[kind]}: {shown}")
+        lines.append(f"    {roles[kind]}")
+
+    lines.append("")
+    lines.append(
+        "Strict error topic: " + ("on" if ERROR_TOPIC_STRICT else "off")
+    )
+    lines.append(
+        "Send /id in a topic to learn its id, then set "
+        "TELEGRAM_TOPIC_STATUS / _STATS / _SERVICE in the service variables."
+    )
+
+    _send(chat_id, "\n".join(lines), reply_to_message_id=reply_to)
 
 
 def _handle_top(chat_id, args, reply_to):
@@ -2685,6 +2951,15 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         # reply_to не передаём: команду бот сразу удалит, и ответ «в ответ
         # на удалённое сообщение» выглядел бы сломанным.
         if _handle_command(chat_id, sender, normalized, args, None, chat):
+            # Если ответ ушёл в другой топик (в топике ошибок только ошибки),
+            # коротко и самоудаляемо говорим об этом там, где спросили.
+            _hint_moved(
+                chat_id,
+                COMMAND_TOPICS.get(
+                    normalized,
+                    "status" if normalized in STATUS_DIRECTIONS else "service",
+                ),
+            )
             # Команда отработана — затираем её, чтобы чат не зарастал.
             _delete_user_message(chat_id, message_id)
             return
@@ -2702,7 +2977,9 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
                 "Send /help to see the available commands."
             )
 
-        _send(chat_id, hint)
+        with reply_kind("service"):
+            _send(chat_id, hint)
+
         _delete_user_message(chat_id, message_id)
         return
 
@@ -2716,7 +2993,11 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             text[:80],
         )
 
-        changed = finish_status_change(chat_id, sender, text, message_id, pending)
+        with reply_kind("status"):
+            changed = finish_status_change(
+                chat_id, sender, text, message_id, pending
+            )
+            _hint_moved(chat_id, "status")
 
         if changed:
             # Описание причины бот забирает себе — но только если статус
@@ -3203,6 +3484,26 @@ def main():
         console.print(f"[cyan]Allowed chats: {sorted(ALLOWED_CHAT_IDS)}[/cyan]")
 
     console.print(f"[cyan]Monitored topic: {monitored_topic_label()}[/cyan]")
+
+    console.print("[cyan]Topic routing:[/cyan]")
+
+    for topic_kind in TOPIC_KINDS:
+        thread_id = topic_thread(topic_kind)
+
+        if thread_id is None:
+            if topic_kind == "error":
+                console.print(
+                    f"  [red]{TOPIC_TITLES[topic_kind]}: не задан[/red]"
+                )
+            else:
+                console.print(
+                    f"  [yellow]{TOPIC_TITLES[topic_kind]}: не задан — "
+                    f"ответы остаются в топике-источнике[/yellow]"
+                )
+        else:
+            console.print(
+                f"  [green]{TOPIC_TITLES[topic_kind]}: id {thread_id}[/green]"
+            )
 
     if TELEGRAM_TOPIC_ID is None and not TELEGRAM_TOPIC_NAME:
         console.print(

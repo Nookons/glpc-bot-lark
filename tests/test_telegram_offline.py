@@ -5186,6 +5186,265 @@ def test_analytics_commands():
         empty,
     )
 
+# ============================================================
+# ТОПИКИ: РАЗДЕЛЕНИЕ ПО СМЫСЛУ
+# ============================================================
+
+def test_topic_map_and_resolution():
+    """Как бот понимает, какой топик за что отвечает."""
+    original = (
+        dict(bot.TOPIC_RAW),
+        bot.TELEGRAM_TOPIC_ID,
+        bot.TELEGRAM_TOPIC_NAME,
+    )
+    original_names = dict(bot._topic_names)
+
+    try:
+        bot.TOPIC_RAW = {"error": "2", "status": "14", "stats": "15", "service": "16"}
+        bot.TELEGRAM_TOPIC_ID = 2
+        bot.TELEGRAM_TOPIC_NAME = ""
+
+        check(
+            "topics: id из конфига",
+            bot.topic_thread("error") == 2
+            and bot.topic_thread("status") == 14
+            and bot.topic_thread("stats") == 15
+            and bot.topic_thread("service") == 16,
+            bot.topic_map(),
+        )
+
+        bot._topic_names[(-500, 21)] = "Robot status"
+        bot.TOPIC_RAW = {**bot.TOPIC_RAW, "status": "Robot status"}
+
+        check(
+            "topics: имя ищется среди выученных",
+            bot.topic_thread("status", -500) == 21,
+            bot.topic_thread("status", -500),
+        )
+
+        bot.TOPIC_RAW = {**bot.TOPIC_RAW, "status": "No such topic"}
+
+        check(
+            "topics: неизвестное имя -> None (ответим как раньше)",
+            bot.topic_thread("status", -500) is None,
+        )
+
+        bot.TOPIC_RAW = {"error": "", "status": "", "stats": "", "service": ""}
+        bot.TELEGRAM_TOPIC_ID = None
+
+        check(
+            "topics: ничего не настроено -> None",
+            all(value is None for value in bot.topic_map().values()),
+            bot.topic_map(),
+        )
+
+        check("topics: неизвестный вид -> None", bot.topic_thread("nonsense") is None)
+    finally:
+        (
+            bot.TOPIC_RAW,
+            bot.TELEGRAM_TOPIC_ID,
+            bot.TELEGRAM_TOPIC_NAME,
+        ) = original
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+
+
+def test_error_topic_keeps_only_errors():
+    """В топике ошибок — только ошибки: команды отвечают в своих топиках."""
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3783"] = _robot()
+
+    original = (
+        dict(bot.TOPIC_RAW),
+        bot.TELEGRAM_TOPIC_ID,
+        bot.ERROR_TOPIC_STRICT,
+        bot.MOVED_HINT,
+        bot.DELETE_USER_MESSAGES,
+        bot.shift_metrics,
+        bot.robot_card.robot_card,
+    )
+    original_names = dict(bot._topic_names)
+
+    bot.TOPIC_RAW = {"error": "2", "status": "14", "stats": "15", "service": "16"}
+    bot.TELEGRAM_TOPIC_ID = 2
+    bot.ERROR_TOPIC_STRICT = True
+    bot.MOVED_HINT = True
+    bot.DELETE_USER_MESSAGES = True
+    bot.shift_metrics = lambda shift_date, shift_name: None
+    bot.robot_card.robot_card = lambda number, warehouse=None: {
+        "found": True,
+        "number": str(number),
+        "robot": {"robot_number": number, "robot_type": "RT", "status": "在线 | Online",
+                  "warehouse": "GLP-C"},
+        "errors_available": True,
+        "errors": 0,
+        "reporters": [],
+        "last_issues": [],
+        "history": [],
+    }
+
+    try:
+        # 1) /stats из топика ошибок -> ответ в топике статистики
+        sent = run(make_update(text="/stats", message_id=9801, thread_id=2))
+
+        check(
+            "topics: /stats из топика ошибок отвечает в топике статистики",
+            sent and sent[0]["thread_id"] == 15,
+            [item["thread_id"] for item in sent],
+        )
+        check(
+            "topics: там же короткая подсказка, куда ушёл ответ",
+            any(
+                "The answer is in the Stats topic" in item["text"]
+                and item["thread_id"] == 2
+                for item in sent
+            ),
+            sent,
+        )
+
+        # 2) /help из топика ошибок -> служебный топик
+        sent = run(make_update(text="/help", message_id=9802, thread_id=2))
+
+        check(
+            "topics: /help отвечает в служебном топике",
+            any(item["thread_id"] == 16 for item in sent),
+            [item["thread_id"] for item in sent],
+        )
+        check(
+            "topics: помощь не попадает в топик ошибок",
+            all(item["thread_id"] != 2 for item in sent if "Robot exception bot" in item["text"]),
+            sent,
+        )
+
+        # 3) /offline из топика ошибок -> флоу целиком в топике статусов
+        sent = run(make_update(text="/offline 3783", message_id=9803, thread_id=2))
+        prompt = [item for item in sent if item.get("reply_markup")]
+
+        check(
+            "topics: кнопки причин уходят в топик статусов",
+            prompt and prompt[0]["thread_id"] == 14,
+            [(item["thread_id"], bool(item.get("reply_markup"))) for item in sent],
+        )
+        check(
+            "topics: подсказка про перенос есть в топике ошибок",
+            any(item["thread_id"] == 2 and "Robot status topic" in item["text"] for item in sent),
+            sent,
+        )
+
+        # 4) ошибка из топика ошибок -> всё остаётся там же, без подсказок
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            message_id=9804,
+            thread_id=2,
+        ))
+
+        check(
+            "topics: ошибка остаётся в топике ошибок",
+            sent and all(item["thread_id"] == 2 for item in sent),
+            [item["thread_id"] for item in sent],
+        )
+        check(
+            "topics: для ошибок подсказок про перенос нет",
+            not any("The answer is in the" in item["text"] for item in sent),
+            sent,
+        )
+
+        # 5) команда из своего топика остаётся в нём
+        sent = run(make_update(text="/stats", message_id=9805, thread_id=15))
+
+        check(
+            "topics: /stats из топика статистики остаётся там",
+            sent and sent[0]["thread_id"] == 15,
+            [item["thread_id"] for item in sent],
+        )
+        check(
+            "topics: без переноса подсказки нет",
+            not any("The answer is in the" in item["text"] for item in sent),
+            sent,
+        )
+
+        # 6) строгий режим выключен -> отвечаем там, где спросили
+        bot.ERROR_TOPIC_STRICT = False
+        sent = run(make_update(text="/stats", message_id=9806, thread_id=2))
+
+        check(
+            "topics: strict=off — ответ остаётся в топике ошибок",
+            sent and sent[0]["thread_id"] == 2,
+            [item["thread_id"] for item in sent],
+        )
+
+        bot.ERROR_TOPIC_STRICT = True
+
+        # 7) топик статусов не настроен -> падаем в служебный
+        bot.TOPIC_RAW = {**bot.TOPIC_RAW, "status": ""}
+        sent = run(make_update(text="/offline 3783", message_id=9807, thread_id=2))
+        prompt = [item for item in sent if item.get("reply_markup")]
+
+        check(
+            "topics: без топика статусов ответ уходит в служебный",
+            prompt and prompt[0]["thread_id"] == 16,
+            [(item["thread_id"], bool(item.get("reply_markup"))) for item in sent],
+        )
+
+        # 8) не настроено ничего -> отвечаем в топике-источнике (как раньше)
+        bot.TOPIC_RAW = {"error": "", "status": "", "stats": "", "service": ""}
+        sent = run(make_update(text="/stats", message_id=9808, thread_id=2))
+
+        check(
+            "topics: ничего не настроено — поведение как раньше",
+            sent and sent[0]["thread_id"] == 2,
+            [item["thread_id"] for item in sent],
+        )
+    finally:
+        (
+            bot.TOPIC_RAW,
+            bot.TELEGRAM_TOPIC_ID,
+            bot.ERROR_TOPIC_STRICT,
+            bot.MOVED_HINT,
+            bot.DELETE_USER_MESSAGES,
+            bot.shift_metrics,
+            bot.robot_card.robot_card,
+        ) = original
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+        ROBOTS.clear()
+
+
+def test_topics_command():
+    """/topics показывает карту топиков."""
+    original = (dict(bot.TOPIC_RAW), bot.TELEGRAM_TOPIC_ID)
+    original_names = dict(bot._topic_names)
+
+    bot.TOPIC_RAW = {"error": "2", "status": "", "stats": "15", "service": ""}
+    bot.TELEGRAM_TOPIC_ID = 2
+    bot._topic_names[(-500, 2)] = "Ex GLPC"
+
+    try:
+        sent = run(make_update(text="/topics", message_id=9901, thread_id=15))
+    finally:
+        (bot.TOPIC_RAW, bot.TELEGRAM_TOPIC_ID) = original
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+
+    text = sent[0]["text"] if sent else ""
+
+    check(
+        "topics: команда показывает id и имя",
+        "Ex GLPC (errors): id 2" in text and "'Ex GLPC'" in text,
+        text,
+    )
+    check(
+        "topics: видно, что не настроено",
+        "Robot status: NOT configured" in text,
+        text,
+    )
+    check(
+        "topics: видно, что в топике ошибок только ошибки",
+        "errors are read and answered here" in text,
+        text,
+    )
+
 
 def main():
     tests = [
@@ -5288,6 +5547,9 @@ def main():
         test_analytics_downtime_report,
         test_analytics_weekly_and_schedule,
         test_analytics_commands,
+        test_topic_map_and_resolution,
+        test_error_topic_keeps_only_errors,
+        test_topics_command,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
