@@ -36,9 +36,11 @@ import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
 import bot_lease
+import digests
 import robot_card
 from env_utils import env_bool, env_int
 from robot_queue import start_queue_autoclose
+from digests import start_digest_scheduler
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
     TARGET_HOOK_URL,
@@ -217,8 +219,8 @@ BOOTSTRAP_COMMANDS = ("id", "help", "start")
 
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
 KNOWN_COMMANDS = (
-    "reg", "unreg", "whoami", "stats", "robot", "id", "help", "start",
-    "offline", "online", "cancel",
+    "reg", "unreg", "whoami", "stats", "robot", "digest", "id", "help",
+    "start", "offline", "online", "cancel",
 )
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
@@ -304,6 +306,7 @@ HELP_TEXT = (
     "/unreg — remove the link\n"
     "/stats [date] [day|night] — shift statistics\n"
     "/robot <number> — robot card: status, downtime, history\n"
+    "/digest — maintenance digest (stale offline, add-robot queue)\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
     "/cancel — cancel the current action\n"
@@ -1743,6 +1746,10 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
         _handle_robot(chat_id, args, reply_to)
         return True
 
+    if command == "digest":
+        _handle_digest(chat_id, reply_to)
+        return True
+
     if command in STATUS_DIRECTIONS:
         _handle_status_command(chat_id, sender, command, args, reply_to)
         return True
@@ -2012,6 +2019,17 @@ def _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id):
         )
 
     _delete_quiet(chat_id, message_id)
+
+
+def _handle_digest(chat_id, reply_to):
+    """Предпросмотр дайджеста обслуживания (та же сводка, что уходит в личку)."""
+    text = digests.build_digest()
+
+    _send(
+        chat_id,
+        text or "✅ Nothing to report: no stale offline robots, no open requests.",
+        reply_to_message_id=reply_to,
+    )
 
 
 def _handle_robot(chat_id, args, reply_to):
@@ -2896,6 +2914,10 @@ def poller_supervisor(holder: str, acquired: bool = False):
                 # Отчёты и обслуживание очереди — только у опрашивающего.
                 start_shift_scheduler()
                 start_queue_autoclose()
+
+                if digests.DIGEST_ENABLED:
+                    start_digest_scheduler()
+
                 scheduler_started = True
 
             threading.Thread(
@@ -3070,6 +3092,11 @@ def main():
 
     # Ответы пользователю идут в Telegram, а не в Lark API.
     set_notifier(lambda chat_id, text: _send(chat_id, text))
+
+    # Дайджест обслуживания уходит в личку, а не в топик.
+    digests.set_digest_sender(
+        lambda chat_id, text: tg.send_message(chat_id, text)
+    )
 
     console.print("[bold green]Telegram-бот запущен[/bold green]")
     console.print(f"[cyan]Bot: @{BOT_USERNAME}[/cyan]")

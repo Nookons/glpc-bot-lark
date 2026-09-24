@@ -194,12 +194,13 @@ def queue_stats(days: int = 1) -> dict:
         {"status": "is.false", "created_at": f"gte.{since}"},
     )
 
+    # Последние открытые заявки (не только «за сутки»): дайджест показывает
+    # именно то, что человеку нужно разобрать.
     recent = rest_get(
         QUEUE_TABLE,
         params={
             "select": "robot_number,created_at,employee_id",
             "status": "is.false",
-            "created_at": f"gte.{since}",
             "order": "created_at.desc",
             "limit": "200",
         },

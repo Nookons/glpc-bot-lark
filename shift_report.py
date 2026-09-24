@@ -30,11 +30,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
+import robot_status
 from shift import DAY_END, DAY_START
 from supabase_storage import download_json, upload_json
 from pending_photos import TARGET_HOOK_URL
-from sendToDataBase import WAREHOUSE, shift_report_data
+from sendToDataBase import WAREHOUSE, rest_get, shift_report_data
 from logging_config import setup_logging
+from time_utils import parse_iso
 
 
 logger = setup_logging(__name__)
@@ -57,6 +59,12 @@ def _env_int(name: str, default: int) -> int:
 
 # Сколько строк показывать в топах.
 REPORT_TOP = _env_int("REPORT_TOP", 5)
+
+# Журнал смен статуса небольшой (сотни строк), поэтому читаем его целиком:
+# простой считается склейкой Offline→Online, и обрезанный список дал бы
+# неверные интервалы.
+HISTORY_TABLE = "change_status_robots"
+HISTORY_SCAN_LIMIT = _env_int("DOWNTIME_HISTORY_LIMIT", 4000)
 
 # С какого числа исключений робота зовём обслуживание.
 MAINTENANCE_THRESHOLD = _env_int("ERROR_THRESHOLD", 3)
@@ -217,6 +225,145 @@ def _maintenance_line(maintenance) -> str:
 # METRICS
 # ============================================================
 
+def shift_window(shift_date: str, shift_name: str):
+    """Границы смены в UTC: [начало, конец)."""
+    try:
+        day = datetime.strptime(shift_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+    if shift_name == "day":
+        start = day.replace(hour=DAY_START, minute=0, second=0, microsecond=0)
+        end = day.replace(hour=DAY_END, minute=0, second=0, microsecond=0)
+    else:
+        start = day.replace(hour=DAY_END, minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=24 - DAY_END + DAY_START)
+
+    return (
+        start.replace(tzinfo=WARSAW_TZ).astimezone(timezone.utc),
+        end.replace(tzinfo=WARSAW_TZ).astimezone(timezone.utc),
+    )
+
+
+def downtime_intervals():
+    """
+    Интервалы простоя Offline→Online из журнала смен статуса.
+
+    None — сбой чтения (это не «простоев не было»). Незакрытые интервалы
+    (робот до сих пор в офлайне) не возвращаются: их простой ещё идёт.
+    """
+    rows = rest_get(
+        HISTORY_TABLE,
+        params={
+            "select": "created_at,robot_number,new_status,type_problem",
+            "order": "created_at.asc",
+            "limit": str(HISTORY_SCAN_LIMIT),
+        },
+    )
+
+    if rows is None:
+        logger.error("Не удалось прочитать журнал смен статуса для MTTR")
+        return None
+
+    opened = {}
+    intervals = []
+
+    for row in rows:
+        number = row.get("robot_number")
+        moment = parse_iso(row.get("created_at"))
+
+        if number is None or moment is None:
+            continue
+
+        status = row.get("new_status")
+
+        if status == robot_status.OFFLINE:
+            opened[number] = (moment, row.get("type_problem"))
+        elif status == robot_status.ONLINE and number in opened:
+            started, type_problem = opened.pop(number)
+
+            if moment >= started:
+                intervals.append({
+                    "robot": number,
+                    "start": started,
+                    "end": moment,
+                    "seconds": (moment - started).total_seconds(),
+                    "type_problem": type_problem,
+                })
+
+    return intervals
+
+
+def downtime_metrics(shift_date: str, shift_name: str) -> dict:
+    """
+    Простой роботов за смену: MTTR и самый долгий простой.
+
+    Считаем по интервалам Offline→Online, которые закрылись внутри смены
+    (робот вернулся в работу на этой смене). Источник — тот же журнал
+    `change_status_robots`, из которого строит отчёт веб-приложение, поэтому
+    цифры не разъезжаются. Роботы, которые всё ещё в офлайне, в MTTR смены
+    не попадают: их простой ещё не закончился.
+    """
+    window = shift_window(shift_date, shift_name)
+
+    if window is None:
+        return {"available": False}
+
+    start, end = window
+
+    intervals = downtime_intervals()
+
+    if intervals is None:
+        return {"available": False}
+
+    recovered = [
+        item for item in intervals if start <= item["end"] < end
+    ]
+
+    if not recovered:
+        return {"available": True, "count": 0, "mttr_seconds": None, "longest": None}
+
+    durations = [item["seconds"] for item in recovered]
+    longest = max(recovered, key=lambda item: item["seconds"])
+
+    return {
+        "available": True,
+        "count": len(recovered),
+        "mttr_seconds": int(sum(durations) / len(durations)),
+        "longest": {
+            "robot": longest.get("robot"),
+            "seconds": int(longest["seconds"]),
+            "type_problem": longest.get("type_problem"),
+        },
+    }
+
+
+def downtime_line(metrics: dict) -> str:
+    """Строка простоя для отчёта (или None, если данных нет)."""
+    downtime = (metrics or {}).get("downtime") or {}
+
+    if not downtime.get("available"):
+        return None
+
+    if not downtime.get("count"):
+        return "🛠 MTTR: no robot came back online this shift"
+
+    line = (
+        f"🛠 MTTR {format_duration(downtime['mttr_seconds'] // 60)} "
+        f"over {downtime['count']} repairs"
+    )
+
+    longest = downtime.get("longest") or {}
+
+    if longest.get("robot") is not None:
+        line += (
+            f" · longest #{longest['robot']} "
+            f"{format_duration(longest['seconds'] // 60)}"
+        )
+
+    return line
+
+
 def shift_metrics(shift_date: str, shift_name: str) -> dict:
     """Метрики смены + сравнение с предыдущей сменой."""
     data = shift_report_data(
@@ -244,6 +391,15 @@ def shift_metrics(shift_date: str, shift_name: str) -> dict:
         "total": previous["total"] if previous else None,
     }
     data["delta"] = data["total"] - previous["total"] if previous else None
+
+    # Простой — отдельный источник; его сбой не должен ломать отчёт.
+    try:
+        data["downtime"] = downtime_metrics(shift_date, shift_name)
+    except Exception:
+        logger.exception(
+            "Не удалось посчитать простой за %s/%s", shift_date, shift_name
+        )
+        data["downtime"] = {"available": False}
 
     return data
 
@@ -300,6 +456,7 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
         f"vs previous shift "
         f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
         f"{previous['shift'] or ''}) {format_delta(metrics['delta'])}",
+        *([downtime_line(metrics)] if downtime_line(metrics) else []),
         "",
         f"⚠️ Maintenance ({MAINTENANCE_THRESHOLD}+ per shift): "
         f"{_maintenance_line(metrics['maintenance'])}",
@@ -361,6 +518,14 @@ def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None):
             ),
         },
     })
+
+    repair_line = downtime_line(metrics)
+
+    if repair_line:
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": repair_line},
+        })
 
     card["elements"].append({"tag": "hr"})
 

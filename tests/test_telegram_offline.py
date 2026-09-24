@@ -4483,6 +4483,356 @@ def test_robot_fix_expiry_flushes_as_is():
         bot.peek_pending_robot_fix(-500, 100) is None,
     )
 
+# ============================================================
+# СПРИНТ 2: ПРОСТОЙ В ОТЧЁТЕ И ДАЙДЖЕСТ ОБСЛУЖИВАНИЯ
+# ============================================================
+
+def _history_rows(events):
+    """events: [(created_at, robot, new_status, type_problem)] -> строки журнала."""
+    return [
+        {
+            "created_at": moment,
+            "robot_number": robot,
+            "new_status": status,
+            "type_problem": type_problem,
+        }
+        for moment, robot, status, type_problem in events
+    ]
+
+
+def test_downtime_metrics_from_history():
+    """MTTR считается склейкой Offline→Online из журнала смен статуса."""
+    import shift_report as sr
+
+    original_get = sr.rest_get
+
+    # Дневная смена 23.09: 06:00–18:00 по Варшаве = 04:00–16:00 UTC.
+    events = [
+        # робот 1: 2 часа простоя, вернулся внутри смены
+        ("2026-09-23T05:00:00+00:00", 1, sr.robot_status.OFFLINE, "Other"),
+        ("2026-09-23T07:00:00+00:00", 1, sr.robot_status.ONLINE, "Solved without changing"),
+        # робот 2: 4 часа простоя, вернулся внутри смены
+        ("2026-09-23T08:00:00+00:00", 2, sr.robot_status.OFFLINE, "Abnormal walking"),
+        ("2026-09-23T12:00:00+00:00", 2, sr.robot_status.ONLINE, "Solved without changing"),
+        # робот 3: вернулся ВНЕ смены (ночью) — в MTTR смены не попадает
+        ("2026-09-22T20:00:00+00:00", 3, sr.robot_status.OFFLINE, "Other"),
+        ("2026-09-23T19:00:00+00:00", 3, sr.robot_status.ONLINE, "Other"),
+        # робот 4: до сих пор в офлайне — интервал не закрыт
+        ("2026-09-23T09:00:00+00:00", 4, sr.robot_status.OFFLINE, "Other"),
+    ]
+
+    sr.rest_get = lambda table, params=None: _history_rows(events)
+
+    try:
+        metrics = sr.downtime_metrics("2026-09-23", "day")
+    finally:
+        sr.rest_get = original_get
+
+    check(
+        "downtime: посчитаны только закрытые внутри смены интервалы",
+        metrics["available"] and metrics["count"] == 2,
+        metrics,
+    )
+    check(
+        "downtime: MTTR = 3 часа ((2+4)/2)",
+        metrics["mttr_seconds"] == 3 * 3600,
+        metrics,
+    )
+    check(
+        "downtime: самый долгий — робот 2 (4 часа, причина из Offline)",
+        metrics["longest"]["robot"] == 2
+        and metrics["longest"]["seconds"] == 4 * 3600
+        and metrics["longest"]["type_problem"] == "Abnormal walking",
+        metrics["longest"],
+    )
+
+    line = sr.downtime_line({"downtime": metrics})
+    check(
+        "downtime: строка отчёта человекочитаемая",
+        line and "MTTR 3h 00m" in line and "#2" in line,
+        line,
+    )
+
+    # нет закрытых интервалов
+    sr.rest_get = lambda table, params=None: _history_rows([])
+
+    try:
+        empty = sr.downtime_metrics("2026-09-23", "day")
+    finally:
+        sr.rest_get = original_get
+
+    check(
+        "downtime: без ремонтов count=0",
+        empty["available"] and empty["count"] == 0,
+        empty,
+    )
+    check(
+        "downtime: строка без ремонтов не врёт про MTTR",
+        "no robot came back online" in (sr.downtime_line({"downtime": empty}) or ""),
+        sr.downtime_line({"downtime": empty}),
+    )
+
+    # сбой БД
+    sr.rest_get = lambda table, params=None: None
+
+    try:
+        broken = sr.downtime_metrics("2026-09-23", "day")
+    finally:
+        sr.rest_get = original_get
+
+    check(
+        "downtime: сбой чтения -> available=False (без выдуманного MTTR)",
+        broken["available"] is False,
+        broken,
+    )
+    check(
+        "downtime: при сбое строки в отчёте нет",
+        sr.downtime_line({"downtime": broken}) is None,
+    )
+
+
+def test_shift_window_bounds():
+    """Границы смены: день 06–18, ночь 18–06 следующего дня (Варшава)."""
+    import shift_report as sr
+
+    day = sr.shift_window("2026-09-23", "day")
+    night = sr.shift_window("2026-09-23", "night")
+
+    check(
+        "shift window: день — 04:00–16:00 UTC летом",
+        day and day[0].hour == 4 and day[1].hour == 16,
+        day,
+    )
+    check(
+        "shift window: ночь — 16:00 UTC → 04:00 UTC следующего дня",
+        night and night[0].hour == 16 and night[1].hour == 4 and night[1].day == 24,
+        night,
+    )
+    check("shift window: мусорная дата -> None", sr.shift_window("23.09", "day") is None)
+
+
+def test_digest_build_stale_and_queue():
+    """Дайджест: залипшие в офлайне + открытые заявки."""
+    import digests
+    import robot_queue
+
+    original_stale = digests.stale_offline_robots
+    original_stats = robot_queue.queue_stats
+
+    stale = [
+        {"robot": 135, "hours": 2800.0, "days": 117, "problem": "其他/other",
+         "updated_at": None},
+        {"robot": 123, "hours": 601.0, "days": 25, "problem": "Photoelectric",
+         "updated_at": None},
+    ]
+
+    digests.stale_offline_robots = lambda hours=None, warehouse=None: stale
+    robot_queue.queue_stats = lambda days=1: {
+        "open": 133,
+        "new": 4,
+        "rows": [
+            {"robot_number": "3706", "created_at": "2026-09-23T01:24:21+00:00"},
+            {"robot_number": "3498", "created_at": "2026-09-23T00:43:00+00:00"},
+        ],
+    }
+
+    try:
+        text = digests.build_digest()
+    finally:
+        digests.stale_offline_robots = original_stale
+        robot_queue.queue_stats = original_stats
+
+    check(
+        "digest: офлайн-роботы с простоем и причиной",
+        "#135 · 117d · 其他/other" in text and "#123 · 25d" in text,
+        text,
+    )
+    check(
+        "digest: очередь заявок с числом и новыми за сутки",
+        "Open robot-add requests: 133" in text and "new in 24h: 4" in text,
+        text,
+    )
+    check(
+        "digest: последние заявки перечислены",
+        "#3706" in text and "#3498" in text,
+        text,
+    )
+
+    # нечего сообщать — не шлём
+    digests.stale_offline_robots = lambda hours=None, warehouse=None: []
+
+    try:
+        robot_queue.queue_stats = lambda days=1: {"open": 0, "new": 0, "rows": []}
+        empty = digests.build_digest()
+    finally:
+        digests.stale_offline_robots = original_stale
+        robot_queue.queue_stats = original_stats
+
+    check("digest: пустой дайджест не отправляется", empty is None, empty)
+
+    # сбой базы — тоже молчим, но не врём «всё хорошо»
+    digests.stale_offline_robots = lambda hours=None, warehouse=None: None
+
+    try:
+        broken = digests.build_digest()
+    finally:
+        digests.stale_offline_robots = original_stale
+
+    check("digest: сбой чтения -> не отправляем", broken is None, broken)
+
+
+def test_digest_send_and_marker():
+    """Рассылка: получатели, маркер дня, отсутствие получателей."""
+    import digests
+
+    original = (
+        digests._sender,
+        digests.build_digest,
+        digests.was_sent,
+        digests.mark_sent,
+        digests.recipients,
+    )
+
+    sent = []
+
+    digests._sender = lambda chat_id, text: sent.append((chat_id, text)) or True
+    digests.build_digest = lambda now=None: "digest text"
+    digests.was_sent = lambda now: False
+    digests.mark_sent = lambda now: True
+    digests.recipients = lambda: [111, 222]
+
+    try:
+        result = digests.send_digest()
+    finally:
+        (
+            digests._sender,
+            digests.build_digest,
+            digests.was_sent,
+            digests.mark_sent,
+            digests.recipients,
+        ) = original
+
+    check(
+        "digest: ушёл всем получателям",
+        result["sent"] == 2 and [chat for chat, _ in sent] == [111, 222],
+        (result, sent),
+    )
+
+    # уже отправляли сегодня — второй раз не шлём
+    digests.build_digest = lambda now=None: "digest text"
+    digests.was_sent = lambda now: True
+    digests.recipients = lambda: [111]
+    digests._sender = lambda chat_id, text: sent.append((chat_id, text)) or True
+
+    try:
+        sent.clear()
+        again = digests.send_digest()
+    finally:
+        (
+            digests._sender,
+            digests.build_digest,
+            digests.was_sent,
+            digests.mark_sent,
+            digests.recipients,
+        ) = original
+
+    check(
+        "digest: повторная отправка в тот же день заблокирована",
+        again["reason"] == "already sent" and sent == [],
+        (again, sent),
+    )
+
+    # нет получателей
+    digests._sender = lambda chat_id, text: True
+    digests.build_digest = lambda now=None: "digest text"
+    digests.was_sent = lambda now: False
+    digests.recipients = lambda: []
+
+    try:
+        nobody = digests.send_digest()
+    finally:
+        (
+            digests._sender,
+            digests.build_digest,
+            digests.was_sent,
+            digests.mark_sent,
+            digests.recipients,
+        ) = original
+
+    check(
+        "digest: без получателей — не падаем и не помечаем день",
+        nobody["reason"] == "no recipients",
+        nobody,
+    )
+
+
+def test_digest_due_and_command():
+    """Расписание дайджеста и команда /digest."""
+    import digests
+
+    original_was_sent = digests.was_sent
+    original_last = digests._last_sent_date
+    original_build = digests.build_digest
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+
+    digests.was_sent = lambda now: False
+    digests._last_sent_date = None
+
+    try:
+        early = digests.digest_due(datetime(2026, 9, 24, digests.DIGEST_HOUR - 1, tzinfo=warsaw))
+        ready = digests.digest_due(datetime(2026, 9, 24, digests.DIGEST_HOUR, tzinfo=warsaw))
+
+        digests._last_sent_date = "2026-09-24"
+        same_day = digests.digest_due(datetime(2026, 9, 24, digests.DIGEST_HOUR + 2, tzinfo=warsaw))
+
+        digests._last_sent_date = None
+        digests.was_sent = lambda now: True
+        sent_before_restart = digests.digest_due(
+            datetime(2026, 9, 24, digests.DIGEST_HOUR, tzinfo=warsaw)
+        )
+    finally:
+        digests.was_sent = original_was_sent
+        digests._last_sent_date = original_last
+
+    check("digest: до часа отправки не шлём", early is False)
+    check("digest: после часа отправки шлём", ready is True)
+    check("digest: второй раз в тот же день не шлём", same_day is False)
+    check(
+        "digest: маркер в Storage отменяет отправку после перезапуска",
+        sent_before_restart is False,
+    )
+
+    original_build = digests.build_digest
+    digests.build_digest = lambda now=None: "🗂 Maintenance digest · 24.09.2026"
+
+    try:
+        sent = run(make_update(text="/digest", message_id=9601, thread_id=2))
+    finally:
+        digests.build_digest = original_build
+
+    check(
+        "digest: команда /digest присылает сводку",
+        sent and "Maintenance digest" in sent[0]["text"],
+        sent,
+    )
+
+    digests.build_digest = lambda now=None: None
+
+    try:
+        sent = run(make_update(text="/digest", message_id=9602, thread_id=2))
+    finally:
+        digests.build_digest = original_build
+
+    check(
+        "digest: нечего сообщать — честный ответ, а не пустое сообщение",
+        sent and "Nothing to report" in sent[0]["text"],
+        sent,
+    )
+
 
 def main():
     tests = [
@@ -4576,6 +4926,11 @@ def main():
         test_robot_fix_suggestion_then_correction,
         test_robot_fix_declined_keeps_number,
         test_robot_fix_expiry_flushes_as_is,
+        test_downtime_metrics_from_history,
+        test_shift_window_bounds,
+        test_digest_build_stale_and_queue,
+        test_digest_send_and_marker,
+        test_digest_due_and_command,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
