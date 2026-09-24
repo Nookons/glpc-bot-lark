@@ -5419,13 +5419,19 @@ def test_topics_command():
     bot.TOPIC_RAW = {"error": "2", "status": "", "stats": "15", "service": ""}
     bot.TELEGRAM_TOPIC_ID = 2
     bot._topic_names[(-500, 2)] = "Ex GLPC"
+    original_seen = dict(bot._topic_seen)
+    bot._topic_seen.clear()
 
     try:
-        sent = run(make_update(text="/topics", message_id=9901, thread_id=15))
+        # бот «видел» сообщения в двух топиках: ошибки и статистика
+        run(make_update(text="/help", message_id=9901, thread_id=2))
+        sent = run(make_update(text="/topics", message_id=9902, thread_id=15))
     finally:
         (bot.TOPIC_RAW, bot.TELEGRAM_TOPIC_ID) = original
         bot._topic_names.clear()
         bot._topic_names.update(original_names)
+        bot._topic_seen.clear()
+        bot._topic_seen.update(original_seen)
 
     text = sent[0]["text"] if sent else ""
 
@@ -5442,6 +5448,13 @@ def test_topics_command():
     check(
         "topics: видно, что в топике ошибок только ошибки",
         "errors are read and answered here" in text,
+        text,
+    )
+    check(
+        "topics: перечислены топики, где бот видел сообщения",
+        "Topics the bot has seen messages in:" in text
+        and "id 2" in text
+        and "id 15" in text,
         text,
     )
 

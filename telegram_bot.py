@@ -525,6 +525,7 @@ def parse_command(text: str, bot_username: str = None):
 # `message_thread_id` нужного топика показывает команда /id.
 
 _topic_names = {}      # (chat_id, thread_id) -> name
+_topic_seen = {}       # (chat_id, thread_id) -> name или None (бот видел тут сообщения)
 _routes = {}           # chat_id -> thread_id последнего сообщения
 _hinted_threads = set()
 _chat_types = {}       # chat_id -> тип чата (supergroup/private/...)
@@ -547,6 +548,14 @@ def _set_route(chat_id, thread_id, chat_type: str = None):
         if chat_type:
             _chat_types[key] = chat_type
 
+        if thread_id is not None and len(_topic_seen) < _CACHE_LIMIT:
+            observed = (key, int(thread_id))
+
+            if observed not in _topic_seen:
+                # Топик, в котором бот видел хоть одно сообщение: из этого
+                # списка видно, какие топики уже существуют и какие id у них.
+                _topic_seen[observed] = _topic_names.get(observed)
+
 
 def _route_thread(chat_id):
     with _routes_lock:
@@ -567,6 +576,9 @@ def remember_topic(chat_id, thread_id, name):
 
     if _topic_names.get(key) != name:
         _remember_bounded(_topic_names, key, name)
+
+        if key in _topic_seen:
+            _topic_seen[key] = name
         logger.info(
             "Learned topic name: chat=%s thread=%s name=%r",
             chat_id,
@@ -2293,6 +2305,27 @@ def _handle_topics(chat_id, reply_to):
         lines.append(f"{TOPIC_TITLES[kind]}: {shown}")
         lines.append(f"    {roles[kind]}")
 
+    seen = sorted(
+        (thread_id, known)
+        for (key_chat, thread_id), known in list(_topic_seen.items())
+        if int(key_chat) == _chat_key(chat_id)
+    )
+
+    lines.append("")
+
+    if seen:
+        lines.append("Topics the bot has seen messages in:")
+        lines.extend(
+            f"  id {thread_id}" + (f" · {known!r}" if known else "")
+            for thread_id, known in seen
+        )
+    else:
+        lines.append("The bot hasn't seen any topic here yet.")
+
+    lines.append("")
+    lines.append(
+        "If your topic is not in the list, send /id inside it."
+    )
     lines.append("")
     lines.append(
         "Strict error topic: " + ("on" if ERROR_TOPIC_STRICT else "off")
