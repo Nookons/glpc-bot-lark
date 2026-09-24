@@ -76,7 +76,7 @@ def open_queue_rows(limit: int = None):
     return rest_get(
         QUEUE_TABLE,
         params={
-            "select": "id,robot_number,created_at,employee_id",
+            "select": "id,robot_number,created_at,employee_id,warehouse",
             "status": "is.false",
             "order": "id.asc",
             "limit": str(limit or QUEUE_SCAN_LIMIT),
@@ -84,22 +84,28 @@ def open_queue_rows(limit: int = None):
     )
 
 
-def known_robot_numbers(numbers):
+def known_robot_numbers(numbers, warehouse: str = None):
     """
-    Подмножество номеров, которые есть в справочнике роботов (любой склад).
+    Подмножество номеров, которые есть в справочнике ЭТОГО склада.
+
+    Номера между складами повторяются, поэтому искать «где-нибудь» нельзя:
+    заявка склада GLP-C не должна закрываться из-за робота с тем же номером
+    на SMALL-P3.
 
     None — сбой чтения: закрывать очередь по неполным данным нельзя.
     """
     found = set()
 
     for chunk in _chunks(list(numbers), KNOWN_CHUNK):
-        rows = rest_get(
-            ROBOTS_TABLE,
-            params={
-                "select": "robot_number",
-                "robot_number": f"in.({','.join(chunk)})",
-            },
-        )
+        params = {
+            "select": "robot_number",
+            "robot_number": f"in.({','.join(chunk)})",
+        }
+
+        if warehouse:
+            params["warehouse"] = f"eq.{warehouse}"
+
+        rows = rest_get(ROBOTS_TABLE, params=params)
 
         if rows is None:
             logger.error("Не удалось проверить номера в справочнике роботов")
@@ -127,54 +133,64 @@ def close_queued_robots() -> dict:
     if rows is None:
         return {"checked": 0, "closed": 0, "error": True}
 
-    numbers = sorted(set(_digits(row.get("robot_number") for row in rows)))
+    # Группируем по складу заявки: робот ищется только на своём складе.
+    by_warehouse = {}
 
-    if not numbers:
-        return {"checked": 0, "closed": 0, "error": False}
+    for row in rows:
+        numbers = _digits([row.get("robot_number")])
 
-    known = known_robot_numbers(numbers)
+        if not numbers:
+            continue
 
-    if known is None:
-        return {"checked": len(numbers), "closed": 0, "error": True}
+        title = str(row.get("warehouse") or "").strip()
+        by_warehouse.setdefault(title, set()).add(numbers[0])
 
-    to_close = [number for number in numbers if number in known]
-
-    if not to_close:
-        return {"checked": len(numbers), "closed": 0, "error": False}
-
+    checked = 0
     closed = 0
 
-    for chunk in _chunks(to_close, IN_CHUNK):
-        patched = rest_patch(
-            QUEUE_TABLE,
-            params={
+    for title, group in by_warehouse.items():
+        numbers = sorted(group)
+        checked += len(numbers)
+
+        known = known_robot_numbers(numbers, title or None)
+
+        if known is None:
+            return {"checked": checked, "closed": closed, "error": True}
+
+        to_close = [number for number in numbers if number in known]
+
+        for chunk in _chunks(to_close, IN_CHUNK):
+            params = {
                 "status": "is.false",
                 "robot_number": f"in.({','.join(chunk)})",
-            },
-            payload={"status": True},
-        )
-
-        if patched is None:
-            logger.error(
-                "Не удалось закрыть заявки очереди (%s номеров в пачке)",
-                len(chunk),
-            )
-            return {
-                "checked": len(numbers),
-                "closed": closed,
-                "error": True,
             }
 
-        closed += len(patched)
+            if title:
+                params["warehouse"] = f"eq.{title}"
+
+            patched = rest_patch(QUEUE_TABLE, params=params, payload={"status": True})
+
+            if patched is None:
+                logger.error(
+                    "Не удалось закрыть заявки очереди (%s номеров в пачке)",
+                    len(chunk),
+                )
+                return {
+                    "checked": checked,
+                    "closed": closed,
+                    "error": True,
+                }
+
+            closed += len(patched)
 
     if closed:
         logger.info(
             "Очередь роботов: закрыто %s заявок (проверено %s)",
             closed,
-            len(numbers),
+            checked,
         )
 
-    return {"checked": len(numbers), "closed": closed, "error": False}
+    return {"checked": checked, "closed": closed, "error": False}
 
 
 def queue_stats(days: int = 1, warehouse: str = None) -> dict:

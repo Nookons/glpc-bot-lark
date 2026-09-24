@@ -4124,6 +4124,67 @@ def test_lease_stale_with_short_fraction():
     check("lease: нечитаемое время = живой (не отбираем лиз)", bot_lease._is_stale("мусор", 90) is False)
 
 
+def test_queue_autoclose_does_not_mix_warehouses():
+    """Заявка склада закрывается только роботом ТОГО ЖЕ склада."""
+    import robot_queue
+
+    original_get = robot_queue.rest_get
+    original_patch = robot_queue.rest_patch
+
+    calls = []
+
+    def fake_get(table, params=None):
+        if table == "robots_to_add":
+            return [
+                {"id": 1, "robot_number": "123", "warehouse": "GLP-C"},
+                {"id": 2, "robot_number": "5016", "warehouse": "SMALL-P3"},
+            ]
+
+        # у GLP-C робота 123 нет, зато есть у SMALL-P3
+        calls.append(params)
+
+        if params.get("warehouse") == "eq.GLP-C":
+            return []
+
+        if params.get("warehouse") == "eq.SMALL-P3":
+            return [{"robot_number": 5016}]
+
+        return []
+
+    patches = []
+
+    def fake_patch(table, params, payload):
+        patches.append(params)
+
+        return []
+
+    robot_queue.rest_get = fake_get
+    robot_queue.rest_patch = fake_patch
+
+    try:
+        robot_queue.close_queued_robots()
+    finally:
+        robot_queue.rest_get = original_get
+        robot_queue.rest_patch = original_patch
+
+    check(
+        "queue: справочник ищется по складу заявки",
+        sorted(params.get("warehouse") for params in calls)
+        == ["eq.GLP-C", "eq.SMALL-P3"],
+        calls,
+    )
+    check(
+        "queue: чужой склад заявку не закрывает",
+        patches and all(params.get("warehouse") == "eq.SMALL-P3" for params in patches),
+        patches,
+    )
+    check(
+        "queue: PATCH не трогает заявку GLP-C",
+        all("123" not in params.get("robot_number", "") for params in patches),
+        patches,
+    )
+
+
 def test_queue_autoclose_closes_known_robots():
     """Очередь роботов: заявки, которые уже есть в справочнике, закрываются."""
     import robot_queue
@@ -4137,12 +4198,7 @@ def test_queue_autoclose_closes_known_robots():
         calls["get"].append((table, params))
 
         if table == "robots_to_add":
-            return [
-                {"id": 1, "robot_number": "3458"},
-                {"id": 2, "robot_number": "9999"},
-                {"id": 3, "robot_number": "abc"},
-                {"id": 4, "robot_number": "3458"},
-            ]
+            return queue_rows
 
         if table == "robots_maintenance_list":
             return [{"robot_number": 3458}]
@@ -4158,6 +4214,13 @@ def test_queue_autoclose_closes_known_robots():
         return [
             {"id": 1} for number in listed if number == "3458"
         ]
+
+    queue_rows = [
+        {"id": 1, "robot_number": "3458", "warehouse": "GLP-C"},
+        {"id": 2, "robot_number": "9999", "warehouse": "GLP-C"},
+        {"id": 3, "robot_number": "abc", "warehouse": "GLP-C"},
+        {"id": 4, "robot_number": "3458", "warehouse": "GLP-C"},
+    ]
 
     robot_queue.rest_get = fake_get
     robot_queue.rest_patch = fake_patch
@@ -5499,8 +5562,8 @@ def test_warehouses_config_and_args():
     check("warehouses: ключ по названию", warehouse_key("SMALL-P3") == "sp3")
 
 
-def test_two_warehouses_errors_and_topics():
-    """Ошибки каждого склада пишутся в свой склад, роботы находятся по обоим."""
+def test_two_warehouses_strict_lookup():
+    """Ошибки пишутся складом топика, робот ищется ТОЛЬКО на своём складе."""
     LINKS[100] = "Ivan Petrenko"
     ROBOTS.clear()
 
@@ -5512,6 +5575,9 @@ def test_two_warehouses_errors_and_topics():
     )
     original_names = dict(bot._topic_names)
     original_find = robot_status.find_robot
+    original_find_by_id = robot_status.find_robot_by_id
+    original_change = robot_status.change_robot_status
+    original_card = bot.send_card_via_hook
 
     bot.TOPIC_RAW = {
         "error": "2",
@@ -5525,9 +5591,14 @@ def test_two_warehouses_errors_and_topics():
     bot.MOVED_HINT = True
     bot._topic_names.clear()
 
+    # #123 есть на ДВУХ складах — бот обязан брать робота своего склада.
     robots_by_warehouse = {
-        "GLP-C": {"3780": _robot(3780, 101)},
+        "GLP-C": {
+            "123": {**_robot(123, 101), "warehouse": "GLP-C"},
+            "3780": _robot(3780, 102),
+        },
         "SMALL-P3": {
+            "123": {**_robot(123, 201), "warehouse": "SMALL-P3"},
             "5016": {**_robot(5016, 202), "warehouse": "SMALL-P3"},
         },
     }
@@ -5537,24 +5608,38 @@ def test_two_warehouses_errors_and_topics():
             str(number).strip().lstrip("#")
         )
 
+    changed, cards = [], []
+
+    def fake_change(robot, *args, **kwargs):
+        changed.append(robot.get("warehouse"))
+
+        return {
+            "robot": robot,
+            "old_status": robot_status.ONLINE,
+            "new_status": robot_status.OFFLINE,
+            "type_problem": "Other",
+            "problem_note": "test",
+            "history_saved": True,
+        }
+
+    def fake_find_by_id(robot_id, strict=False):
+        for rows in robots_by_warehouse.values():
+            for robot in rows.values():
+                if str(robot.get("id")) == str(robot_id):
+                    return robot
+
+        return None
+
     robot_status.find_robot = fake_find
+    robot_status.find_robot_by_id = fake_find_by_id
+    robot_status.change_robot_status = fake_change
+    bot.send_card_via_hook = lambda url, card: (cards.append(url), {"code": 0})[1]
 
     try:
-        run(make_update(
-            text="Unable to drive: Security module failure. 3780",
-            message_id=10001,
-            thread_id=2,
-        ))
-
-        check(
-            "warehouse: ошибка из топика GLP-C пишется складом GLP-C",
-            DB_CALLS and DB_CALLS[-1]["warehouse"] == "GLP-C",
-            DB_CALLS[-1] if DB_CALLS else None,
-        )
-
+        # 1) ошибка из топика SP3 пишется складом SMALL-P3
         run(make_update(
             text="Unable to drive: Security module failure. 5016",
-            message_id=10002,
+            message_id=10001,
             thread_id=318,
         ))
 
@@ -5564,36 +5649,88 @@ def test_two_warehouses_errors_and_topics():
             DB_CALLS[-1] if DB_CALLS else None,
         )
 
-        # общий топик статусов: робот ищется по обоим складам
+        # 2) ошибка из топика GLP-C — складом GLP-C
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            message_id=10002,
+            thread_id=2,
+        ))
+
+        check(
+            "warehouse: ошибка из топика GLP-C пишется складом GLP-C",
+            DB_CALLS and DB_CALLS[-1]["warehouse"] == "GLP-C",
+            DB_CALLS[-1] if DB_CALLS else None,
+        )
+
+        # 3) чужой склад не подставляется: SP3-робот из общего топика не найден
         sent = run(make_update(text="/offline 5016", message_id=10003, thread_id=319))
+
+        check(
+            "warehouse: SP3-робот не подставляется в GLP-C",
+            sent and "not found in GLP-C" in sent[0]["text"],
+            sent,
+        )
+        check(
+            "warehouse: подсказан способ указать склад",
+            sent and "/offline sp3" in sent[0]["text"],
+            sent,
+        )
+
+        # 4) тот же робот со явным складом — находится
+        sent = run(make_update(text="/offline sp3 5016", message_id=10004, thread_id=319))
         prompt = [item for item in sent if item.get("reply_markup")]
 
         check(
-            "warehouse: робот SP3 находится из общего топика",
-            prompt and "5016" in prompt[0]["text"],
-            sent,
-        )
-        check(
-            "warehouse: в карточке виден склад робота",
-            prompt and "SMALL-P3" in prompt[0]["text"],
+            "warehouse: /offline sp3 находит робота SP3",
+            prompt and "5016" in prompt[0]["text"] and "SMALL-P3" in prompt[0]["text"],
             prompt,
         )
 
-        sent = run(make_update(text="/offline 3780", message_id=10004, thread_id=319))
+        # 5) тот же номер на двух складах — берём робота склада контекста
+        sent = run(make_update(text="/offline 123", message_id=10005, thread_id=319))
 
         check(
-            "warehouse: робот GLP-C находится из того же топика",
-            any("3780" in item["text"] for item in sent),
+            "warehouse: дубль номера — робот склада контекста (GLP-C)",
+            sent and "GLP-C" in sent[0]["text"] and "SMALL-P3" not in sent[0]["text"],
             sent,
         )
 
-        # чужой робот в топике ошибок другого склада — честная подсказка
-        sent = run(make_update(text="/offline 99999", message_id=10005, thread_id=318))
+        sent = run(make_update(text="/offline sp3 123", message_id=10006, thread_id=319))
 
         check(
-            "warehouse: ненайденный робот перечисляет оба склада",
-            sent and "GLP-C or SMALL-P3" in sent[0]["text"],
+            "warehouse: дубль номера — робот SP3 при явном складе",
+            sent and "SMALL-P3" in sent[0]["text"],
             sent,
+        )
+
+        # 6) флоу помнит склад: причина приходит в общий топик (где склад GLP-C)
+        sent = run(make_update(text="/offline sp3 5016", message_id=10007, thread_id=319))
+        prompt_id = sent[0]["message_id"] if sent else None
+
+        run(make_callback("st:offline:202:other", message_id=prompt_id, thread_id=319))
+        pending = bot.peek_pending_status(-500, 100)
+
+        check(
+            "warehouse: склад робота сохранён во флоу",
+            pending and pending.get("warehouse") == "SMALL-P3",
+            pending,
+        )
+
+        changed.clear()
+        cards.clear()
+        run(make_update(text="сломался ролик", message_id=10008, thread_id=319))
+
+        check(
+            "warehouse: статус меняется у робота своего склада",
+            changed == ["SMALL-P3"],
+            changed,
+        )
+        check(
+            "warehouse: карточка статуса ушла в вебхук SP3",
+            cards and cards[-1] == os.environ.get(
+                "LARK_HOOK_STATUS_SP3", cards[-1]
+            ) if os.environ.get("LARK_HOOK_STATUS_SP3") else bool(cards),
+            cards,
         )
     finally:
         (
@@ -5603,6 +5740,9 @@ def test_two_warehouses_errors_and_topics():
             bot.MOVED_HINT,
         ) = original
         robot_status.find_robot = original_find
+        robot_status.find_robot_by_id = original_find_by_id
+        robot_status.change_robot_status = original_change
+        bot.send_card_via_hook = original_card
         bot._topic_names.clear()
         bot._topic_names.update(original_names)
         ROBOTS.clear()
@@ -5995,6 +6135,7 @@ def main():
         test_cache_helpers_are_bounded,
         test_time_utils_parse_iso,
         test_lease_stale_with_short_fraction,
+        test_queue_autoclose_does_not_mix_warehouses,
         test_queue_autoclose_closes_known_robots,
         test_queue_autoclose_db_error_does_not_patch,
         test_robot_card_command,
@@ -6014,7 +6155,7 @@ def main():
         test_error_topic_keeps_only_errors,
         test_topics_command,
         test_warehouses_config_and_args,
-        test_two_warehouses_errors_and_topics,
+        test_two_warehouses_strict_lookup,
         test_warehouse_argument_in_commands,
         test_topic_name_learned_from_service_message,
         test_lark_hooks_resolve,
