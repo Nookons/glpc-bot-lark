@@ -5671,6 +5671,32 @@ def test_warehouse_argument_in_commands():
     )
 
 
+def test_topic_name_learned_from_service_message():
+    """Имя топика учим даже из сервисного сообщения, отправленного ботом."""
+    original_names = dict(bot._topic_names)
+
+    try:
+        update = make_update(text=None, message_id=10201, thread_id=319)
+        update["message"]["forum_topic_created"] = {"name": "Robot status"}
+        update["message"]["from"] = {"id": 8732612039, "is_bot": True}
+
+        run(update)
+
+        check(
+            "topics: имя выучено из сервисного сообщения",
+            bot.topic_name(-500, 319) == "Robot status",
+            bot.topic_name(-500, 319),
+        )
+        check(
+            "topics: сервисное сообщение не уходит в обработку как текст",
+            SENT == [],
+            SENT,
+        )
+    finally:
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+
+
 def main():
     tests = [
         test_parse_command,
@@ -5778,6 +5804,7 @@ def main():
         test_warehouses_config_and_args,
         test_two_warehouses_errors_and_topics,
         test_warehouse_argument_in_commands,
+        test_topic_name_learned_from_service_message,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

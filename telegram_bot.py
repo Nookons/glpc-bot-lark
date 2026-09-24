@@ -3026,15 +3026,21 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     if not message:
         return
 
-    sender = message.get("from") or {}
-
-    if sender.get("is_bot"):
-        return
-
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
 
     if chat_id is None:
+        return
+
+    # Имена топиков бот узнаёт только из сервисных сообщений форума, поэтому
+    # учим их ДО проверки «от бота ли сообщение»: топики может создать и сам
+    # бот (createForumTopic), и другой бот.
+    if message.get("forum_topic_created") or message.get("forum_topic_edited"):
+        _learn_topic_from_message(chat_id, message)
+
+    sender = message.get("from") or {}
+
+    if sender.get("is_bot"):
         return
 
     message_id = message.get("message_id")
