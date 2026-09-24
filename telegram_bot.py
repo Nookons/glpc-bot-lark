@@ -3048,6 +3048,32 @@ def handle_update(update: dict, bot_username: str = None):
     _mark_processed(key)
 
 
+# Сервисные сообщения форума: создание/переименование топика, закрепление,
+# вход/выход участника и т.п. Это не «непонятный тип», а служебная лента —
+# отвечать на неё нечем.
+SERVICE_MESSAGE_FIELDS = (
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "pinned_message",
+    "new_chat_members",
+    "left_chat_member",
+    "new_chat_title",
+    "new_chat_photo",
+    "delete_chat_photo",
+    "video_chat_started",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+    "message_auto_delete_timer_changed",
+    "proximity_alert_triggered",
+    "write_access_allowed",
+    "successful_payment",
+)
+
+
 def _handle_update_inner(update: dict, bot_username: str = None):
     """Разбор апдейта без учёта дедупликации."""
     callback = update.get("callback_query")
@@ -3076,6 +3102,14 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     # бот (createForumTopic), и другой бот.
     if message.get("forum_topic_created") or message.get("forum_topic_edited"):
         _learn_topic_from_message(chat_id, message)
+
+    if any(message.get(field) for field in SERVICE_MESSAGE_FIELDS):
+        logger.info(
+            "Ignored: сервисное сообщение (chat=%s thread=%s)",
+            chat_id,
+            message.get("message_thread_id"),
+        )
+        return
 
     sender = message.get("from") or {}
 
@@ -3143,14 +3177,35 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         return
 
     if caption:
-        # Фото/документ с подписью без самого фото — просто подсказка.
-        _send(chat_id, FORMAT_HINT, reply_to_message_id=message_id)
+        # Вложение с подписью (документ, видео, гифка). Если в подписи есть
+        # ошибка — сохраняем её как обычный текст; иначе молчим: подсказка на
+        # каждое вложение превращается в спам.
+        if parse_error_message(caption):
+            logger.info(
+                "Ошибка в подписи к вложению (без фото): %r", caption[:80]
+            )
+            handle_error_text(chat_id, sender, caption, message_id)
+        else:
+            logger.info(
+                "Ignored: вложение с подписью без ошибки (chat=%s message=%s)",
+                chat_id,
+                message_id,
+            )
+
         return
 
-    _send(
+    logger.info(
+        "Ignored: неподдерживаемый тип сообщения (chat=%s message=%s: %s)",
         chat_id,
-        "⚠️ Unsupported message type. Send text or photo.",
-        reply_to_message_id=message_id,
+        message_id,
+        ", ".join(
+            key for key in (
+                "sticker", "voice", "video", "video_note", "audio",
+                "document", "animation", "contact", "location", "poll",
+                "dice", "venue", "game",
+            )
+            if message.get(key)
+        ) or "unknown",
     )
 
 

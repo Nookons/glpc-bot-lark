@@ -5837,6 +5837,77 @@ def test_error_and_status_hooks_by_warehouse():
             else:
                 os.environ[name] = value
 
+def test_no_spam_for_non_text_messages():
+    """Стикеры, войсы, сервисные сообщения — молча, без ответов и подсказок."""
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+    ROBOTS["3780"] = _robot(3780, 101)
+
+    def silent(update, label):
+        sent = run(update)
+
+        check(
+            f"spam: {label} — бот молчит",
+            sent == [],
+            sent,
+        )
+
+    # медиа без подписи
+    for field, value in (
+        ("sticker", {"file_id": "s", "emoji": "🙂"}),
+        ("voice", {"file_id": "v", "duration": 3}),
+        ("video", {"file_id": "m", "duration": 5}),
+        ("video_note", {"file_id": "n", "duration": 5}),
+        ("animation", {"file_id": "a"}),
+        ("audio", {"file_id": "au", "duration": 5}),
+        ("contact", {"phone_number": "+48", "first_name": "Ivan"}),
+        ("location", {"latitude": 51.0, "longitude": 17.0}),
+        ("poll", {"id": "1", "question": "?"}),
+    ):
+        update = make_update(text=None, message_id=MESSAGE_SEQ[0] + 1, thread_id=2)
+        update["message"][field] = value
+        silent(update, field)
+
+    # сервисные сообщения форума
+    for field in ("pinned_message", "new_chat_members", "forum_topic_edited"):
+        update = make_update(text=None, message_id=MESSAGE_SEQ[0] + 1, thread_id=2)
+        update["message"][field] = {"name": "x"} if "topic" in field else {}
+        silent(update, field)
+
+    # вложение с подписью, в которой нет ошибки
+    update = make_update(caption="смотрите какое видео", message_id=10301, thread_id=2)
+    update["message"]["video"] = {"file_id": "m", "duration": 5}
+    silent(update, "вложение с посторонней подписью")
+
+    # вложение с ошибкой в подписи — сохраняем как обычный текст
+    DB_CALLS.clear()
+    FORWARDED.clear()
+
+    update = make_update(
+        caption="Unable to drive: Security module failure. 3780",
+        message_id=10302,
+        thread_id=2,
+    )
+    update["message"]["document"] = {"file_id": "d", "file_name": "video.mp4"}
+
+    sent = run(update)
+
+    check(
+        "spam: ошибка в подписи к вложению сохраняется",
+        DB_CALLS and DB_CALLS[-1]["parsed"]["robot"] == "3780",
+        DB_CALLS,
+    )
+    check(
+        "spam: карточка ушла в Lark",
+        FORWARDED and "3780" in json.dumps(FORWARDED, ensure_ascii=False),
+        FORWARDED,
+    )
+    check(
+        "spam: сотруднику пришло подтверждение, а не подсказка формата",
+        sent and "Saved" in sent[0]["text"],
+        sent,
+    )
+
 
 def main():
     tests = [
@@ -5948,6 +6019,7 @@ def main():
         test_topic_name_learned_from_service_message,
         test_lark_hooks_resolve,
         test_error_and_status_hooks_by_warehouse,
+        test_no_spam_for_non_text_messages,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
