@@ -186,7 +186,7 @@ def fake_unlink_user(telegram_id):
     return True
 
 
-def fake_send_to_data_base(parsed, data_obj, chat_id):
+def fake_send_to_data_base(parsed, data_obj, chat_id, defer_missing=False):
     DB_CALLS.append({"parsed": parsed, "data": data_obj, "chat_id": chat_id})
     return {
         "status": "saved",
@@ -195,6 +195,19 @@ def fake_send_to_data_base(parsed, data_obj, chat_id):
         "exception_id": 41,
         "robot": parsed["robot"],
     }
+
+
+QUEUED_ROBOTS = []
+
+
+def fake_queue_missing_robot(robot_number, employee_card_id=None, chat_id=None,
+                             notify=True, warehouse=None):
+    QUEUED_ROBOTS.append({
+        "robot": str(robot_number),
+        "employee_card_id": employee_card_id,
+        "chat_id": chat_id,
+    })
+    return True
 
 
 def fake_count_robot_errors_in_shift(robot, shift_date, shift_name):
@@ -233,6 +246,14 @@ bot.resolve_employee_name = fake_resolve_employee_name
 bot.link_user = fake_link_user
 bot.unlink_user = fake_unlink_user
 bot.send_to_data_base = fake_send_to_data_base
+bot.queue_missing_robot = fake_queue_missing_robot
+
+# По умолчанию похожих номеров нет: тесты про подсказку подменяют это сами,
+# иначе каждый «неизвестный робот» ходил бы в базу за списком номеров.
+import robot_card as robot_card_module  # noqa: E402
+
+REAL_SUGGEST_ROBOT_NUMBERS = robot_card_module.suggest_robot_numbers
+robot_card_module.suggest_robot_numbers = lambda *args, **kwargs: []
 
 # Offset Telegram в тестах не читаем и не пишем в настоящий Storage.
 bot.load_saved_offset = lambda: None
@@ -346,6 +367,7 @@ def run(update):
     DB_CALLS.clear()
     FORWARDED.clear()
     PHOTO_CALLS.clear()
+    QUEUED_ROBOTS.clear()
     bot.handle_update(update, "TestBot")
     return list(SENT)
 
@@ -505,7 +527,7 @@ def test_not_saved_no_forward():
     LINKS[100] = "Ivan Petrenko"
 
     original = bot.send_to_data_base
-    bot.send_to_data_base = lambda parsed, data_obj, chat_id: None
+    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False: None
 
     try:
         sent = run(make_update(text="Unable to drive: Security module failure. 3780"))
@@ -2937,7 +2959,7 @@ def test_bot_forwards_missing_robot_to_lark():
 
     counted = []
 
-    bot.send_to_data_base = lambda parsed, data_obj, chat_id: {
+    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False: {
         "robot_missing": True,
         "robot": parsed["robot"],
     }
@@ -4044,6 +4066,423 @@ def test_user_messages_not_deleted_in_private_chats():
     check("private L7: удаление в личке не выполняется", deleted is False, deleted)
     check("private L7: deleteMessage не вызывался", (-777, 4242) not in DELETED, DELETED)
 
+# ============================================================
+# СПРИНТ 1: КАРТОЧКА РОБОТА, ПОДСКАЗКА НОМЕРА, ОЧЕРЕДЬ
+# ============================================================
+
+def test_time_utils_parse_iso():
+    """Postgres отдаёт доли секунды с обрезкой нулей — парсер обязан их есть."""
+    from datetime import datetime, timezone
+    from time_utils import parse_iso
+
+    six = parse_iso("2026-04-09T05:28:16.632623+00:00")
+    five = parse_iso("2026-04-09T05:28:16.63262+00:00")
+    one = parse_iso("2026-04-09T05:28:16.6Z")
+    naive = parse_iso("2026-04-09T05:28:16")
+
+    check(
+        "time: 6 знаков после точки",
+        six is not None and six.microsecond == 632623,
+        six,
+    )
+    check(
+        "time: 5 знаков (обрезанный ноль) читаются",
+        five is not None and five.microsecond == 632620,
+        five,
+    )
+    check("time: 1 знак и Z", one is not None and one.microsecond == 600000, one)
+    check(
+        "time: без доли секунды — считаем UTC",
+        naive is not None and naive.tzinfo == timezone.utc,
+        naive,
+    )
+    check("time: мусор -> None", parse_iso("не время") is None)
+    check("time: None -> None", parse_iso(None) is None)
+    check(
+        "time: datetime на входе не ломает",
+        parse_iso(datetime(2026, 4, 9, tzinfo=timezone.utc)) is not None,
+    )
+
+
+def test_lease_stale_with_short_fraction():
+    """Живой-но-битый формат времени не должен навсегда «держать» лиз."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S") + ".02344+00:00"
+    fresh = now.strftime("%Y-%m-%dT%H:%M:%S") + ".02344+00:00"
+
+    check("lease: просроченный heartbeat с 5 знаками = мёртвый", bot_lease._is_stale(old, 90) is True)
+    check("lease: свежий heartbeat с 5 знаками = живой", bot_lease._is_stale(fresh, 90) is False)
+    check("lease: пустой heartbeat = мёртвый", bot_lease._is_stale(None, 90) is True)
+    check("lease: нечитаемое время = живой (не отбираем лиз)", bot_lease._is_stale("мусор", 90) is False)
+
+
+def test_queue_autoclose_closes_known_robots():
+    """Очередь роботов: заявки, которые уже есть в справочнике, закрываются."""
+    import robot_queue
+
+    original_get = robot_queue.rest_get
+    original_patch = robot_queue.rest_patch
+
+    calls = {"get": [], "patch": []}
+
+    def fake_get(table, params=None):
+        calls["get"].append((table, params))
+
+        if table == "robots_to_add":
+            return [
+                {"id": 1, "robot_number": "3458"},
+                {"id": 2, "robot_number": "9999"},
+                {"id": 3, "robot_number": "abc"},
+                {"id": 4, "robot_number": "3458"},
+            ]
+
+        if table == "robots_maintenance_list":
+            return [{"robot_number": 3458}]
+
+        return []
+
+    def fake_patch(table, params, payload):
+        calls["patch"].append((table, params, payload))
+
+        # закрываем только те номера, что реально просили
+        listed = params["robot_number"].split("in.(")[1].rstrip(")").split(",")
+
+        return [
+            {"id": 1} for number in listed if number == "3458"
+        ]
+
+    robot_queue.rest_get = fake_get
+    robot_queue.rest_patch = fake_patch
+
+    try:
+        result = robot_queue.close_queued_robots()
+    finally:
+        robot_queue.rest_get = original_get
+        robot_queue.rest_patch = original_patch
+
+    check(
+        "queue: проверено 2 уникальных номера, закрыта 1 заявка",
+        result == {"checked": 2, "closed": 1, "error": False},
+        result,
+    )
+
+    patch = calls["patch"][0] if calls["patch"] else ({}, {}, {})
+    check(
+        "queue: PATCH фильтрует по открытым заявкам и номеру",
+        patch[1].get("status") == "is.false" and "3458" in patch[1].get("robot_number", ""),
+        patch[1],
+    )
+    check(
+        "queue: closing не трогает ненайденные номера",
+        "9999" not in patch[1].get("robot_number", ""),
+        patch[1],
+    )
+    check(
+        "queue: мусорные номера не уходят в справочник",
+        all(
+            "abc" not in str(params)
+            for table, params in calls["get"]
+            if table == "robots_maintenance_list"
+        ),
+        calls["get"],
+    )
+
+
+def test_queue_autoclose_db_error_does_not_patch():
+    """Сбой чтения — не «нечего закрывать»: PATCH не делаем."""
+    import robot_queue
+
+    original_get = robot_queue.rest_get
+    original_patch = robot_queue.rest_patch
+
+    patched = []
+
+    robot_queue.rest_get = lambda table, params=None: (
+        [{"id": 1, "robot_number": "3458"}]
+        if table == "robots_to_add"
+        else None
+    )
+    robot_queue.rest_patch = lambda table, params, payload: patched.append(table) or []
+
+    try:
+        lookup_error = robot_queue.close_queued_robots()
+    finally:
+        robot_queue.rest_get = original_get
+        robot_queue.rest_patch = original_patch
+
+    check(
+        "queue: сбой чтения справочника -> error, без правок",
+        lookup_error["error"] is True and patched == [],
+        (lookup_error, patched),
+    )
+
+    patched.clear()
+    robot_queue.rest_get = lambda table, params=None: None
+    robot_queue.rest_patch = lambda table, params, payload: patched.append(table) or []
+
+    try:
+        queue_error = robot_queue.close_queued_robots()
+    finally:
+        robot_queue.rest_get = original_get
+        robot_queue.rest_patch = original_patch
+
+    check(
+        "queue: сбой чтения очереди -> error, без правок",
+        queue_error["error"] is True and patched == [],
+        (queue_error, patched),
+    )
+
+
+def test_robot_card_command():
+    """/robot: карточка, подсказки, валидация аргумента."""
+    LINKS[100] = "Ivan Petrenko"
+
+    original_card = bot.robot_card.robot_card
+    original_flag = bot.DELETE_USER_MESSAGES
+
+    bot.DELETE_USER_MESSAGES = True
+
+    card = {
+        "found": True,
+        "number": "3680",
+        "robot": {
+            "robot_number": 3680,
+            "robot_type": "RT_KUBOT_MINI_HAIFLEX",
+            "status": "在线 | Online",
+            "warehouse": "GLP-C",
+        },
+        "errors_available": True,
+        "errors": 4,
+        "reporters": [("Vladyslav Kovalenko", 2)],
+        "last_issues": [{
+            "at": "23.09 10:53",
+            "issue_type": "Unable to drive",
+            "by": "Dmytro Kolomiiets",
+        }],
+        "history": [{
+            "at": "23.09 18:47",
+            "old": "离线 | Offline",
+            "new": "在线 | Online",
+            "type_problem": "Solved without changing",
+            "note": "test",
+            "by": "Dmytro Kolomiiets",
+        }],
+    }
+
+    try:
+        bot.robot_card.robot_card = lambda number, warehouse=None: card
+        sent = run(make_update(text="/robot 3680", message_id=9101, thread_id=2))
+        text = sent[0]["text"] if sent else ""
+
+        check(
+            "robot card: карточка отправлена",
+            "Robot 3680" in text and "RT_KUBOT_MINI_HAIFLEX" in text,
+            text,
+        )
+        check(
+            "robot card: ошибки, авторы и история на месте",
+            "Issues (7 days): 4" in text
+            and "Vladyslav Kovalenko (2)" in text
+            and "Unable to drive" in text
+            and "History:" in text,
+            text,
+        )
+        check("robot card: команда удалена", (-500, 9101) in DELETED, DELETED)
+
+        bot.robot_card.robot_card = lambda number, warehouse=None: {
+            "found": False, "number": number, "suggestions": ["882"],
+        }
+        sent = run(make_update(text="/robot 3882", thread_id=2))
+        check(
+            "robot card: предложены похожие номера",
+            sent and "882" in sent[0]["text"] and "/robot 882" in sent[0]["text"],
+            sent,
+        )
+    finally:
+        bot.robot_card.robot_card = original_card
+        bot.DELETE_USER_MESSAGES = original_flag
+
+    sent = run(make_update(text="/robot", thread_id=2))
+    check(
+        "robot card: без номера — подсказка по формату",
+        sent and "Usage: /robot" in sent[0]["text"],
+        sent,
+    )
+
+    sent = run(make_update(text="/robot abc", thread_id=2))
+    check(
+        "robot card: буквы отвергаются",
+        sent and "must be digits" in sent[0]["text"],
+        sent,
+    )
+
+    bot.robot_card.robot_card = lambda number, warehouse=None: None
+
+    try:
+        sent = run(make_update(text="/robot 3680", thread_id=2))
+    finally:
+        bot.robot_card.robot_card = original_card
+
+    check(
+        "robot card: сбой БД не выдаётся за «робота нет»",
+        sent and "Can't read the database" in sent[0]["text"],
+        sent,
+    )
+
+
+def _robot_fix_env(candidates=("882",)):
+    """Общая обвязка для тестов подсказки номера."""
+    original = (
+        bot.send_to_data_base,
+        bot.queue_missing_robot,
+        bot.robot_card.suggest_robot_numbers,
+    )
+
+    state = {"saved": [], "queued": []}
+
+    def fake_save(parsed, data_obj, chat_id, defer_missing=False):
+        if defer_missing:
+            return {
+                "robot_missing": True,
+                "robot": parsed["robot"],
+                "employee_card_id": 60072001,
+            }
+
+        state["saved"].append(parsed["robot"])
+
+        return {
+            "status": "saved",
+            "glpc_id": 1,
+            "exception_id": 2,
+            "robot": parsed["robot"],
+        }
+
+    bot.send_to_data_base = fake_save
+    bot.queue_missing_robot = lambda *args, **kwargs: (
+        state["queued"].append(args[0] if args else kwargs.get("robot_number")), True
+    )[1]
+    bot.robot_card.suggest_robot_numbers = (
+        lambda number, limit=None, cutoff=None: list(candidates)
+    )
+
+    return state, original
+
+
+def _robot_fix_restore(original):
+    (
+        bot.send_to_data_base,
+        bot.queue_missing_robot,
+        bot.robot_card.suggest_robot_numbers,
+    ) = original
+
+
+def test_robot_fix_suggestion_then_correction():
+    """Опечатка в номере: подсказка -> кнопка -> запись с правильным номером."""
+    LINKS[100] = "Ivan Petrenko"
+    state, original = _robot_fix_env()
+
+    try:
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3882",
+            message_id=9201,
+            thread_id=2,
+        ))
+        prompt = sent[0] if sent else {}
+        pending = bot.peek_pending_robot_fix(-500, 100)
+
+        SENT.clear()
+        FORWARDED.clear()
+        QUEUED_ROBOTS.clear()
+
+        run(make_callback("rf:882", message_id=prompt.get("message_id"), thread_id=2))
+    finally:
+        _robot_fix_restore(original)
+
+    markup = json.dumps(prompt.get("reply_markup") or {}, ensure_ascii=False)
+
+    check(
+        "fix: показаны кнопки с похожим номером и отказом",
+        "rf:882" in markup and "rf:no" in markup,
+        markup,
+    )
+    check("fix: бот ждёт ответа сотрудника", pending is not None, pending)
+    check("fix: сохранён исправленный номер", state["saved"] == ["882"], state["saved"])
+    check("fix: очередь не пополнялась", state["queued"] == [], state["queued"])
+    flat = json.dumps(FORWARDED, ensure_ascii=False)
+
+    check(
+        "fix: в Lark ушла одна карточка с исправленным номером",
+        len(FORWARDED) == 1 and "882" in flat and "3882" not in flat,
+        FORWARDED,
+    )
+
+
+def test_robot_fix_declined_keeps_number():
+    """Сотрудник подтвердил номер: очередь + Lark, как раньше."""
+    LINKS[100] = "Ivan Petrenko"
+    state, original = _robot_fix_env()
+
+    try:
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3882",
+            message_id=9301,
+            thread_id=2,
+        ))
+        prompt_id = sent[0]["message_id"] if sent else None
+
+        FORWARDED.clear()
+        run(make_callback("rf:no", message_id=prompt_id, thread_id=2))
+    finally:
+        _robot_fix_restore(original)
+
+    flat = json.dumps(FORWARDED, ensure_ascii=False)
+
+    check(
+        "fix: отказ -> номер ушёл в очередь",
+        state["queued"] == ["3882"],
+        state["queued"],
+    )
+    check("fix: отказ -> ошибка ушла в Lark", "3882" in flat, flat)
+    check("fix: отказ -> записи в базу нет", state["saved"] == [], state["saved"])
+
+
+def test_robot_fix_expiry_flushes_as_is():
+    """Молчание сотрудника: по TTL ошибка уходит как есть, не теряется."""
+    LINKS[100] = "Ivan Petrenko"
+    state, original = _robot_fix_env()
+
+    try:
+        run(make_update(
+            text="Unable to drive: Security module failure. 3882",
+            message_id=9401,
+            thread_id=2,
+        ))
+
+        with bot._pending_robot_fix_lock:
+            for key in list(bot._pending_robot_fix):
+                bot._pending_robot_fix[key]["expires"] = time.time() - 1
+
+        FORWARDED.clear()
+        flushed = bot.flush_expired_robot_fixes()
+    finally:
+        _robot_fix_restore(original)
+
+    flat = json.dumps(FORWARDED, ensure_ascii=False)
+
+    check("fix: просроченная подсказка дослана", flushed == 1, flushed)
+    check(
+        "fix: по TTL номер ушёл в очередь как есть",
+        state["queued"] == ["3882"],
+        state["queued"],
+    )
+    check("fix: по TTL ошибка ушла в Lark", "3882" in flat, flat)
+    check(
+        "fix: состояние очищено",
+        bot.peek_pending_robot_fix(-500, 100) is None,
+    )
+
 
 def main():
     tests = [
@@ -4129,6 +4568,14 @@ def main():
         test_table_probe_and_lease_error_caching,
         test_flush_expired_photos_noop_when_disabled,
         test_cache_helpers_are_bounded,
+        test_time_utils_parse_iso,
+        test_lease_stale_with_short_fraction,
+        test_queue_autoclose_closes_known_robots,
+        test_queue_autoclose_db_error_does_not_patch,
+        test_robot_card_command,
+        test_robot_fix_suggestion_then_correction,
+        test_robot_fix_declined_keeps_number,
+        test_robot_fix_expiry_flushes_as_is,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
@@ -4146,6 +4593,16 @@ def main():
 
     for test in tests:
         print(f"\n--- {test.__name__} ---")
+
+        # T5: состояние одного теста не должно влиять на другой — иначе
+        # «дубль» из старого теста глушит сообщение в новом.
+        with bot._seen_lock:
+            bot._seen_message_ids.clear()
+
+        bot._pending_robot_fix.clear()
+        bot._pending_photo.clear()
+        bot._last_error.clear()
+
         test()
 
     failed = [name for name, ok in RESULTS if not ok]

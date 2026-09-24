@@ -630,16 +630,59 @@ def find_best_template(
 # SAVE EXCEPTION
 # ============================================================
 
+def queue_missing_robot(
+    robot_number,
+    employee_card_id=None,
+    chat_id=None,
+    notify: bool = True,
+    warehouse: str = WAREHOUSE,
+) -> bool:
+    """
+    Ставит номер в очередь `robots_to_add` (робота нет в справочнике).
+
+    True — заявка есть (создана сейчас или уже была). Уведомление сотруднику
+    отправляется только при notify=True: Telegram-бот может сам решить, что
+    написать (например, предложить исправить опечатку в номере).
+    """
+    queued = _rest_post(
+        "robots_to_add",
+        {
+            "robot_number": str(robot_number),
+            "employee_id": employee_card_id,
+            "warehouse": warehouse,
+        },
+        ignore_conflict=True,
+    )
+
+    if queued is None:
+        logger.error("Не удалось поставить робота #%s в очередь", robot_number)
+
+    if notify and chat_id is not None:
+        notify_user(
+            chat_id,
+            f"⚠️ Robot #{robot_number} is not in the system.\n"
+            "The issue was forwarded to Lark, "
+            "the robot is queued to be added.",
+        )
+
+    return queued is not None
+
+
 def send_to_data_base(
     parsed: dict,
     table_lines: dict,
     chat_id: str,
+    defer_missing: bool = False,
 ):
     """
     Записывает исключение в Supabase (exceptions + exceptions_glpc).
 
     Возвращает результат POST /exceptions (список созданных строк)
     при успехе, иначе None. Сообщения об ошибках отправляет в чат.
+
+    defer_missing=True — если робота нет в справочнике, ничего не пишем в
+    очередь и не отвечаем сотруднику: вызывающий код сначала предложит
+    исправить номер (опечатки — частая причина «робота нет в системе»).
     """
     # ========================================================
     # GET ERROR TEMPLATES
@@ -793,36 +836,24 @@ def send_to_data_base(
         return None
 
     if not robot_data:
-        obj = {
-            "robot_number": table_lines['robot'],
-            "employee_id": employee.get("card_id"),
-            "warehouse": WAREHOUSE,
-        }
-
-        queued = _rest_post(
-            "robots_to_add",
-            obj,
-            ignore_conflict=True,
-        )
-
-        if not queued:
-            # Строка уже могла быть в очереди (409) — это не ошибка,
-            # но если не вышло вообще, стоит знать.
-            logger.info(
-                "Робот #%s не добавлен в robots_to_add (возможно, уже в очереди)",
-                table_lines["robot"],
-            )
-
         logger.warning(
             "Robot not found: #%s",
             table_lines["robot"],
         )
 
-        notify_user(
-            chat_id,
-            f"⚠️ Robot #{table_lines['robot']} is not in the system.\n"
-            "The issue was forwarded to Lark, "
-            "the robot is queued to be added.",
+        if defer_missing:
+            # Очередь и ответ сотруднику — решение вызывающего кода:
+            # возможно, номер с опечаткой и его сначала предложат исправить.
+            return {
+                "robot_missing": True,
+                "robot": str(table_lines["robot"]),
+                "employee_card_id": employee.get("card_id"),
+            }
+
+        queue_missing_robot(
+            table_lines["robot"],
+            employee_card_id=employee.get("card_id"),
+            chat_id=chat_id,
         )
 
         # Возвращаем маркер: запись в базу невозможна (нет робота), но
@@ -831,6 +862,7 @@ def send_to_data_base(
         return {
             "robot_missing": True,
             "robot": str(table_lines["robot"]),
+            "employee_card_id": employee.get("card_id"),
         }
 
     robot = robot_data[0]

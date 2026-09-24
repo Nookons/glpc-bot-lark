@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from sendToDataBase import WAREHOUSE, rest_get, rest_patch, rest_post
 from logging_config import setup_logging
 from text_utils import VALUE_LIMIT, truncate
+from time_utils import parse_iso
 
 
 logger = setup_logging(__name__)
@@ -238,11 +239,12 @@ def change_robot_status(
 # ============================================================
 
 def _warsaw_time(changed_at: str) -> str:
-    try:
-        moment = datetime.fromisoformat(str(changed_at).replace("Z", "+00:00"))
-        return moment.astimezone(WARSAW_TZ).strftime("%d.%m.%Y %H:%M")
-    except (TypeError, ValueError):
+    moment = parse_iso(changed_at)
+
+    if moment is None:
         return ""
+
+    return moment.astimezone(WARSAW_TZ).strftime("%d.%m.%Y %H:%M")
 
 
 def status_title(direction: str, robot: dict) -> str:

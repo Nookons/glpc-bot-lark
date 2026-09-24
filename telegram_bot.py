@@ -36,7 +36,9 @@ import telegram_api as tg
 from error_parser import parse_error_message
 from logging_config import setup_logging
 import bot_lease
+import robot_card
 from env_utils import env_bool, env_int
+from robot_queue import start_queue_autoclose
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
     TARGET_HOOK_URL,
@@ -56,6 +58,7 @@ import robot_status
 from sendToDataBase import (
     WAREHOUSE,
     count_robot_errors_in_shift,
+    queue_missing_robot,
     set_exception_photo,
     notify_user,
     send_to_data_base,
@@ -200,13 +203,21 @@ PHOTO_ATTACH_ENABLED = _env_bool("PHOTO_ATTACH_ENABLED", False)
 # при смене статуса (бот — админ группы, права позволяют).
 DELETE_USER_MESSAGES = _env_bool("DELETE_USER_MESSAGES", True)
 
+# Подсказывать ли исправление номера, когда робота нет в справочнике.
+# Опечатки («3882» вместо «882») — частая причина «робота нет в системе»:
+# сначала предлагаем похожие номера, а очередь/Lark — после ответа.
+ROBOT_FIX_SUGGEST = _env_bool("ROBOT_FIX_SUGGEST", True)
+
+# Сколько ждать ответа сотрудника, прежде чем дослать номер как есть.
+ROBOT_FIX_TTL_SECONDS = _env_int("ROBOT_FIX_TTL", 180)
+
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
 
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
 KNOWN_COMMANDS = (
-    "reg", "unreg", "whoami", "stats", "id", "help", "start",
+    "reg", "unreg", "whoami", "stats", "robot", "id", "help", "start",
     "offline", "online", "cancel",
 )
 
@@ -292,6 +303,7 @@ HELP_TEXT = (
     "/whoami — show current link\n"
     "/unreg — remove the link\n"
     "/stats [date] [day|night] — shift statistics\n"
+    "/robot <number> — robot card: status, downtime, history\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
     "/cancel — cancel the current action\n"
@@ -705,6 +717,7 @@ def _deletion_loop():
         try:
             _drain_pending_deletions()
             flush_expired_photos()
+            flush_expired_robot_fixes()
         except Exception:
             logger.exception("Ошибка при удалении служебных сообщений")
 
@@ -1074,6 +1087,10 @@ def handle_status_callback(callback: dict):
         return
 
     parts = (callback.get("data") or "").split(":")
+
+    if parts and parts[0] == "rf":
+        _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id)
+        return
 
     if len(parts) != 4 or parts[0] != "st":
         if callback_id:
@@ -1722,6 +1739,10 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
         _handle_stats(chat_id, args, reply_to)
         return True
 
+    if command == "robot":
+        _handle_robot(chat_id, args, reply_to)
+        return True
+
     if command in STATUS_DIRECTIONS:
         _handle_status_command(chat_id, sender, command, args, reply_to)
         return True
@@ -1750,6 +1771,288 @@ def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool
         return True
 
     return False
+
+
+# ============================================================
+# КАРТОЧКА РОБОТА И ИСПРАВЛЕНИЕ НОМЕРА
+# ============================================================
+#
+# Сотрудники регулярно присылают номер с опечаткой («3882» вместо «882»).
+# Раньше ошибка уходила в Lark, номер падал в robots_to_add, и запись в базу
+# не появлялась. Теперь бот сначала показывает похожие номера и ждёт ответа
+# (ROBOT_FIX_TTL_SECONDS): исправили — сохраняем как обычно; не ответили или
+# нажали «номер верный» — ведём себя как раньше (очередь + Lark).
+
+_pending_robot_fix = {}
+_pending_robot_fix_lock = threading.Lock()
+
+
+def _robot_fix_key(chat_id, user_id):
+    return (int(chat_id), int(user_id))
+
+
+def set_pending_robot_fix(chat_id, user_id, data: dict):
+    with _pending_robot_fix_lock:
+        _pending_robot_fix[_robot_fix_key(chat_id, user_id)] = dict(
+            data,
+            expires=time.time() + ROBOT_FIX_TTL_SECONDS,
+        )
+
+
+def take_pending_robot_fix(chat_id, user_id):
+    """Забирает ожидающую подсказку по номеру (single-flight)."""
+    key = _robot_fix_key(chat_id, user_id)
+
+    with _pending_robot_fix_lock:
+        data = _pending_robot_fix.pop(key, None)
+
+    if not data or data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
+def peek_pending_robot_fix(chat_id, user_id):
+    """Ожидающая подсказка без изъятия (для тестов и логов)."""
+    key = _robot_fix_key(chat_id, user_id)
+
+    with _pending_robot_fix_lock:
+        data = _pending_robot_fix.get(key)
+
+    if not data or data.get("expires", 0) < time.time():
+        return None
+
+    return dict(data)
+
+
+def expired_robot_fixes():
+    """Просроченные подсказки: ждать больше нельзя, номер уходит как есть."""
+    now = time.time()
+    due = []
+
+    with _pending_robot_fix_lock:
+        for key, data in list(_pending_robot_fix.items()):
+            if data.get("expires", 0) <= now:
+                due.append((key, _pending_robot_fix.pop(key)))
+
+    return due
+
+
+def flush_expired_robot_fixes() -> int:
+    """
+    Досылает ошибки, по которым сотрудник не ответил.
+
+    Терять сообщение нельзя: если подсказка истекла, работаем как раньше
+    (очередь «неизвестных роботов» + карточка в Lark).
+    """
+    due = expired_robot_fixes()
+
+    for _key, data in due:
+        try:
+            _complete_missing_robot(
+                data["chat_id"],
+                data["sender"],
+                data["employee_name"],
+                data["parsed"],
+                data.get("photo_path"),
+                data.get("employee_card_id"),
+                prompt_message_id=data.get("prompt_message_id"),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось дослать ошибку по неизвестному роботу #%s",
+                (data.get("parsed") or {}).get("robot"),
+            )
+
+    return len(due)
+
+
+def robot_fix_keyboard(candidates):
+    """Кнопки: исправить на похожий номер или подтвердить текущий."""
+    rows = [
+        [{"text": f"✅ Robot #{number}", "callback_data": f"rf:{number}"}]
+        for number in candidates
+    ]
+
+    rows.append([{
+        "text": "➡️ No, the number is correct",
+        "callback_data": "rf:no",
+    }])
+
+    return {"inline_keyboard": rows}
+
+
+def _ask_robot_fix(
+    chat_id,
+    sender,
+    employee_name,
+    parsed,
+    photo_path,
+    candidates,
+    employee_card_id=None,
+):
+    """Спрашивает, не опечатка ли номер, и запоминает контекст ошибки."""
+    sent = _send(
+        chat_id,
+        f"⚠️ Robot #{parsed['robot']} is not in the system.\n"
+        "Is the number correct?",
+        reply_markup=robot_fix_keyboard(candidates),
+    )
+
+    prompt_message_id = (sent or {}).get("message_id")
+
+    set_pending_robot_fix(chat_id, sender.get("id"), {
+        "chat_id": chat_id,
+        "sender": sender,
+        "employee_name": employee_name,
+        "parsed": parsed,
+        "photo_path": photo_path,
+        "employee_card_id": employee_card_id,
+        "prompt_message_id": prompt_message_id,
+    })
+
+    logger.info(
+        "Робот #%s не найден: предложены варианты %s",
+        parsed["robot"],
+        candidates,
+    )
+
+
+def _complete_missing_robot(
+    chat_id,
+    sender,
+    employee_name,
+    parsed,
+    photo_path=None,
+    employee_card_id=None,
+    prompt_message_id=None,
+):
+    """
+    Робота нет в справочнике: ставим номер в очередь и шлём ошибку в Lark.
+
+    Факт «робота нет в системе» в Lark не пишем — об этом бот сообщает
+    сотруднику в Telegram.
+    """
+    _delete_quiet(chat_id, prompt_message_id)
+
+    queue_missing_robot(
+        parsed["robot"],
+        employee_card_id=employee_card_id,
+        chat_id=chat_id,
+    )
+
+    pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
+
+    forward_error(parsed, [
+        ("👤 Employee", employee_name),
+        ("🤖 Robot", parsed["robot"]),
+        ("⚠️ Time", pretty),
+        ("📝 Details", parsed["error_text"]),
+    ])
+
+    if photo_path:
+        send_photo(
+            photo_path,
+            f"📷 {employee_name}: {parsed['error_text']}",
+            console,
+        )
+
+    logger.warning(
+        "Робот %s не найден в системе — ошибка переслана в Lark "
+        "без записи в базу (сотрудник уведомлён в Telegram)",
+        parsed["robot"],
+    )
+
+
+def _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id):
+    """Нажатие кнопки в подсказке по номеру робота."""
+    pending = take_pending_robot_fix(chat_id, sender.get("id"))
+
+    if not pending:
+        if callback_id:
+            tg.answer_callback_query(
+                callback_id,
+                "This suggestion is outdated — send the message again",
+            )
+
+        _delete_quiet(chat_id, message_id)
+        return
+
+    action = parts[1] if len(parts) > 1 else "no"
+
+    if action.isdigit():
+        parsed = dict(pending["parsed"])
+        parsed["robot"] = action
+
+        if callback_id:
+            tg.answer_callback_query(callback_id, f"Robot #{action}")
+
+        # Сохраняем как обычную ошибку; повторно номер не предлагаем.
+        save_and_forward_error(
+            chat_id,
+            pending["sender"],
+            parsed,
+            pending.get("prompt_message_id") or message_id,
+            pending["employee_name"],
+            pending.get("photo_path"),
+            allow_fix=False,
+        )
+    else:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Keeping the number as is")
+
+        _complete_missing_robot(
+            chat_id,
+            pending["sender"],
+            pending["employee_name"],
+            pending["parsed"],
+            pending.get("photo_path"),
+            pending.get("employee_card_id"),
+            prompt_message_id=pending.get("prompt_message_id"),
+        )
+
+    _delete_quiet(chat_id, message_id)
+
+
+def _handle_robot(chat_id, args, reply_to):
+    """Карточка робота: /robot <номер>."""
+    args = (args or "").strip()
+
+    if not args:
+        _send(
+            chat_id,
+            "Usage: /robot <number>\nExample: /robot 3680",
+            reply_to_message_id=reply_to,
+        )
+        return
+
+    number = args.split()[0]
+
+    if not number.lstrip("#").isdigit():
+        _send(
+            chat_id,
+            f"⚠️ Robot number must be digits, got {number!r}.\n"
+            "Example: /robot 3680",
+            reply_to_message_id=reply_to,
+        )
+        return
+
+    card = robot_card.robot_card(number)
+
+    if card is None:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    _send(
+        chat_id,
+        robot_card.format_robot_card(card),
+        reply_to_message_id=reply_to,
+    )
 
 
 def handle_error_text(chat_id, sender, text, message_id):
@@ -1788,6 +2091,7 @@ def save_and_forward_error(
     message_id,
     employee_name,
     photo_path: str = None,
+    allow_fix: bool = True,
 ):
     """
     Сохраняет ошибку и пересылает её в Lark.
@@ -1814,32 +2118,43 @@ def save_and_forward_error(
     )
 
     # send_to_data_base сам сообщит в чат, если шаблон/сотрудник/робот
-    # не найдены (через notifier, т.е. в Telegram).
-    saved = send_to_data_base(parsed, data_obj, chat_id)
+    # не найдены (через notifier, т.е. в Telegram). При подсказке номера
+    # решение об очереди и ответе принимает бот (defer_missing).
+    defer = bool(allow_fix and ROBOT_FIX_SUGGEST)
+
+    saved = send_to_data_base(parsed, data_obj, chat_id, defer_missing=defer)
 
     if isinstance(saved, dict) and saved.get("robot_missing"):
-        # Робота нет в списке склада: записать нечего, но ошибку показываем
-        # смене. Факт «робота нет в системе» в Lark не пишем.
-        pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
+        if defer:
+            candidates = robot_card.suggest_robot_numbers(parsed["robot"])
+        else:
+            candidates = []
 
-        forward_error(parsed, [
-            ("👤 Employee", employee_name),
-            ("🤖 Robot", parsed["robot"]),
-            ("⚠️ Time", pretty),
-            ("📝 Details", parsed["error_text"]),
-        ])
+        if candidates:
+            if PHOTO_ATTACH_ENABLED:
+                waited = take_pending_photo(chat_id, sender.get("id"))
 
-        if photo_path:
-            send_photo(
+                if waited and not photo_path:
+                    photo_path = waited.get("path")
+
+            _ask_robot_fix(
+                chat_id,
+                sender,
+                employee_name,
+                parsed,
                 photo_path,
-                f"📷 {employee_name}: {parsed['error_text']}",
-                console,
+                candidates,
+                saved.get("employee_card_id"),
             )
+            return
 
-        logger.warning(
-            "Робот %s не найден в системе — ошибка переслана в Lark "
-            "без записи в базу (сотрудник уведомлён в Telegram)",
-            parsed["robot"],
+        _complete_missing_robot(
+            chat_id,
+            sender,
+            employee_name,
+            parsed,
+            photo_path,
+            saved.get("employee_card_id"),
         )
         return
 
@@ -2578,8 +2893,9 @@ def poller_supervisor(holder: str, acquired: bool = False):
             LEASE_STATUS = "poller"
 
             if not scheduler_started:
-                # Отчёт за смену шлёт только опрашивающий инстанс.
+                # Отчёты и обслуживание очереди — только у опрашивающего.
                 start_shift_scheduler()
+                start_queue_autoclose()
                 scheduler_started = True
 
             threading.Thread(
@@ -2745,6 +3061,7 @@ def main():
         {"command": "whoami", "description": "Show current link"},
         {"command": "unreg", "description": "Remove the link"},
         {"command": "stats", "description": "Shift statistics"},
+        {"command": "robot", "description": "Robot card by number"},
         {"command": "offline", "description": "Take a robot out of service"},
         {"command": "online", "description": "Return a robot to service"},
         {"command": "id", "description": "Show chat/user IDs"},

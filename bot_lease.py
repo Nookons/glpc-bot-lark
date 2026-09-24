@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from env_utils import env_int
+from time_utils import parse_iso
 from sendToDataBase import (
     rest_delete,
     rest_get,
@@ -83,13 +84,12 @@ def _is_stale(heartbeat_at, ttl: int) -> bool:
         # «залипнет» навсегда и опрос не переедет на живой инстанс.
         return True
 
-    try:
-        moment = datetime.fromisoformat(str(heartbeat_at).replace("Z", "+00:00"))
-    except ValueError:
-        return False
+    moment = parse_iso(heartbeat_at)
 
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+    if moment is None:
+        # Нечитаемое время: считаем лиз живым, чтобы не отобрать его
+        # у работающего инстанса из-за формата даты.
+        return False
 
     return moment < datetime.now(timezone.utc) - timedelta(seconds=ttl)
 
