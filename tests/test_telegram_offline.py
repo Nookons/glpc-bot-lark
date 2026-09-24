@@ -220,8 +220,8 @@ def fake_count_robot_errors_in_shift(robot, shift_date, shift_name, warehouse=No
     return COUNTS.get(str(robot), 0)
 
 
-def fake_forward_error(parsed, table_lines=None):
-    FORWARDED.append({"parsed": parsed, "lines": table_lines})
+def fake_forward_error(parsed, table_lines=None, warehouse=None):
+    FORWARDED.append({"parsed": parsed, "lines": table_lines, "warehouse": warehouse})
     return True
 
 
@@ -557,7 +557,7 @@ def test_photo_with_error_caption_creates_one_record():
     combined, stored = [], []
 
     bot.send_error_with_photo = (
-        lambda parsed, lines, photo_path=None, photo_url=None: (
+        lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
             combined.append({"parsed": parsed, "path": photo_path}), "link"
         )[1]
     )
@@ -615,7 +615,7 @@ def test_photo_waits_for_text_then_combines():
 
     combined = []
     bot.send_error_with_photo = (
-        lambda parsed, lines, photo_path=None, photo_url=None: (
+        lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
             combined.append(photo_path), "link"
         )[1]
     )
@@ -684,7 +684,7 @@ def test_photo_attaches_to_recent_error():
     original_set = bot.set_exception_photo
 
     captions, patched_photo = [], []
-    bot.send_photo = lambda path, caption=None, console=None: (
+    bot.send_photo = lambda path, caption=None, console=None, warehouse=None: (
         captions.append(caption), {"mode": "link", "url": "https://storage/p.jpg"}
     )[1]
     bot.set_exception_photo = lambda table, row_id, url: (
@@ -1040,7 +1040,7 @@ def test_photo_forwarded_when_attachment_disabled():
 
     calls = []
     bot.PHOTO_ATTACH_ENABLED = False
-    bot.send_photo = lambda path, caption=None, console=None: (
+    bot.send_photo = lambda path, caption=None, console=None, warehouse=None: (
         calls.append(caption), {"mode": "link", "url": "https://x/p/1"}
     )[1]
 
@@ -1079,7 +1079,7 @@ def test_flush_pending_photo_modes():
     ):
         original = bot.send_photo
         bot.send_photo = (
-            lambda path, caption=None, console=None, _mode=mode: {
+            lambda path, caption=None, console=None, warehouse=None, _mode=mode: {
                 "mode": _mode,
                 "url": None,
             }
@@ -5696,6 +5696,147 @@ def test_topic_name_learned_from_service_message():
         bot._topic_names.clear()
         bot._topic_names.update(original_names)
 
+# ============================================================
+# ВЕБХУКИ LARK ПО СКЛАДАМ И ВИДАМ СООБЩЕНИЙ
+# ============================================================
+
+def test_lark_hooks_resolve():
+    """Ошибки и статусы уходят в свои вебхуки, у каждого склада — свой."""
+    import lark_hooks
+
+    names = (
+        "LARK_HOOK_ERROR_SP3",
+        "LARK_HOOK_STATUS_SP3",
+        "LARK_HOOK_STATUS_GLPC",
+    )
+    original = {name: os.environ.get(name) for name in names}
+
+    os.environ["LARK_HOOK_ERROR_SP3"] = "https://hook/sp3-errors"
+    os.environ["LARK_HOOK_STATUS_SP3"] = "https://hook/sp3-status"
+    os.environ["LARK_HOOK_STATUS_GLPC"] = "https://hook/glpc-status"
+
+    try:
+        check(
+            "hooks: ошибки SP3 — свой вебхук",
+            lark_hooks.error_hook("SMALL-P3") == "https://hook/sp3-errors",
+            lark_hooks.error_hook("SMALL-P3"),
+        )
+        check(
+            "hooks: статусы SP3 — свой вебхук",
+            lark_hooks.status_hook("SMALL-P3") == "https://hook/sp3-status",
+            lark_hooks.status_hook("SMALL-P3"),
+        )
+        check(
+            "hooks: статусы GLP-C — свой вебхук",
+            lark_hooks.status_hook("GLP-C") == "https://hook/glpc-status",
+            lark_hooks.status_hook("GLP-C"),
+        )
+        check(
+            "hooks: ошибки GLP-C — общий вебхук (переменной нет)",
+            lark_hooks.error_hook("GLP-C") == lark_hooks.TARGET_HOOK_URL,
+            lark_hooks.error_hook("GLP-C"),
+        )
+        check(
+            "hooks: неизвестный склад — общий вебхук",
+            lark_hooks.error_hook("NO-SUCH") == lark_hooks.TARGET_HOOK_URL,
+        )
+        check(
+            "hooks: карта вебхуков по складам и видам",
+            set(lark_hooks.hook_map()) == {"error", "status"}
+            and set(lark_hooks.hook_map()["status"]) == {"GLP-C", "SMALL-P3"},
+            lark_hooks.hook_map(),
+        )
+        check(
+            "hooks: в лог печатается только хвост ссылки",
+            lark_hooks.short("https://open.larksuite.com/open-apis/bot/v2/hook/abcdef12-3456")
+            == "abcdef12",
+            lark_hooks.short("https://x/hook/abcdef12-3456"),
+        )
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_error_and_status_hooks_by_warehouse():
+    """Ошибка SP3 и смена статуса SP3 уходят каждый в свой вебхук."""
+    import lark_hooks
+    import pending_photos
+
+    names = ("LARK_HOOK_ERROR_SP3", "LARK_HOOK_STATUS_SP3")
+    original_env = {name: os.environ.get(name) for name in names}
+
+    os.environ["LARK_HOOK_ERROR_SP3"] = "https://hook/sp3-errors"
+    os.environ["LARK_HOOK_STATUS_SP3"] = "https://hook/sp3-status"
+
+    original_send_text = pending_photos.send_text_via_hook
+    original_card = bot.send_card_via_hook
+
+    sent_text, sent_cards = [], []
+
+    pending_photos.send_text_via_hook = lambda url, text: (
+        sent_text.append((url, text)), {"code": 0}
+    )[1]
+    bot.send_card_via_hook = lambda url, card: (
+        sent_cards.append((url, card)), {"code": 0, "msg": "success"}
+    )[1]
+
+    try:
+        pending_photos.forward_error(
+            {
+                "error_type": "Unable to drive",
+                "error_text": "Security module failure",
+                "robot": "5016",
+            },
+            [("🤖 Robot", "5016")],
+            "SMALL-P3",
+        )
+
+        check(
+            "hooks: ошибка SP3 ушла в свой вебхук",
+            sent_text and sent_text[0][0] == "https://hook/sp3-errors",
+            sent_text,
+        )
+
+        bot._notify_lark_status(
+            "offline",
+            {
+                "robot": {
+                    "robot_number": 5016,
+                    "robot_type": "RT",
+                    "warehouse": "SMALL-P3",
+                },
+                "old_status": "在线 | Online",
+                "new_status": "离线 | Offline",
+                "type_problem": "Other",
+                "problem_note": "test",
+            },
+            "Ivan Petrenko",
+        )
+
+        check(
+            "hooks: статус SP3 ушёл в свой вебхук",
+            sent_cards and sent_cards[0][0] == "https://hook/sp3-status",
+            [url for url, _ in sent_cards],
+        )
+        check(
+            "hooks: в карточке статуса есть робот",
+            sent_cards
+            and "5016" in json.dumps(sent_cards[0][1], ensure_ascii=False),
+            sent_cards,
+        )
+    finally:
+        pending_photos.send_text_via_hook = original_send_text
+        bot.send_card_via_hook = original_card
+
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
 
 def main():
     tests = [
@@ -5805,6 +5946,8 @@ def main():
         test_two_warehouses_errors_and_topics,
         test_warehouse_argument_in_commands,
         test_topic_name_learned_from_service_message,
+        test_lark_hooks_resolve,
+        test_error_and_status_hooks_by_warehouse,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

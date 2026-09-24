@@ -42,6 +42,7 @@ import digests
 import robot_card
 from env_utils import env_bool, env_int
 from robot_queue import start_queue_autoclose
+import lark_hooks
 from analytics import start_weekly_scheduler
 from warehouses import (
     DEFAULT_WAREHOUSE,
@@ -1506,9 +1507,14 @@ def handle_status_callback(callback: dict):
 
 
 def _notify_lark_status(direction, result, employee_name) -> bool:
-    """Карточка о смене статуса в целевой Lark-группе (с откатом на текст)."""
+    """Карточка о смене статуса в Lark-группе склада (с откатом на текст)."""
+    robot = result.get("robot") or {}
+    target = lark_hooks.status_hook(
+        robot.get("warehouse") or current_warehouse()
+    )
+
     card = robot_status.build_status_card(direction, result, employee_name)
-    hook_result = send_card_via_hook(TARGET_HOOK_URL, card)
+    hook_result = send_card_via_hook(target, card)
 
     if hook_ok(hook_result):
         logger.info(
@@ -1520,7 +1526,7 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
     logger.warning("Карточка статуса не прошла (%s) — отправляю текстом", hook_result)
 
     send_text_via_hook(
-        TARGET_HOOK_URL,
+        target,
         robot_status.build_status_text(direction, result, employee_name),
     )
 
@@ -1679,13 +1685,23 @@ def _photo_key(chat_id, user_id):
     return (int(chat_id), int(user_id))
 
 
-def put_pending_photo(chat_id, user_id, path, message_id, caption=None):
+def put_pending_photo(
+    chat_id,
+    user_id,
+    path,
+    message_id,
+    caption=None,
+    warehouse=None,
+):
     """Запоминаем фото, к которому ещё может прийти текст ошибки."""
     with _photo_lock:
         _pending_photo[_photo_key(chat_id, user_id)] = {
             "path": path,
             "message_id": message_id,
             "caption": caption or "",
+            # Склад нужен уборщику: он пересылает фото вне апдейта, когда
+            # контекста топика уже нет.
+            "warehouse": warehouse or current_warehouse(),
             "expires": time.time() + PHOTO_HOLD_SECONDS,
         }
 
@@ -1795,7 +1811,12 @@ def _flush_pending_photo_inner(chat_id, user_id, data):
     if data.get("caption"):
         caption = f"{caption}\n{data['caption']}"
 
-    mode = send_photo(data["path"], caption, console)
+    mode = send_photo(
+        data["path"],
+        caption,
+        console,
+        warehouse=data.get("warehouse"),
+    )
 
     logger.info(
         "Фото переслано отдельно (не нашлось текста ошибки): chat=%s user=%s mode=%s",
@@ -2331,17 +2352,18 @@ def _complete_missing_robot(
     pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
 
     forward_error(parsed, [
-        ("👤 Employee", employee_name),
-        ("🤖 Robot", parsed["robot"]),
-        ("⚠️ Time", pretty),
-        ("📝 Details", parsed["error_text"]),
-    ])
+            ("👤 Employee", employee_name),
+            ("🤖 Robot", parsed["robot"]),
+            ("⚠️ Time", pretty),
+            ("📝 Details", parsed["error_text"]),
+        ], current_warehouse())
 
     if photo_path:
         send_photo(
             photo_path,
             f"📷 {employee_name}: {parsed['error_text']}",
             console,
+            warehouse=current_warehouse(),
         )
 
     logger.warning(
@@ -2462,6 +2484,13 @@ def _handle_topics(chat_id, reply_to):
     lines.append(
         "If your topic is not in the list, send /id inside it."
     )
+    lines.append("")
+    lines.append("Lark hooks:")
+
+    for kind, mapping in lark_hooks.hook_map().items():
+        for title, url in mapping.items():
+            lines.append(f"  {kind} {title}: …{lark_hooks.short(url)}")
+
     lines.append("")
     lines.append(
         "Strict error topic: " + ("on" if ERROR_TOPIC_STRICT else "off")
@@ -2783,10 +2812,13 @@ def save_and_forward_error(
                 table_lines,
                 photo_path=photo_path,
                 photo_url=photo_url,
+                warehouse=current_warehouse(),
             )
             forwarded = mode != "none"
         else:
-            forwarded = forward_error(parsed, table_lines)
+            forwarded = forward_error(
+                parsed, table_lines, current_warehouse()
+            )
 
         remember_last_error(
             chat_id,
@@ -2834,6 +2866,7 @@ def attach_photo_to_last_error(chat_id, sender, recent, photo_path, message_id):
         photo_path,
         f"📷 Robot {robot} · {employee_name}",
         console,
+        warehouse=current_warehouse(),
     )
 
     if result.get("url") and recent.get("glpc_id"):
@@ -2921,7 +2954,12 @@ def handle_photo(chat_id, sender, message, message_id):
         if caption:
             photo_caption = f"{photo_caption}\n{caption}"
 
-        mode = send_photo(destination, photo_caption, console)
+        mode = send_photo(
+            destination,
+            photo_caption,
+            console,
+            warehouse=current_warehouse(),
+        )
 
         if mode["mode"] == "none":
             _send(
@@ -2982,6 +3020,7 @@ def handle_photo(chat_id, sender, message, message_id):
         destination,
         message_id,
         caption,
+        current_warehouse(),
     )
 
     _send(
@@ -3687,6 +3726,14 @@ def main():
 
     if ALLOWED_CHAT_IDS:
         console.print(f"[cyan]Allowed chats: {sorted(ALLOWED_CHAT_IDS)}[/cyan]")
+
+    console.print("[cyan]Lark hooks:[/cyan]")
+
+    for hook_kind, mapping in lark_hooks.hook_map().items():
+        for warehouse_title, url in mapping.items():
+            console.print(
+                f"  {hook_kind} {warehouse_title}: …{lark_hooks.short(url)}"
+            )
 
     console.print(f"[cyan]Monitored topic: {monitored_topic_label()}[/cyan]")
 

@@ -9,8 +9,7 @@
 её сначала нужно загрузить через im/v1/images (1 вызов API на фото).
 """
 
-import os
-
+from lark_hooks import TARGET_HOOK_URL, error_hook
 from lark_media import (
     hook_ok,
     send_image_via_hook,
@@ -26,23 +25,21 @@ from logging_config import setup_logging
 logger = setup_logging(__name__)
 
 
-# Webhook бота целевой группы Lark. Можно переопределить через .env.
-DEFAULT_TARGET_HOOK_URL = (
-    "https://open.larksuite.com/open-apis/bot/v2/hook/"
-    "dc2c430d-ce07-4ff2-b5ca-0b92feb4f62a"
-)
-
-TARGET_HOOK_URL = os.environ.get(
-    "LARK_TARGET_HOOK_URL",
-    DEFAULT_TARGET_HOOK_URL,
-)
+# TARGET_HOOK_URL — общий вебхук (отчёты и запасной вариант). Ошибки уходят
+# в вебхук своего склада: lark_hooks.error_hook(warehouse).
+DEFAULT_TARGET_HOOK_URL = TARGET_HOOK_URL
 
 
 # Оставлено для обратной совместимости: реализация живёт в lark_media.
 _hook_ok = hook_ok
 
 
-def send_photo(image_path: str, caption: str = None, console=None) -> dict:
+def send_photo(
+    image_path: str,
+    caption: str = None,
+    console=None,
+    warehouse: str = None,
+) -> dict:
     """
     Отправляет фото в целевую группу Lark.
 
@@ -55,6 +52,7 @@ def send_photo(image_path: str, caption: str = None, console=None) -> dict:
     Возвращает {"mode": "lark"|"link"|"none", "url": <ссылка или None>}:
     url нужен, чтобы привязать фото к записи об ошибке.
     """
+    target = error_hook(warehouse)
     image_key = None
 
     try:
@@ -73,9 +71,9 @@ def send_photo(image_path: str, caption: str = None, console=None) -> dict:
 
     if image_key:
         if caption:
-            result = send_post_via_hook(TARGET_HOOK_URL, image_key, caption)
+            result = send_post_via_hook(target, image_key, caption)
         else:
-            result = send_image_via_hook(TARGET_HOOK_URL, image_key)
+            result = send_image_via_hook(target, image_key)
 
         if _hook_ok(result):
             logger.info("Photo forwarded to Lark group: %s", image_path)
@@ -95,7 +93,7 @@ def send_photo(image_path: str, caption: str = None, console=None) -> dict:
 
     text = f"{caption}\n🔗 {link}" if caption else f"📷 Photo\n🔗 {link}"
 
-    result = send_text_via_hook(TARGET_HOOK_URL, text)
+    result = send_text_via_hook(target, text)
 
     if not _hook_ok(result):
         logger.error("Failed to send photo link to Lark hook: %s", result)
@@ -106,9 +104,14 @@ def send_photo(image_path: str, caption: str = None, console=None) -> dict:
     return {"mode": "link", "url": link}
 
 
-def handle_incoming_photo(image_path: str, console=None, caption: str = None) -> str:
+def handle_incoming_photo(
+    image_path: str,
+    console=None,
+    caption: str = None,
+    warehouse: str = None,
+) -> str:
     """Совместимая обёртка: возвращает только режим доставки."""
-    return send_photo(image_path, caption, console)["mode"]
+    return send_photo(image_path, caption, console, warehouse=warehouse)["mode"]
 
 
 def send_error_with_photo(
@@ -116,6 +119,7 @@ def send_error_with_photo(
     table_lines=None,
     photo_path: str = None,
     photo_url: str = None,
+    warehouse: str = None,
 ) -> str:
     """
     Отправляет карточку ошибки вместе с фото.
@@ -123,6 +127,7 @@ def send_error_with_photo(
     Сначала пробует картинкой (нужна квота Lark), иначе текстом со ссылкой.
     Возвращает "lark" | "link" | "text" | "none".
     """
+    target = error_hook(warehouse)
     plain_line = f"{parsed['error_type']}: {parsed['error_text']}. {parsed['robot']}"
 
     if table_lines:
@@ -144,7 +149,7 @@ def send_error_with_photo(
             image_key = None
 
         if image_key:
-            if _hook_ok(send_post_via_hook(TARGET_HOOK_URL, image_key, text_block)):
+            if _hook_ok(send_post_via_hook(target, image_key, text_block)):
                 logger.info(
                     "Ошибка с фото отправлена в Lark картинкой: robot=%s",
                     parsed.get("robot"),
@@ -153,7 +158,7 @@ def send_error_with_photo(
 
     if photo_url:
         result = send_text_via_hook(
-            TARGET_HOOK_URL,
+            target,
             f"{text_block}\n🔗 {photo_url}",
         )
 
@@ -167,11 +172,11 @@ def send_error_with_photo(
         logger.error("Failed to send error with photo to Lark: %s", result)
         return "none"
 
-    return "text" if forward_error(parsed, table_lines) else "none"
+    return "text" if forward_error(parsed, table_lines, warehouse) else "none"
 
 
-def forward_error(parsed: dict, table_lines=None) -> bool:
-    """Отправляет карточку ошибки в целевую группу Lark."""
+def forward_error(parsed: dict, table_lines=None, warehouse: str = None) -> bool:
+    """Отправляет карточку ошибки в группу Lark своего склада."""
     plain_line = f"{parsed['error_type']}: {parsed['error_text']}. {parsed['robot']}"
 
     if table_lines:
@@ -182,7 +187,7 @@ def forward_error(parsed: dict, table_lines=None) -> bool:
     else:
         text_block = truncate(plain_line, VALUE_LIMIT)
 
-    result = send_text_via_hook(TARGET_HOOK_URL, text_block)
+    result = send_text_via_hook(error_hook(warehouse), text_block)
 
     if not _hook_ok(result):
         logger.error("Failed to forward error to Lark hook: %s", result)
