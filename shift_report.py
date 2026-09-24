@@ -245,21 +245,23 @@ def shift_window(shift_date: str, shift_name: str):
     )
 
 
-def downtime_intervals():
+def downtime_intervals(warehouse: str = None):
     """
     Интервалы простоя Offline→Online из журнала смен статуса.
 
     None — сбой чтения (это не «простоев не было»). Незакрытые интервалы
     (робот до сих пор в офлайне) не возвращаются: их простой ещё идёт.
     """
-    rows = rest_get(
-        HISTORY_TABLE,
-        params={
-            "select": "created_at,robot_number,new_status,type_problem",
-            "order": "created_at.asc",
-            "limit": str(HISTORY_SCAN_LIMIT),
-        },
-    )
+    params = {
+        "select": "created_at,robot_number,new_status,type_problem",
+        "order": "created_at.asc",
+        "limit": str(HISTORY_SCAN_LIMIT),
+    }
+
+    if warehouse:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get(HISTORY_TABLE, params=params)
 
     if rows is None:
         logger.error("Не удалось прочитать журнал смен статуса для MTTR")
@@ -294,7 +296,7 @@ def downtime_intervals():
     return intervals
 
 
-def downtime_metrics(shift_date: str, shift_name: str) -> dict:
+def downtime_metrics(shift_date: str, shift_name: str, warehouse: str = None) -> dict:
     """
     Простой роботов за смену: MTTR и самый долгий простой.
 
@@ -311,7 +313,7 @@ def downtime_metrics(shift_date: str, shift_name: str) -> dict:
 
     start, end = window
 
-    intervals = downtime_intervals()
+    intervals = downtime_intervals(warehouse)
 
     if intervals is None:
         return {"available": False}
@@ -387,11 +389,14 @@ def downtime_line(metrics: dict) -> str:
     return line
 
 
-def shift_metrics(shift_date: str, shift_name: str) -> dict:
+def shift_metrics(shift_date: str, shift_name: str, warehouse: str = None) -> dict:
     """Метрики смены + сравнение с предыдущей сменой."""
+    warehouse = warehouse or WAREHOUSE
+
     data = shift_report_data(
         shift_date,
         shift_name,
+        warehouse=warehouse,
         maintenance_threshold=MAINTENANCE_THRESHOLD,
     )
 
@@ -405,6 +410,7 @@ def shift_metrics(shift_date: str, shift_name: str) -> dict:
         previous = shift_report_data(
             previous_key[0],
             previous_key[1],
+            warehouse=warehouse,
             maintenance_threshold=MAINTENANCE_THRESHOLD,
         )
 
@@ -414,10 +420,11 @@ def shift_metrics(shift_date: str, shift_name: str) -> dict:
         "total": previous["total"] if previous else None,
     }
     data["delta"] = data["total"] - previous["total"] if previous else None
+    data["warehouse"] = warehouse
 
     # Простой — отдельный источник; его сбой не должен ломать отчёт.
     try:
-        data["downtime"] = downtime_metrics(shift_date, shift_name)
+        data["downtime"] = downtime_metrics(shift_date, shift_name, warehouse)
     except Exception:
         logger.exception(
             "Не удалось посчитать простой за %s/%s", shift_date, shift_name
@@ -441,9 +448,9 @@ def report_color(metrics: dict) -> str:
     return "green"
 
 
-def report_title(shift_date: str, shift_name: str) -> str:
+def report_title(shift_date: str, shift_name: str, warehouse: str = None) -> str:
     return (
-        f"📊 Shift report · {WAREHOUSE} · "
+        f"📊 Shift report · {warehouse or WAREHOUSE} · "
         f"{_pretty_date(shift_date)} · {shift_label(shift_name)}"
     )
 
@@ -452,9 +459,14 @@ def report_title(shift_date: str, shift_name: str) -> str:
 # BUILDERS
 # ============================================================
 
-def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) -> str:
+def build_shift_summary(
+    shift_date: str,
+    shift_name: str,
+    metrics: dict = None,
+    warehouse: str = None,
+) -> str:
     """Текстовый вариант отчёта."""
-    metrics = metrics or shift_metrics(shift_date, shift_name)
+    metrics = metrics or shift_metrics(shift_date, shift_name, warehouse)
 
     if metrics is None:
         return (
@@ -462,7 +474,9 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
             "Please try again in a minute."
         )
 
-    header = report_title(shift_date, shift_name)
+    header = report_title(
+        shift_date, shift_name, metrics.get("warehouse") or warehouse
+    )
     total = metrics["total"]
 
     if not total:
@@ -494,9 +508,14 @@ def build_shift_summary(shift_date: str, shift_name: str, metrics: dict = None) 
     return "\n".join(lines)
 
 
-def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None):
+def build_shift_card(
+    shift_date: str,
+    shift_name: str,
+    metrics: dict = None,
+    warehouse: str = None,
+):
     """Интерактивная карточка Lark. None — данных нет (ошибка БД)."""
-    metrics = metrics or shift_metrics(shift_date, shift_name)
+    metrics = metrics or shift_metrics(shift_date, shift_name, warehouse)
 
     if metrics is None:
         return None
@@ -507,7 +526,11 @@ def build_shift_card(shift_date: str, shift_name: str, metrics: dict = None):
             "template": report_color(metrics),
             "title": {
                 "tag": "plain_text",
-                "content": report_title(shift_date, shift_name),
+                "content": report_title(
+                    shift_date,
+                    shift_name,
+                    metrics.get("warehouse") or warehouse,
+                ),
             },
         },
         "elements": [],

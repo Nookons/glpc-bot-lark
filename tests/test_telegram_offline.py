@@ -186,8 +186,14 @@ def fake_unlink_user(telegram_id):
     return True
 
 
-def fake_send_to_data_base(parsed, data_obj, chat_id, defer_missing=False):
-    DB_CALLS.append({"parsed": parsed, "data": data_obj, "chat_id": chat_id})
+def fake_send_to_data_base(parsed, data_obj, chat_id, defer_missing=False,
+                           warehouse=None):
+    DB_CALLS.append({
+        "parsed": parsed,
+        "data": data_obj,
+        "chat_id": chat_id,
+        "warehouse": warehouse,
+    })
     return {
         "status": "saved",
         "rows": [{"id": 1}],
@@ -210,7 +216,7 @@ def fake_queue_missing_robot(robot_number, employee_card_id=None, chat_id=None,
     return True
 
 
-def fake_count_robot_errors_in_shift(robot, shift_date, shift_name):
+def fake_count_robot_errors_in_shift(robot, shift_date, shift_name, warehouse=None):
     return COUNTS.get(str(robot), 0)
 
 
@@ -527,7 +533,7 @@ def test_not_saved_no_forward():
     LINKS[100] = "Ivan Petrenko"
 
     original = bot.send_to_data_base
-    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False: None
+    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False, warehouse=None: None
 
     try:
         sent = run(make_update(text="Unable to drive: Security module failure. 3780"))
@@ -1498,7 +1504,7 @@ def test_commands_work_in_any_topic():
     sent = run(make_update(text="/help", thread_id=777))
     check(
         "команды: /help доступен везде и показывает топик",
-        len(sent) == 1 and "Monitored: topic id 555" in sent[0]["text"],
+        len(sent) == 1 and "Monitored: GLP-C: topic id 555" in sent[0]["text"],
         sent,
     )
 
@@ -2959,7 +2965,7 @@ def test_bot_forwards_missing_robot_to_lark():
 
     counted = []
 
-    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False: {
+    bot.send_to_data_base = lambda parsed, data_obj, chat_id, defer_missing=False, warehouse=None: {
         "robot_missing": True,
         "robot": parsed["robot"],
     }
@@ -4342,7 +4348,7 @@ def _robot_fix_env(candidates=("882",)):
 
     state = {"saved": [], "queued": []}
 
-    def fake_save(parsed, data_obj, chat_id, defer_missing=False):
+    def fake_save(parsed, data_obj, chat_id, defer_missing=False, warehouse=None):
         if defer_missing:
             return {
                 "robot_missing": True,
@@ -4626,8 +4632,11 @@ def test_digest_build_stale_and_queue():
          "updated_at": None},
     ]
 
+    # дайджест по одному складу — как в ежедневной рассылке
+    text = None
+
     digests.stale_offline_robots = lambda hours=None, warehouse=None: stale
-    robot_queue.queue_stats = lambda days=1: {
+    robot_queue.queue_stats = lambda days=1, warehouse=None: {
         "open": 133,
         "new": 4,
         "rows": [
@@ -4637,7 +4646,7 @@ def test_digest_build_stale_and_queue():
     }
 
     try:
-        text = digests.build_digest()
+        text = digests.build_digest(warehouse="GLP-C")
     finally:
         digests.stale_offline_robots = original_stale
         robot_queue.queue_stats = original_stats
@@ -4662,8 +4671,8 @@ def test_digest_build_stale_and_queue():
     digests.stale_offline_robots = lambda hours=None, warehouse=None: []
 
     try:
-        robot_queue.queue_stats = lambda days=1: {"open": 0, "new": 0, "rows": []}
-        empty = digests.build_digest()
+        robot_queue.queue_stats = lambda days=1, warehouse=None: {"open": 0, "new": 0, "rows": []}
+        empty = digests.build_digest(warehouse="GLP-C")
     finally:
         digests.stale_offline_robots = original_stale
         robot_queue.queue_stats = original_stats
@@ -4674,7 +4683,7 @@ def test_digest_build_stale_and_queue():
     digests.stale_offline_robots = lambda hours=None, warehouse=None: None
 
     try:
-        broken = digests.build_digest()
+        broken = digests.build_digest(warehouse="GLP-C")
     finally:
         digests.stale_offline_robots = original_stale
 
@@ -4696,7 +4705,7 @@ def test_digest_send_and_marker():
     sent = []
 
     digests._sender = lambda chat_id, text: sent.append((chat_id, text)) or True
-    digests.build_digest = lambda now=None: "digest text"
+    digests.build_digest = lambda now=None, warehouse=None: "digest text"
     digests.was_sent = lambda now: False
     digests.mark_sent = lambda now: True
     digests.recipients = lambda: [111, 222]
@@ -4719,7 +4728,7 @@ def test_digest_send_and_marker():
     )
 
     # уже отправляли сегодня — второй раз не шлём
-    digests.build_digest = lambda now=None: "digest text"
+    digests.build_digest = lambda now=None, warehouse=None: "digest text"
     digests.was_sent = lambda now: True
     digests.recipients = lambda: [111]
     digests._sender = lambda chat_id, text: sent.append((chat_id, text)) or True
@@ -4744,7 +4753,7 @@ def test_digest_send_and_marker():
 
     # нет получателей
     digests._sender = lambda chat_id, text: True
-    digests.build_digest = lambda now=None: "digest text"
+    digests.build_digest = lambda now=None, warehouse=None: "digest text"
     digests.was_sent = lambda now: False
     digests.recipients = lambda: []
 
@@ -4807,7 +4816,7 @@ def test_digest_due_and_command():
     )
 
     original_build = digests.build_digest
-    digests.build_digest = lambda now=None: "🗂 Maintenance digest · 24.09.2026"
+    digests.build_digest = lambda now=None, warehouse=None: "🗂 Maintenance digest · 24.09.2026"
 
     try:
         sent = run(make_update(text="/digest", message_id=9601, thread_id=2))
@@ -4820,7 +4829,7 @@ def test_digest_due_and_command():
         sent,
     )
 
-    digests.build_digest = lambda now=None: None
+    digests.build_digest = lambda now=None, warehouse=None: None
 
     try:
         sent = run(make_update(text="/digest", message_id=9602, thread_id=2))
@@ -4933,7 +4942,7 @@ def test_analytics_downtime_report():
          "type_problem": "Other"},
     ]
 
-    analytics.downtime_intervals = lambda: intervals
+    analytics.downtime_intervals = lambda warehouse=None: intervals
 
     try:
         report = analytics.downtime_report(7, now)
@@ -4966,7 +4975,7 @@ def test_analytics_downtime_report():
         text,
     )
 
-    analytics.downtime_intervals = lambda: None
+    analytics.downtime_intervals = lambda warehouse=None: None
 
     try:
         broken = analytics.downtime_report(7, now)
@@ -5002,16 +5011,16 @@ def test_analytics_weekly_and_schedule():
         analytics.WEEKLY_REPORT_ENABLED,
     )
 
-    analytics.top_report = lambda period="week", now=None: {
+    analytics.top_report = lambda period="week", now=None, warehouse=None: {
         "period": "week", "days": 7, "since": None, "total": 464,
         "issues": [("Unable to drive", 311)], "robots": [("3750", 13)],
     }
-    analytics.downtime_report = lambda days=7, now=None: {
+    analytics.downtime_report = lambda days=7, now=None, warehouse=None: {
         "days": days, "repairs": 18, "mttr_seconds": 85200,
         "top": [(3432, {"seconds": 306300.0, "count": 1})], "legacy": 27,
         "legacy_longest": {"robot": 132, "seconds": 7815000.0},
     }
-    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None: [
+    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None, warehouse=None: [
         (97, 3, 262402.0),
     ]
 
@@ -5041,12 +5050,12 @@ def test_analytics_weekly_and_schedule():
     # отправка + маркер
     hooks, marked = [], []
 
-    analytics.top_report = lambda period="week", now=None: {
+    analytics.top_report = lambda period="week", now=None, warehouse=None: {
         "period": "week", "days": 7, "since": None, "total": 1,
         "issues": [], "robots": [],
     }
-    analytics.downtime_report = lambda days=7, now=None: None
-    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None: []
+    analytics.downtime_report = lambda days=7, now=None, warehouse=None: None
+    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None, warehouse=None: []
     analytics.send_text_via_hook = lambda url, text: hooks.append(text) or {"code": 0}
     analytics.was_sent = lambda now: False
     analytics.mark_sent = lambda now: marked.append(now.strftime("%Y-%m-%d")) or True
@@ -5119,16 +5128,16 @@ def test_analytics_commands():
     original_downtime = analytics.downtime_report
     original_week = analytics.weekly_text
 
-    analytics.top_report = lambda period="week", now=None: {
+    analytics.top_report = lambda period="week", now=None, warehouse=None: {
         "period": period, "days": analytics.period_days(period), "since": None,
         "total": 3, "issues": [("Unable to drive", 3)], "robots": [("3750", 2)],
     }
-    analytics.downtime_report = lambda days=7, now=None: {
+    analytics.downtime_report = lambda days=7, now=None, warehouse=None: {
         "days": days, "repairs": 1, "mttr_seconds": 3600,
         "top": [(1, {"seconds": 3600.0, "count": 1})], "legacy": 0,
         "legacy_longest": None,
     }
-    analytics.weekly_text = lambda days=7, now=None: "📊 Weekly report · GLP-C"
+    analytics.weekly_text = lambda days=7, now=None, warehouse=None: "📊 Weekly report · GLP-C"
 
     try:
         week = run(make_update(text="/top", message_id=9701, thread_id=2))
@@ -5173,7 +5182,7 @@ def test_analytics_commands():
         weekly,
     )
 
-    analytics.weekly_text = lambda days=7, now=None: ""
+    analytics.weekly_text = lambda days=7, now=None, warehouse=None: ""
 
     try:
         empty = run(make_update(text="/week", message_id=9707, thread_id=2))
@@ -5437,7 +5446,7 @@ def test_topics_command():
 
     check(
         "topics: команда показывает id и имя",
-        "Ex GLPC (errors): id 2" in text and "'Ex GLPC'" in text,
+        "GLP-C: id 2" in text and "'Ex GLPC'" in text,
         text,
     )
     check(
@@ -5446,8 +5455,8 @@ def test_topics_command():
         text,
     )
     check(
-        "topics: видно, что в топике ошибок только ошибки",
-        "errors are read and answered here" in text,
+        "topics: видно, где читаются ошибки",
+        "Errors are read from these topics:" in text,
         text,
     )
     check(
@@ -5456,6 +5465,209 @@ def test_topics_command():
         and "id 2" in text
         and "id 15" in text,
         text,
+    )
+
+# ============================================================
+# ДВА СКЛАДА: GLP-C и SMALL-P3
+# ============================================================
+
+def test_warehouses_config_and_args():
+    """Склады бота и разбор склада в аргументах команды."""
+    from warehouses import WAREHOUSES, warehouse_from_args, warehouse_key
+
+    check(
+        "warehouses: по умолчанию два склада",
+        WAREHOUSES.get("glpc") == "GLP-C" and WAREHOUSES.get("sp3") == "SMALL-P3",
+        WAREHOUSES,
+    )
+    check(
+        "warehouses: /stats sp3 day",
+        warehouse_from_args("sp3 day") == ("SMALL-P3", "day"),
+        warehouse_from_args("sp3 day"),
+    )
+    check(
+        "warehouses: /stats GLP-C 2026-09-23 day",
+        warehouse_from_args("GLP-C 2026-09-23 day")
+        == ("GLP-C", "2026-09-23 day"),
+        warehouse_from_args("GLP-C 2026-09-23 day"),
+    )
+    check(
+        "warehouses: без склада аргументы не трогаем",
+        warehouse_from_args("2026-09-23 day") == (None, "2026-09-23 day"),
+        warehouse_from_args("2026-09-23 day"),
+    )
+    check("warehouses: ключ по названию", warehouse_key("SMALL-P3") == "sp3")
+
+
+def test_two_warehouses_errors_and_topics():
+    """Ошибки каждого склада пишутся в свой склад, роботы находятся по обоим."""
+    LINKS[100] = "Ivan Petrenko"
+    ROBOTS.clear()
+
+    original = (
+        dict(bot.TOPIC_RAW),
+        bot.TELEGRAM_TOPIC_ID,
+        bot.ERROR_TOPIC_STRICT,
+        bot.MOVED_HINT,
+    )
+    original_names = dict(bot._topic_names)
+    original_find = robot_status.find_robot
+
+    bot.TOPIC_RAW = {
+        "error": "2",
+        "error:SMALL-P3": "318",
+        "status": "319",
+        "stats": "320",
+        "service": "321",
+    }
+    bot.TELEGRAM_TOPIC_ID = 2
+    bot.ERROR_TOPIC_STRICT = True
+    bot.MOVED_HINT = True
+    bot._topic_names.clear()
+
+    robots_by_warehouse = {
+        "GLP-C": {"3780": _robot(3780, 101)},
+        "SMALL-P3": {
+            "5016": {**_robot(5016, 202), "warehouse": "SMALL-P3"},
+        },
+    }
+
+    def fake_find(number, warehouse=None, strict=False):
+        return robots_by_warehouse.get(warehouse, {}).get(
+            str(number).strip().lstrip("#")
+        )
+
+    robot_status.find_robot = fake_find
+
+    try:
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            message_id=10001,
+            thread_id=2,
+        ))
+
+        check(
+            "warehouse: ошибка из топика GLP-C пишется складом GLP-C",
+            DB_CALLS and DB_CALLS[-1]["warehouse"] == "GLP-C",
+            DB_CALLS[-1] if DB_CALLS else None,
+        )
+
+        run(make_update(
+            text="Unable to drive: Security module failure. 5016",
+            message_id=10002,
+            thread_id=318,
+        ))
+
+        check(
+            "warehouse: ошибка из топика SP3 пишется складом SMALL-P3",
+            DB_CALLS and DB_CALLS[-1]["warehouse"] == "SMALL-P3",
+            DB_CALLS[-1] if DB_CALLS else None,
+        )
+
+        # общий топик статусов: робот ищется по обоим складам
+        sent = run(make_update(text="/offline 5016", message_id=10003, thread_id=319))
+        prompt = [item for item in sent if item.get("reply_markup")]
+
+        check(
+            "warehouse: робот SP3 находится из общего топика",
+            prompt and "5016" in prompt[0]["text"],
+            sent,
+        )
+        check(
+            "warehouse: в карточке виден склад робота",
+            prompt and "SMALL-P3" in prompt[0]["text"],
+            prompt,
+        )
+
+        sent = run(make_update(text="/offline 3780", message_id=10004, thread_id=319))
+
+        check(
+            "warehouse: робот GLP-C находится из того же топика",
+            any("3780" in item["text"] for item in sent),
+            sent,
+        )
+
+        # чужой робот в топике ошибок другого склада — честная подсказка
+        sent = run(make_update(text="/offline 99999", message_id=10005, thread_id=318))
+
+        check(
+            "warehouse: ненайденный робот перечисляет оба склада",
+            sent and "GLP-C or SMALL-P3" in sent[0]["text"],
+            sent,
+        )
+    finally:
+        (
+            bot.TOPIC_RAW,
+            bot.TELEGRAM_TOPIC_ID,
+            bot.ERROR_TOPIC_STRICT,
+            bot.MOVED_HINT,
+        ) = original
+        robot_status.find_robot = original_find
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+        ROBOTS.clear()
+
+
+def test_warehouse_argument_in_commands():
+    """/stats и /top принимают склад аргументом, иначе берут склад топика."""
+    import analytics
+
+    original_metrics = bot.shift_metrics
+    original_top = analytics.top_report
+
+    captured = []
+
+    def fake_metrics(shift_date, shift_name, warehouse=None):
+        captured.append(warehouse)
+
+        return {
+            "total": 0,
+            "robots": {},
+            "employees": {},
+            "downtime_minutes": 0,
+            "previous": {"date": None, "shift": None, "total": None},
+            "delta": None,
+            "maintenance": [],
+            "types": {},
+            "warehouse": warehouse,
+        }
+
+    top_args = []
+
+    def fake_top(period="week", now=None, warehouse=None):
+        top_args.append((period, warehouse))
+
+        return {
+            "period": period,
+            "days": analytics.period_days(period),
+            "since": None,
+            "warehouse": warehouse,
+            "total": 0,
+            "issues": [],
+            "robots": [],
+        }
+
+    bot.shift_metrics = fake_metrics
+    analytics.top_report = fake_top
+
+    try:
+        run(make_update(text="/stats sp3", message_id=10101, thread_id=320))
+        run(make_update(text="/stats", message_id=10102, thread_id=320))
+        run(make_update(text="/top sp3 day", message_id=10103, thread_id=320))
+        run(make_update(text="/top", message_id=10104, thread_id=320))
+    finally:
+        bot.shift_metrics = original_metrics
+        analytics.top_report = original_top
+
+    check(
+        "warehouse: /stats sp3 считает SP3, /stats — склад топика",
+        captured == ["SMALL-P3", "GLP-C"],
+        captured,
+    )
+    check(
+        "warehouse: /top sp3 day и /top по умолчанию",
+        top_args == [("day", "SMALL-P3"), ("week", "GLP-C")],
+        top_args,
     )
 
 
@@ -5563,6 +5775,9 @@ def main():
         test_topic_map_and_resolution,
         test_error_topic_keeps_only_errors,
         test_topics_command,
+        test_warehouses_config_and_args,
+        test_two_warehouses_errors_and_topics,
+        test_warehouse_argument_in_commands,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

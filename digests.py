@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from env_utils import env_bool, env_int
 from robot_status import OFFLINE
 from sendToDataBase import WAREHOUSE, rest_get
+from warehouses import WAREHOUSES
 from supabase_storage import download_json, upload_json
 from time_utils import parse_iso
 from logging_config import setup_logging
@@ -194,15 +195,42 @@ def _format_age(item) -> str:
     return f"{int(item['hours'])}h"
 
 
-def build_digest(now: datetime = None):
+def build_digest(now: datetime = None, warehouse: str = None):
     """
     Текст дайджеста или None, если сообщать нечего (или база недоступна).
 
+    warehouse=None — по всем складам бота (как в ежедневной рассылке).
     Пустой дайджест не отправляем: смысл в сигнале, а не в ежедневном шуме.
     """
     now = now or datetime.now(WARSAW_TZ)
 
-    stale = stale_offline_robots()
+    titles = [warehouse] if warehouse else list(WAREHOUSES.values())
+
+    if len(titles) == 1:
+        return _digest_section(titles[0], now)
+
+    sections = []
+
+    for title in titles:
+        text = _digest_section(title, now)
+
+        if text:
+            sections.append(text)
+
+    if not sections:
+        return None
+
+    header = f"🗂 Maintenance digest · {now.strftime('%d.%m.%Y')}"
+
+    if len(sections) == 1:
+        return f"{header}\n\n{sections[0]}"
+
+    return header + "\n\n" + "\n\n".join(sections)
+
+
+def _digest_section(warehouse: str, now: datetime):
+    """Один склад: залипшие в офлайне + очередь заявок. None — пусто."""
+    stale = stale_offline_robots(warehouse=warehouse)
 
     if stale is None:
         return None
@@ -211,12 +239,12 @@ def build_digest(now: datetime = None):
     # зависит от sendToDataBase — так меньше шансов на цикл импортов.
     import robot_queue
 
-    queue = robot_queue.queue_stats()
+    queue = robot_queue.queue_stats(warehouse=warehouse)
 
     if queue.get("open") is None:
         return None
 
-    lines = [f"🗂 Maintenance digest · {now.strftime('%d.%m.%Y')}"]
+    lines = [f"● {warehouse}"]
 
     if stale:
         lines.append("")

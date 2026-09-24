@@ -43,6 +43,12 @@ import robot_card
 from env_utils import env_bool, env_int
 from robot_queue import start_queue_autoclose
 from analytics import start_weekly_scheduler
+from warehouses import (
+    DEFAULT_WAREHOUSE,
+    WAREHOUSES,
+    warehouse_from_args,
+    warehouse_key,
+)
 from digests import start_digest_scheduler
 from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
@@ -168,6 +174,14 @@ TOPIC_RAW = {
     "stats": os.environ.get("TELEGRAM_TOPIC_STATS", "").strip(),
     "service": os.environ.get("TELEGRAM_TOPIC_SERVICE", "").strip(),
 }
+
+# Топик ошибок для каждого склада: TELEGRAM_TOPIC_ERROR_GLPC / _SP3.
+# Для склада по умолчанию работает и историческая TELEGRAM_TOPIC_ID.
+for _key, _title in WAREHOUSES.items():
+    _raw = os.environ.get(f"TELEGRAM_TOPIC_ERROR_{_key.upper()}", "").strip()
+
+    if _raw:
+        TOPIC_RAW[f"error:{_title}"] = _raw
 
 TOPIC_KINDS = ("error", "status", "stats", "service")
 
@@ -534,6 +548,24 @@ _chat_types = {}       # chat_id -> тип чата (supergroup/private/...)
 _routes_lock = threading.Lock()
 
 
+_warehouse_ctx = threading.local()
+
+
+def current_warehouse() -> str:
+    """
+    Склад текущего сообщения.
+
+    Ставится из топика: топик ошибок GLP-C -> GLP-C, топик ошибок SP3 ->
+    SMALL-P3. В общих топиках (статусы/статистика/служебный) — склад по
+    умолчанию; команды могут указать склад аргументом (/stats sp3).
+    """
+    return getattr(_warehouse_ctx, "value", None) or DEFAULT_WAREHOUSE
+
+
+def set_current_warehouse(title: str):
+    _warehouse_ctx.value = title or DEFAULT_WAREHOUSE
+
+
 def _chat_key(chat_id) -> int:
     return int(chat_id)
 
@@ -639,6 +671,51 @@ def _topic_by_name(name, chat_id=None):
     return None
 
 
+def error_topic(warehouse: str = None, chat_id=None):
+    """thread_id топика ошибок указанного склада."""
+    title = warehouse or current_warehouse()
+
+    raw = TOPIC_RAW.get(f"error:{title}", "")
+
+    if not raw and title == DEFAULT_WAREHOUSE:
+        if TELEGRAM_TOPIC_ID is not None:
+            return TELEGRAM_TOPIC_ID
+
+        return _topic_by_name(TELEGRAM_TOPIC_NAME, chat_id)
+
+    if not raw:
+        return None
+
+    digits = raw.lstrip("-")
+
+    if digits.isdigit():
+        return int(raw)
+
+    return _topic_by_name(raw, chat_id)
+
+
+def error_topic_map(chat_id=None) -> dict:
+    """Склад -> thread_id его топика ошибок."""
+    return {
+        title: error_topic(title, chat_id)
+        for title in WAREHOUSES.values()
+    }
+
+
+def warehouse_for_thread(chat_id, thread_id) -> str:
+    """Склад по топику: в топике ошибок SP3 пишут ошибки SP3."""
+    if thread_id is None:
+        return DEFAULT_WAREHOUSE
+
+    for title in WAREHOUSES.values():
+        configured = error_topic(title, chat_id)
+
+        if configured is not None and int(configured) == int(thread_id):
+            return title
+
+    return DEFAULT_WAREHOUSE
+
+
 def topic_thread(kind: str, chat_id=None):
     """
     Настроенный thread_id топика для вида сообщений.
@@ -648,14 +725,11 @@ def topic_thread(kind: str, chat_id=None):
     """
     kind = str(kind or "").strip().lower()
 
+    if kind == "error":
+        return error_topic(current_warehouse(), chat_id)
+
     if kind not in TOPIC_KINDS:
         return None
-
-    if kind == "error":
-        if TELEGRAM_TOPIC_ID is not None:
-            return TELEGRAM_TOPIC_ID
-
-        return _topic_by_name(TELEGRAM_TOPIC_NAME, chat_id)
 
     raw = TOPIC_RAW.get(kind, "")
 
@@ -765,9 +839,15 @@ def _reply_thread(chat_id, kind: str = None):
 
 
 def monitored_topic_label() -> str:
-    """Человекочитаемое описание отслеживаемого топика."""
-    if TELEGRAM_TOPIC_ID is not None:
-        return f"topic id {TELEGRAM_TOPIC_ID}"
+    """Человекочитаемое описание топиков ошибок (по складам)."""
+    parts = []
+
+    for title, thread_id in error_topic_map().items():
+        if thread_id is not None:
+            parts.append(f"{title}: topic id {thread_id}")
+
+    if parts:
+        return " · ".join(parts)
 
     if TELEGRAM_TOPIC_NAME:
         return f"topic {TELEGRAM_TOPIC_NAME!r}"
@@ -781,12 +861,22 @@ def topic_allowed(chat_id, thread_id):
 
     Возвращает (allowed, reason).
     """
-    if TELEGRAM_TOPIC_ID is None and not TELEGRAM_TOPIC_NAME:
+    configured_errors = error_topic_map(chat_id)
+
+    if (
+        TELEGRAM_TOPIC_ID is None
+        and not TELEGRAM_TOPIC_NAME
+        and not any(configured_errors.values())
+    ):
         return True, "no-filter"
 
     if thread_id is None:
         # Сообщение вне топиков — это «General».
         return False, "general-topic"
+
+    for title, configured in configured_errors.items():
+        if configured is not None and int(thread_id) == int(configured):
+            return True, f"errors:{title}"
 
     if TELEGRAM_TOPIC_ID is not None and int(thread_id) == TELEGRAM_TOPIC_ID:
         return True, "id-match"
@@ -1220,6 +1310,26 @@ def status_usage(direction: str) -> str:
     )
 
 
+def find_robot_anywhere(number, strict: bool = True):
+    """
+    Ищет робота по складам бота: сначала склад топика, потом остальные.
+
+    Возвращает (robot, warehouse_title). (None, None) — робота нет нигде.
+    StatusUnavailable — база недоступна (это не «робота нет»).
+    """
+    order = [current_warehouse()] + [
+        title for title in WAREHOUSES.values() if title != current_warehouse()
+    ]
+
+    for title in order:
+        robot = robot_status.find_robot(number, warehouse=title, strict=strict)
+
+        if robot:
+            return robot, title
+
+    return None, None
+
+
 def _handle_status_command(chat_id, sender, direction, args, message_id):
     """/offline или /online: показываем робота и кнопки причин."""
     employee, db_error = _lookup_employee(chat_id, sender, message_id)
@@ -1238,7 +1348,7 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     robot_number = args.split()[0]
 
     try:
-        robot = robot_status.find_robot(robot_number, strict=True)
+        robot, robot_warehouse = find_robot_anywhere(robot_number)
     except robot_status.StatusUnavailable:
         _send(
             chat_id,
@@ -1252,7 +1362,8 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     if not robot:
         _send(
             chat_id,
-            f"⚠️ Robot {robot_number} not found in {WAREHOUSE}.",
+            f"⚠️ Robot {robot_number} not found in "
+            f"{' or '.join(WAREHOUSES.values())}.",
         )
         return
 
@@ -1272,7 +1383,8 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     _send(
         chat_id,
         f"{spec['emoji']} Robot {robot.get('robot_number')} · "
-        f"{robot.get('robot_type') or '-'} · {robot.get('warehouse') or WAREHOUSE}\n"
+        f"{robot.get('robot_type') or '-'} · "
+        f"{robot.get('warehouse') or robot_warehouse or WAREHOUSE}\n"
         f"Status: {robot.get('status')} → {spec['new_status']}\n"
         "\n"
         "Choose the reason:",
@@ -1447,7 +1559,7 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
         return False
 
     try:
-        robot = robot_status.find_robot(pending["robot_number"], strict=True)
+        robot, _robot_warehouse = find_robot_anywhere(pending["robot_number"])
     except robot_status.StatusUnavailable:
         # База недоступна: возвращаем флоу, чтобы сотрудник просто повторил
         # сообщение с причиной, и не теряем его текст.
@@ -1465,7 +1577,8 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
         clear_pending_status(chat_id, sender.get("id"))
         _send(
             chat_id,
-            f"⚠️ Robot {pending['robot_number']} not found in {WAREHOUSE}.",
+            f"⚠️ Robot {pending['robot_number']} not found in "
+            f"{' or '.join(WAREHOUSES.values())}.",
             reply_to_message_id=message_id,
         )
         return False
@@ -1884,7 +1997,7 @@ def _handle_whoami(chat_id, sender, reply_to):
     )
 
 
-def _stats_text(shift_date: str, shift_name: str) -> str:
+def _stats_text(shift_date: str, shift_name: str, warehouse: str = None) -> str:
     """
     Статистика смены в Telegram.
 
@@ -1892,20 +2005,25 @@ def _stats_text(shift_date: str, shift_name: str) -> str:
     динамика к прошлой смене, роботы на обслуживание и топы — чтобы вид
     не разъезжался между командой и автоматическим отчётом.
     """
-    metrics = shift_metrics(shift_date, shift_name)
+    metrics = shift_metrics(shift_date, shift_name, warehouse)
 
-    return build_shift_summary(shift_date, shift_name, metrics)
+    return build_shift_summary(shift_date, shift_name, metrics, warehouse)
 
 
 def _handle_stats(chat_id, args, reply_to):
+    warehouse, args = warehouse_from_args(args)
+    warehouse = warehouse or current_warehouse()
+
     parts = args.split()
 
     shift_date = parts[0] if len(parts) > 0 else None
     shift_name = parts[1] if len(parts) > 1 else None
 
+    keys = "|".join(WAREHOUSES)
+
     usage = (
-        "Usage: /stats [YYYY-MM-DD] [day|night]\n"
-        "Example: /stats 2026-03-08 night"
+        f"Usage: /stats [{keys}] [YYYY-MM-DD] [day|night]\n"
+        f"Example: /stats {keys.split('|')[0]} 2026-03-08 night"
     )
 
     if not shift_date and not shift_name:
@@ -1925,7 +2043,7 @@ def _handle_stats(chat_id, args, reply_to):
         return
 
     try:
-        text = _stats_text(shift_date, shift_name)
+        text = _stats_text(shift_date, shift_name, warehouse)
     except Exception:
         logger.exception(
             "Не удалось собрать статистику смены %s/%s",
@@ -2207,6 +2325,7 @@ def _complete_missing_robot(
         parsed["robot"],
         employee_card_id=employee_card_id,
         chat_id=chat_id,
+        warehouse=current_warehouse(),
     )
 
     pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
@@ -2293,12 +2412,29 @@ def _handle_topics(chat_id, reply_to):
         "service": "/help, /id, /reg, warnings",
     }
 
-    for kind in TOPIC_KINDS:
+    lines.append("Errors are read from these topics:")
+    lines.append("")
+
+    for title, thread_id in error_topic_map(chat_id).items():
+        name = topic_name(chat_id, thread_id) if thread_id else None
+
+        if thread_id is None:
+            shown = "NOT configured"
+        else:
+            shown = f"id {thread_id}" + (f" · {name!r}" if name else "")
+
+        lines.append(f"  {title}: {shown}")
+
+    lines.append("")
+    lines.append("Shared topics:")
+    lines.append("")
+
+    for kind in ("status", "stats", "service"):
         thread_id = topic_thread(kind, chat_id)
         name = topic_name(chat_id, thread_id) if thread_id else None
 
         if thread_id is None:
-            shown = "NOT configured" if kind != "error" else "not set (any topic)"
+            shown = "NOT configured"
         else:
             shown = f"id {thread_id}" + (f" · {name!r}" if name else "")
 
@@ -2339,19 +2475,23 @@ def _handle_topics(chat_id, reply_to):
 
 
 def _handle_top(chat_id, args, reply_to):
-    """Топ типов проблем и роботов за период (/top day|week|month)."""
-    raw = (args or "").strip().split()
+    """Топ типов проблем и роботов за период (/top [склад] day|week|month)."""
+    warehouse, rest = warehouse_from_args(args)
+    warehouse = warehouse or current_warehouse()
+
+    raw = rest.strip().split()
     period = raw[0].lower() if raw else analytics.DEFAULT_PERIOD
 
     if not analytics.period_days(period):
         _send(
             chat_id,
-            "Usage: /top [day|week|month]\nExample: /top week",
+            "Usage: /top [склад] [day|week|month]\n"
+            f"Example: /top {list(WAREHOUSES)[0]} week",
             reply_to_message_id=reply_to,
         )
         return
 
-    report = analytics.top_report(period)
+    report = analytics.top_report(period, warehouse=warehouse)
 
     if report is None:
         _send(
@@ -2370,19 +2510,23 @@ def _handle_top(chat_id, args, reply_to):
 
 
 def _handle_downtime(chat_id, args, reply_to):
-    """Топ роботов по суммарному простою (/downtime [дни])."""
-    raw = (args or "").strip().split()
+    """Топ роботов по суммарному простою (/downtime [склад] [дни])."""
+    warehouse, rest = warehouse_from_args(args)
+    warehouse = warehouse or current_warehouse()
+
+    raw = rest.strip().split()
     days = raw[0] if raw else "7"
 
     if not days.isdigit() or not (1 <= int(days) <= 90):
         _send(
             chat_id,
-            "Usage: /downtime [days 1..90]\nExample: /downtime 7",
+            "Usage: /downtime [склад] [days 1..90]\n"
+            f"Example: /downtime {list(WAREHOUSES)[0]} 7",
             reply_to_message_id=reply_to,
         )
         return
 
-    report = analytics.downtime_report(int(days))
+    report = analytics.downtime_report(int(days), warehouse=warehouse)
 
     if report is None:
         _send(
@@ -2402,7 +2546,7 @@ def _handle_downtime(chat_id, args, reply_to):
 
 def _handle_week(chat_id, reply_to):
     """Предпросмотр недельного отчёта (в Lark он уходит по расписанию)."""
-    text = analytics.weekly_text()
+    text = analytics.weekly_text(warehouse=current_warehouse())
 
     _send(
         chat_id,
@@ -2413,7 +2557,7 @@ def _handle_week(chat_id, reply_to):
 
 def _handle_digest(chat_id, reply_to):
     """Предпросмотр дайджеста обслуживания (та же сводка, что уходит в личку)."""
-    text = digests.build_digest()
+    text = digests.build_digest(warehouse=current_warehouse())
 
     _send(
         chat_id,
@@ -2445,7 +2589,18 @@ def _handle_robot(chat_id, args, reply_to):
         )
         return
 
-    card = robot_card.robot_card(number)
+    card = None
+
+    for title in [current_warehouse()] + [
+        item for item in WAREHOUSES.values() if item != current_warehouse()
+    ]:
+        card = robot_card.robot_card(number, warehouse=title)
+
+        if card is None:
+            break
+
+        if card.get("found"):
+            break
 
     if card is None:
         _send(
@@ -2530,7 +2685,13 @@ def save_and_forward_error(
     # решение об очереди и ответе принимает бот (defer_missing).
     defer = bool(allow_fix and ROBOT_FIX_SUGGEST)
 
-    saved = send_to_data_base(parsed, data_obj, chat_id, defer_missing=defer)
+    saved = send_to_data_base(
+        parsed,
+        data_obj,
+        chat_id,
+        defer_missing=defer,
+        warehouse=current_warehouse(),
+    )
 
     if isinstance(saved, dict) and saved.get("robot_missing"):
         if defer:
@@ -2577,6 +2738,7 @@ def save_and_forward_error(
         parsed["robot"],
         shift_date,
         shift_name,
+        warehouse=current_warehouse(),
     )
 
     pretty = now_warsaw().strftime("%d.%m.%Y %H:%M:%S")
@@ -2896,6 +3058,10 @@ def _handle_update_inner(update: dict, bot_username: str = None):
 
     # Все ответы бота уходят в тот же топик.
     _set_route(chat_id, thread_id, chat.get("type"))
+
+    # Склад сообщения: топик ошибок GLP-C -> GLP-C, топик ошибок SP3 -> SMALL-P3.
+    # В общих топиках — склад по умолчанию (его можно переопределить в команде).
+    set_current_warehouse(warehouse_for_thread(chat_id, thread_id))
 
     text = message.get("text")
     caption = message.get("caption")
@@ -3520,19 +3686,24 @@ def main():
 
     console.print("[cyan]Topic routing:[/cyan]")
 
-    for topic_kind in TOPIC_KINDS:
+    for warehouse_title, thread_id in error_topic_map().items():
+        if thread_id is None:
+            console.print(
+                f"  [red]Ошибки {warehouse_title}: топик не задан[/red]"
+            )
+        else:
+            console.print(
+                f"  [green]Ошибки {warehouse_title}: id {thread_id}[/green]"
+            )
+
+    for topic_kind in ("status", "stats", "service"):
         thread_id = topic_thread(topic_kind)
 
         if thread_id is None:
-            if topic_kind == "error":
-                console.print(
-                    f"  [red]{TOPIC_TITLES[topic_kind]}: не задан[/red]"
-                )
-            else:
-                console.print(
-                    f"  [yellow]{TOPIC_TITLES[topic_kind]}: не задан — "
-                    f"ответы остаются в топике-источнике[/yellow]"
-                )
+            console.print(
+                f"  [yellow]{TOPIC_TITLES[topic_kind]}: не задан — "
+                f"ответы остаются в топике-источнике[/yellow]"
+            )
         else:
             console.print(
                 f"  [green]{TOPIC_TITLES[topic_kind]}: id {thread_id}[/green]"

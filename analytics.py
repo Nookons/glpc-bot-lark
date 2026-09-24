@@ -68,7 +68,7 @@ def period_start(days: int, now: datetime = None) -> datetime:
     return now - timedelta(days=days)
 
 
-def fetch_exceptions(since: datetime):
+def fetch_exceptions(since: datetime, warehouse: str = None):
     """
     Ошибки склада за период (постранично, чтобы не упереться в лимит).
 
@@ -78,14 +78,14 @@ def fetch_exceptions(since: datetime):
         EXCEPTIONS_TABLE,
         params={
             "select": "error_robot,issue_type,error_start_time",
-            "warehouse": f"eq.{WAREHOUSE}",
+            "warehouse": f"eq.{warehouse or WAREHOUSE}",
             "error_start_time": f"gte.{since.isoformat()}",
             "order": "error_start_time.desc",
         },
     )
 
 
-def top_report(period: str = DEFAULT_PERIOD, now: datetime = None):
+def top_report(period: str = DEFAULT_PERIOD, now: datetime = None, warehouse: str = None):
     """Топ типов проблем и роботов за период."""
     days = period_days(period)
 
@@ -93,7 +93,7 @@ def top_report(period: str = DEFAULT_PERIOD, now: datetime = None):
         return None
 
     since = period_start(days, now)
-    rows = fetch_exceptions(since)
+    rows = fetch_exceptions(since, warehouse)
 
     if rows is None:
         return None
@@ -114,6 +114,7 @@ def top_report(period: str = DEFAULT_PERIOD, now: datetime = None):
         "period": period,
         "days": days,
         "since": since,
+        "warehouse": warehouse or WAREHOUSE,
         "total": len(rows),
         "issues": issues.most_common(TOP_LIMIT),
         "robots": robots.most_common(TOP_LIMIT),
@@ -129,7 +130,8 @@ def format_top_report(report) -> str:
         )
 
     lines = [
-        f"📈 Top for the last {report['days']} day(s) · {WAREHOUSE}",
+        f"📈 Top for the last {report['days']} day(s) · "
+        f"{report.get('warehouse') or WAREHOUSE}",
         f"Total: {report['total']} exceptions",
     ]
 
@@ -153,12 +155,12 @@ def format_top_report(report) -> str:
     return "\n".join(lines)
 
 
-def downtime_report(days: int = 7, now: datetime = None):
+def downtime_report(days: int = 7, now: datetime = None, warehouse: str = None):
     """Топ роботов по суммарному простою за последние days дней."""
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    intervals = downtime_intervals()
+    intervals = downtime_intervals(warehouse)
 
     if intervals is None:
         return None
@@ -201,6 +203,7 @@ def downtime_report(days: int = 7, now: datetime = None):
 
     return {
         "days": days,
+        "warehouse": warehouse or WAREHOUSE,
         "repairs": len(inside),
         "mttr_seconds": mttr,
         "top": top,
@@ -219,7 +222,10 @@ def format_downtime_report(report, days: int = 7) -> str:
             "Example: /downtime 7"
         )
 
-    lines = [f"🛠 Downtime · last {report['days']} day(s) · {WAREHOUSE}"]
+    lines = [
+        f"🛠 Downtime · last {report['days']} day(s) · "
+        f"{report.get('warehouse') or WAREHOUSE}"
+    ]
 
     if report["mttr_seconds"] is None:
         lines.append("No robot came back online in this period.")
@@ -254,13 +260,18 @@ def format_downtime_report(report, days: int = 7) -> str:
     return "\n".join(lines)
 
 
-def retirement_candidates(days: int = 30, min_offlines: int = None, now: datetime = None):
+def retirement_candidates(
+    days: int = 30,
+    min_offlines: int = None,
+    now: datetime = None,
+    warehouse: str = None,
+):
     """Роботы, которые чаще всех уходили в офлайн (кандидаты на вывод)."""
     min_offlines = RETIREMENT_MIN_OFFLINES if min_offlines is None else min_offlines
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
-    intervals = downtime_intervals()
+    intervals = downtime_intervals(warehouse)
 
     if intervals is None:
         return None
@@ -282,19 +293,19 @@ def retirement_candidates(days: int = 30, min_offlines: int = None, now: datetim
     ]
 
 
-def weekly_text(days: int = 7, now: datetime = None) -> str:
+def weekly_text(days: int = 7, now: datetime = None, warehouse: str = None) -> str:
     """Текст недельного отчёта (пустая строка — данных нет)."""
     now = now or datetime.now(WARSAW_TZ)
 
-    top = top_report("week", now)
-    downtime = downtime_report(days, now)
-    candidates = retirement_candidates(days, now=now)
+    top = top_report("week", now, warehouse)
+    downtime = downtime_report(days, now, warehouse)
+    candidates = retirement_candidates(days, now=now, warehouse=warehouse)
 
     if top is None and downtime is None:
         return ""
 
     lines = [
-        f"📊 Weekly report · {WAREHOUSE} · "
+        f"📊 Weekly report · {warehouse or WAREHOUSE} · "
         f"{now.strftime('%d.%m.%Y')}",
     ]
 

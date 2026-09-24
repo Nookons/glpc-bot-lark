@@ -214,15 +214,25 @@ Is the number correct?
 Группа-форум делится по смыслу. В топике ошибок не должно быть ничего, кроме
 ошибок: статусы роботов, статистика и служебные ответы уходят в свои топики.
 
+Бот ведёт **два склада** (`TELEGRAM_WAREHOUSES=glpc=GLP-C,sp3=SMALL-P3`), и у
+каждого свой топик ошибок: ошибка, присланная в топик SP3, записывается как
+ошибка склада `SMALL-P3` (робот ищется в справочнике этого склада), из топика
+GLP-C — как `GLP-C`.
+
 | Топик | Переменная | Что там появляется |
 |---|---|---|
-| **Ex GLPC** | `TELEGRAM_TOPIC_ID` | ошибки сотрудников (текст и фото), подтверждения «✅ Saved / Photo forwarded», подсказка «робота нет в системе» с кнопками, алерт «отправить в обслуживание» |
-| **Robot status** | `TELEGRAM_TOPIC_STATUS` | `/offline`, `/online`, кнопки причин, «Describe the reason», сообщение о смене статуса, `/robot`, `/cancel` |
-| **Stats** | `TELEGRAM_TOPIC_STATS` | `/stats`, `/top`, `/downtime`, `/week`, `/digest` |
+| **Ex GLPC** | `TELEGRAM_TOPIC_ID` | ошибки склада GLP-C: текст и фото, «✅ Saved / Photo forwarded», подсказка «робота нет в системе» с кнопками, алерт «отправить в обслуживание» |
+| **Ex SP3** | `TELEGRAM_TOPIC_ERROR_SP3` | то же самое для склада SMALL-P3 |
+| **Robot status** | `TELEGRAM_TOPIC_STATUS` | `/offline`, `/online`, кнопки причин, «Describe the reason», сообщение о смене статуса, `/robot`, `/cancel`. Склад определяется по самому роботу (номер ищется по обоим складам) |
+| **Stats** | `TELEGRAM_TOPIC_STATS` | `/stats`, `/top`, `/downtime`, `/week`, `/digest`; склад — аргументом (`/stats sp3 day`) или склад топика |
 | **Service** | `TELEGRAM_TOPIC_SERVICE` | `/help`, `/id`, `/topics`, `/reg`, `/whoami`, `/unreg`, «Unknown command», предупреждения бота |
 
-Ошибки бот принимает **только** из топика ошибок (`TELEGRAM_TOPIC_ID`), команды
-работают в любом топике группы.
+Топик ошибок для любого склада задаётся как `TELEGRAM_TOPIC_ERROR_<КЛЮЧ>`
+(например `TELEGRAM_TOPIC_ERROR_SP3`); для склада по умолчанию работает
+историческая `TELEGRAM_TOPIC_ID`.
+
+Ошибки бот принимает **только** из топиков ошибок, команды работают в любом
+топике группы.
 
 **Если команду написали в топике ошибок** (а так делают почти всегда),
 ответ уходит в её топик, а в топике ошибок остаётся короткая подсказка
@@ -236,15 +246,18 @@ Is the number correct?
 
 ### Как настроить
 
-1. Создать в группе топики: `Ex GLPC`, `Robot status`, `Stats`, `Service`.
+1. Создать в группе топики: `Ex GLPC`, `Ex SP3`, `Robot status`, `Stats`,
+   `Service` (бот-админ умеет создавать их сам — `createForumTopic`).
 2. Отправить в каждом топике команду `/id` — бот ответит `message_thread_id`.
 3. Прописать в Railway (Variables):
 
 ```
-TELEGRAM_TOPIC_ID=2            # Ex GLPC — уже настроен
-TELEGRAM_TOPIC_STATUS=14
-TELEGRAM_TOPIC_STATS=15
-TELEGRAM_TOPIC_SERVICE=16
+TELEGRAM_TOPIC_ID=2                  # Ex GLPC (ошибки GLP-C)
+TELEGRAM_TOPIC_ERROR_SP3=318         # Ex SP3 (ошибки SMALL-P3)
+TELEGRAM_TOPIC_STATUS=319            # Robot status
+TELEGRAM_TOPIC_STATS=320             # Stats
+TELEGRAM_TOPIC_SERVICE=321           # Service
+TELEGRAM_WAREHOUSES=glpc=GLP-C,sp3=SMALL-P3
 ```
 
 4. Перезапустить сервис и проверить: `/topics` в любом топике покажет карту,

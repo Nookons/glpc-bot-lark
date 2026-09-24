@@ -1,4 +1,6 @@
 import os
+import time
+
 import requests
 
 from datetime import datetime, timedelta
@@ -661,6 +663,38 @@ def find_best_template(
 # SAVE EXCEPTION
 # ============================================================
 
+_warehouse_ids = {"at": 0.0, "map": {}}
+
+
+def warehouse_id(title: str, fallback=None):
+    """
+    id склада из public.warehouses по названию (кэш 10 минут).
+
+    В `exceptions.warehouse` лежит именно id, а в `exceptions_glpc.warehouse` —
+    название. Раньше в exceptions писался home_warehouse сотрудника, из-за
+    чего ошибка склада SP3, присланная сотрудником GLP-C, попадала не туда.
+    """
+    wanted = str(title or "").strip().casefold()
+
+    if not wanted:
+        return fallback
+
+    now = time.time()
+
+    if not _warehouse_ids["map"] or now - _warehouse_ids["at"] > 600:
+        rows = _rest_get("warehouses", params={"select": "id,title", "limit": "50"})
+
+        if rows is not None:
+            _warehouse_ids["map"] = {
+                str(row.get("title") or "").strip().casefold(): row.get("id")
+                for row in rows
+                if row.get("id") is not None
+            }
+            _warehouse_ids["at"] = now
+
+    return _warehouse_ids["map"].get(wanted, fallback)
+
+
 def queue_missing_robot(
     robot_number,
     employee_card_id=None,
@@ -704,6 +738,7 @@ def send_to_data_base(
     table_lines: dict,
     chat_id: str,
     defer_missing: bool = False,
+    warehouse: str = None,
 ):
     """
     Записывает исключение в Supabase (exceptions + exceptions_glpc).
@@ -714,7 +749,11 @@ def send_to_data_base(
     defer_missing=True — если робота нет в справочнике, ничего не пишем в
     очередь и не отвечаем сотруднику: вызывающий код сначала предложит
     исправить номер (опечатки — частая причина «робота нет в системе»).
+
+    warehouse — склад, к которому относится ошибка (топик в Telegram). По
+    умолчанию — склад бота (WAREHOUSE).
     """
+    warehouse = warehouse or WAREHOUSE
     # ========================================================
     # GET ERROR TEMPLATES
     # ========================================================
@@ -844,7 +883,7 @@ def send_to_data_base(
         params={
             "select": "*",
             "robot_number": f"eq.{int(table_lines['robot'])}",
-            "warehouse": f"eq.{WAREHOUSE}",
+            "warehouse": f"eq.{warehouse}",
             "order": "updated_at.desc",
             "limit": "1",
         },
@@ -885,6 +924,7 @@ def send_to_data_base(
             table_lines["robot"],
             employee_card_id=employee.get("card_id"),
             chat_id=chat_id,
+            warehouse=warehouse,
         )
 
         # Возвращаем маркер: запись в базу невозможна (нет робота), но
@@ -933,7 +973,11 @@ def send_to_data_base(
 
         "shift_type": shift_name,
 
-        "warehouse": employee.get("home_warehouse"),
+        # id склада по названию; home_warehouse — только запасной вариант.
+        "warehouse": warehouse_id(
+            warehouse,
+            fallback=employee.get("home_warehouse"),
+        ),
     }
 
     # ========================================================
@@ -973,7 +1017,7 @@ def send_to_data_base(
 
         "shift_type": shift_name,
 
-        "warehouse": WAREHOUSE,
+        "warehouse": warehouse,
 
         "issue_data": shift_date,
 

@@ -177,13 +177,18 @@ def close_queued_robots() -> dict:
     return {"checked": len(numbers), "closed": closed, "error": False}
 
 
-def queue_stats(days: int = 1) -> dict:
+def queue_stats(days: int = 1, warehouse: str = None) -> dict:
     """
     Сводка по очереди для дайджеста: открыто / новых за сутки / топ номеров.
 
     None-поля означают сбой чтения, а не ноль.
     """
-    open_count = rest_count(QUEUE_TABLE, {"status": "is.false"})
+    base = {"status": "is.false"}
+
+    if warehouse:
+        base["warehouse"] = f"eq.{warehouse}"
+
+    open_count = rest_count(QUEUE_TABLE, base)
 
     since = (
         datetime.now(timezone.utc) - timedelta(days=days)
@@ -191,7 +196,7 @@ def queue_stats(days: int = 1) -> dict:
 
     recent_count = rest_count(
         QUEUE_TABLE,
-        {"status": "is.false", "created_at": f"gte.{since}"},
+        {**base, "created_at": f"gte.{since}"},
     )
 
     # Последние открытые заявки (не только «за сутки»): дайджест показывает
@@ -200,7 +205,7 @@ def queue_stats(days: int = 1) -> dict:
         QUEUE_TABLE,
         params={
             "select": "robot_number,created_at,employee_id",
-            "status": "is.false",
+            **base,
             "order": "created_at.desc",
             "limit": "200",
         },
