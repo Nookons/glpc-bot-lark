@@ -193,33 +193,6 @@ TOPIC_TITLES = {
     "service": "Service",
 }
 
-# В топике ошибок — только ошибки: ответы на команды уходят в свой топик.
-ERROR_TOPIC_STRICT = _env_bool("TELEGRAM_ERROR_TOPIC_STRICT", True)
-
-# Короткая самоудаляющаяся подсказка «ответ в другом топике»: без неё
-# сотрудник, написавший /offline в топике ошибок, не поймёт, куда пропал ответ.
-MOVED_HINT = _env_bool("TELEGRAM_MOVED_HINT", True)
-
-# К какому топику относится ответ на команду.
-COMMAND_TOPICS = {
-    "start": "service",
-    "help": "service",
-    "id": "service",
-    "topics": "service",
-    "reg": "service",
-    "unreg": "service",
-    "whoami": "service",
-    "cancel": "status",
-    "offline": "status",
-    "online": "status",
-    "robot": "status",
-    "stats": "stats",
-    "top": "stats",
-    "downtime": "stats",
-    "week": "stats",
-    "digest": "stats",
-}
-
 # Через сколько секунд удалять свои служебные подтверждения
 # («сохранено», «фото переслано»). 0 — не удалять.
 CONFIRM_TTL_SECONDS = _env_int("TELEGRAM_CONFIRM_TTL", 10)
@@ -760,83 +733,55 @@ def topic_title(kind: str, chat_id=None) -> str:
     return TOPIC_TITLES.get(kind, kind)
 
 
-_reply_kind = threading.local()
+_origin_thread = threading.local()
+
+
+def set_origin_thread(chat_id, thread_id):
+    """
+    Запоминает топик, из которого пришло текущее сообщение.
+
+    Ответы уходят ТОЛЬКО туда: бот не отвечает в других топиках и ничего по
+    ним не раскидывает.
+    """
+    _origin_thread.value = (int(chat_id), thread_id)
+
+
+_reply_override = threading.local()
 
 
 @contextlib.contextmanager
-def reply_kind(kind: str):
+def reply_thread(thread_id):
     """
-    Контекст: сообщения внутри блока относятся к топику `kind`.
+    Контекст: сообщения блока уходят в указанный топик.
 
-    Нужен, чтобы не протаскивать параметр через каждый обработчик: команда
-    целиком выполняется внутри своего вида топика.
+    Нужен фоновым досылам (фото, подсказка по номеру): они работают вне
+    апдейта, но обязаны ответить в тот топик, откуда пришло сообщение.
     """
-    previous = getattr(_reply_kind, "value", None)
-    _reply_kind.value = kind
+    previous = getattr(_reply_override, "value", None)
+    _reply_override.value = thread_id
 
     try:
-        yield kind
+        yield thread_id
     finally:
-        _reply_kind.value = previous
+        _reply_override.value = previous
 
 
-def current_reply_kind():
-    return getattr(_reply_kind, "value", None)
+def _reply_thread(chat_id, thread_id=None):
+    """Топик для ответа: явно заданный, топик текущего сообщения или последний."""
+    if thread_id is not None:
+        return thread_id
 
+    override = getattr(_reply_override, "value", None)
 
-def _hint_moved(chat_id, kind: str, origin_thread=None) -> bool:
-    """
-    Короткая самоудаляющаяся подсказка «ответ в другом топике».
+    if override is not None:
+        return override
 
-    Нужна, когда сотрудник пишет в топик ошибок, а ответ по правилам уходит
-    в другой топик: без подсказки выглядит так, будто бот не ответил.
-    """
-    if not MOVED_HINT or not kind or kind == "error":
-        return False
+    origin = getattr(_origin_thread, "value", None)
 
-    origin = _route_thread(chat_id) if origin_thread is None else origin_thread
-    target = _reply_thread(chat_id, kind)
+    if origin and origin[0] == int(chat_id) and origin[1] is not None:
+        return origin[1]
 
-    if origin is None or target is None or int(origin) == int(target):
-        return False
-
-    _send(
-        chat_id,
-        f"➡️ The answer is in the {TOPIC_TITLES.get(kind, kind)} topic.",
-        thread_id=origin,
-        delete_after=CONFIRM_TTL_SECONDS,
-    )
-
-    return True
-
-
-def _reply_thread(chat_id, kind: str = None):
-    """
-    Куда отправлять сообщение вида `kind`.
-
-    По умолчанию — туда, откуда пришло сообщение (как раньше). Исключение:
-    топик ошибок. В нём по условию только ошибки, поэтому ответы на команды
-    уходят в свой топик (status/stats/service), а если он не настроен — в
-    служебный, и лишь в крайнем случае остаются на месте.
-    """
-    origin = _route_thread(chat_id)
-
-    if not kind or not ERROR_TOPIC_STRICT:
-        return origin
-
-    error_thread = topic_thread("error", chat_id)
-
-    if error_thread is None or origin is None:
-        return origin
-
-    if int(origin) != int(error_thread):
-        return origin
-
-    return (
-        topic_thread(kind, chat_id)
-        or topic_thread("service", chat_id)
-        or origin
-    )
+    return _route_thread(chat_id)
 
 
 def is_shared_topic(chat_id, thread_id) -> bool:
@@ -918,14 +863,10 @@ def _send(
     disable_notification=False,
     delete_after: int = None,
     reply_markup: dict = None,
-    kind: str = None,
 ):
     """
-    Отправка с автоопределением топика: ответ уходит в тот же топик,
+    Отправка с автоопределением топика: ответ уходит только в тот топик,
     откуда пришло сообщение (для форум-групп).
-
-    kind — к какому топику относится сообщение ("error", "status", "stats",
-    "service"). В топике ошибок не-ошибочные ответы уходят в свой топик.
 
     Если в этот топик отправить нельзя (например, General закрыт —
     Telegram отвечает TOPIC_CLOSED), повторяем в отслеживаемый топик,
@@ -933,11 +874,8 @@ def _send(
 
     delete_after — через сколько секунд удалить это сообщение (0/None — не удалять).
     """
-    if kind is None:
-        kind = current_reply_kind()
-
     if thread_id is None:
-        thread_id = _reply_thread(chat_id, kind)
+        thread_id = _reply_thread(chat_id)
 
     result = tg.send_message(
         chat_id,
@@ -1352,6 +1290,76 @@ def find_robot_in_warehouse(number, warehouse: str = None, strict: bool = True):
     return robot, title
 
 
+def find_robot_matches(number, strict: bool = True):
+    """
+    Все склады, где есть робот с таким номером.
+
+    Каждый склад проверяется отдельно — чужой робот не подставляется, просто
+    возвращаются все совпадения: [(склад, робот), ...]. Если номер есть на
+    двух складах, вызывающий код спрашивает сотрудника кнопками.
+
+    StatusUnavailable — база недоступна (это не «робота нет»).
+    """
+    matches = []
+
+    for title in WAREHOUSES.values():
+        robot = robot_status.find_robot(number, warehouse=title, strict=strict)
+
+        if robot:
+            matches.append((title, robot))
+
+    return matches
+
+
+def warehouse_keyboard(action: str, number, titles):
+    """Кнопки выбора склада: номер есть и там, и там."""
+    rows = [
+        [{
+            "text": f"🏭 {title}",
+            "callback_data": f"w:{action}:{warehouse_key(title)}:{number}",
+        }]
+        for title in titles
+    ]
+
+    rows.append([{"text": "✖️ Cancel", "callback_data": "w:cancel:-:0"}])
+
+    return {"inline_keyboard": rows}
+
+
+def _ask_warehouse(chat_id, action: str, number, titles, reply_to=None):
+    """Спрашивает склад, если номер есть на нескольких складах."""
+    _send(
+        chat_id,
+        f"🤖 Robot {number} is in {len(titles)} warehouses: "
+        f"{', '.join(titles)}.\nWhich one?",
+        reply_to_message_id=reply_to,
+        reply_markup=warehouse_keyboard(action, number, titles),
+    )
+
+
+def _show_robot_card(chat_id, number, warehouse, reply_to=None) -> bool:
+    """Карточка робота конкретного склада. False — база недоступна."""
+    card = robot_card.robot_card(number, warehouse=warehouse)
+
+    if card is None:
+        _send(
+            chat_id,
+            DB_UNAVAILABLE_HINT,
+            reply_to_message_id=reply_to,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return False
+
+    text = robot_card.format_robot_card(card)
+
+    if not card.get("found"):
+        text += _warehouse_hint("robot", warehouse)
+
+    _send(chat_id, text, reply_to_message_id=reply_to)
+
+    return True
+
+
 def _warehouse_hint(command: str, title: str) -> str:
     """Подсказка, как повторить команду для другого склада."""
     others = [key for key, name in WAREHOUSES.items() if name != title]
@@ -1367,8 +1375,8 @@ def _warehouse_hint(command: str, title: str) -> str:
 
 def _handle_status_command(chat_id, sender, direction, args, message_id):
     """/offline или /online: показываем робота и кнопки причин."""
-    warehouse, args = warehouse_from_args(args)
-    warehouse = warehouse or current_warehouse()
+    explicit_warehouse, args = warehouse_from_args(args)
+    warehouse = explicit_warehouse or current_warehouse()
 
     employee, db_error = _lookup_employee(chat_id, sender, message_id)
 
@@ -1386,9 +1394,13 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     robot_number = args.split()[0]
 
     try:
-        robot, robot_warehouse = find_robot_in_warehouse(
-            robot_number, warehouse
-        )
+        if explicit_warehouse:
+            robot, robot_warehouse = find_robot_in_warehouse(
+                robot_number, warehouse
+            )
+            matches = [(robot_warehouse, robot)] if robot else []
+        else:
+            matches = find_robot_matches(robot_number)
     except robot_status.StatusUnavailable:
         _send(
             chat_id,
@@ -1397,15 +1409,24 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         )
         return
 
-    spec = robot_status.DIRECTIONS[direction]
-
-    if not robot:
+    if not matches:
         _send(
             chat_id,
-            f"⚠️ Robot {robot_number} not found in {robot_warehouse}."
-            + _warehouse_hint(direction, robot_warehouse),
+            f"⚠️ Robot {robot_number} not found in "
+            f"{' or '.join(WAREHOUSES.values())}."
+            + _warehouse_hint(direction, warehouse),
         )
         return
+
+    if len(matches) > 1:
+        # Номер есть на нескольких складах: выбирает сотрудник, а не бот.
+        _ask_warehouse(
+            chat_id, direction, robot_number, [title for title, _ in matches]
+        )
+        return
+
+    robot_warehouse, robot = matches[0]
+    spec = robot_status.DIRECTIONS[direction]
 
     if robot_status.is_in_status(robot, direction):
         other = "online" if direction == "offline" else "offline"
@@ -1418,13 +1439,18 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
         )
         return
 
-    # Команду сотрудника бот удалит, поэтому подсказку шлём отдельным
-    # сообщением без reply-привязки.
+    start_status_flow(chat_id, direction, robot, robot_warehouse)
+
+
+def start_status_flow(chat_id, direction: str, robot: dict, warehouse: str = None):
+    """Показывает робота и кнопки причин (команду сотрудника бот удалит)."""
+    spec = robot_status.DIRECTIONS[direction]
+
     _send(
         chat_id,
         f"{spec['emoji']} Robot {robot.get('robot_number')} · "
         f"{robot.get('robot_type') or '-'} · "
-        f"{robot.get('warehouse') or robot_warehouse or WAREHOUSE}\n"
+        f"{robot.get('warehouse') or warehouse or WAREHOUSE}\n"
         f"Status: {robot.get('status')} → {spec['new_status']}\n"
         "\n"
         "Choose the reason:",
@@ -1467,6 +1493,10 @@ def handle_status_callback(callback: dict):
 
     if parts and parts[0] == "rf":
         _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id)
+        return
+
+    if parts and parts[0] == "w":
+        _handle_warehouse_choice(chat_id, sender, parts, message_id, callback_id)
         return
 
     if len(parts) != 4 or parts[0] != "st":
@@ -1741,6 +1771,7 @@ def put_pending_photo(
     message_id,
     caption=None,
     warehouse=None,
+    thread_id=None,
 ):
     """Запоминаем фото, к которому ещё может прийти текст ошибки."""
     with _photo_lock:
@@ -1748,9 +1779,10 @@ def put_pending_photo(
             "path": path,
             "message_id": message_id,
             "caption": caption or "",
-            # Склад нужен уборщику: он пересылает фото вне апдейта, когда
-            # контекста топика уже нет.
+            # Склад и топик нужны уборщику: он пересылает фото вне апдейта,
+            # когда контекста уже нет.
             "warehouse": warehouse or current_warehouse(),
+            "thread_id": _reply_thread(chat_id, thread_id),
             "expires": time.time() + PHOTO_HOLD_SECONDS,
         }
 
@@ -1845,11 +1877,15 @@ def store_photo_for_record(saved, photo_path):
 
 def flush_pending_photo(chat_id, user_id, data):
     """Фото осталось без текста ошибки — пересылаем его отдельно."""
-    with reply_kind("error"):
-        return _flush_pending_photo_inner(chat_id, user_id, data)
+    return _flush_pending_photo_inner(chat_id, user_id, data)
 
 
 def _flush_pending_photo_inner(chat_id, user_id, data):
+    with reply_thread(data.get("thread_id")):
+        return _flush_pending_photo_locked(chat_id, user_id, data)
+
+
+def _flush_pending_photo_locked(chat_id, user_id, data):
     employee_name = get_employee_name(user_id)
 
     if employee_name:
@@ -2132,21 +2168,8 @@ def _handle_stats(chat_id, args, reply_to):
 
 
 def _handle_command(chat_id, sender, command, args, reply_to, chat=None) -> bool:
-    """
-    Обрабатывает команду. True, если команда распознана.
-
-    Вид топика берётся из COMMAND_TOPICS: в топике ошибок ответы на команды
-    не появляются — они уходят в свой топик (статусы/статистика/служебный).
-    """
-    kind = COMMAND_TOPICS.get(command, "service")
-
-    if command in STATUS_DIRECTIONS:
-        kind = "status"
-
-    with reply_kind(kind):
-        return _handle_command_inner(
-            chat_id, sender, command, args, reply_to, chat
-        )
+    """Обрабатывает команду. True, если команда распознана."""
+    return _handle_command_inner(chat_id, sender, command, args, reply_to, chat)
 
 
 def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -> bool:
@@ -2305,16 +2328,17 @@ def flush_expired_robot_fixes() -> int:
 
     for _key, data in due:
         try:
-            _complete_missing_robot(
-                data["chat_id"],
-                data["sender"],
-                data["employee_name"],
-                data["parsed"],
-                data.get("photo_path"),
-                data.get("employee_card_id"),
-                prompt_message_id=data.get("prompt_message_id"),
-                warehouse=data.get("warehouse"),
-            )
+            with reply_thread(data.get("thread_id")):
+                _complete_missing_robot(
+                    data["chat_id"],
+                    data["sender"],
+                    data["employee_name"],
+                    data["parsed"],
+                    data.get("photo_path"),
+                    data.get("employee_card_id"),
+                    prompt_message_id=data.get("prompt_message_id"),
+                    warehouse=data.get("warehouse"),
+                )
         except Exception:
             logger.exception(
                 "Не удалось дослать ошибку по неизвестному роботу #%s",
@@ -2366,9 +2390,10 @@ def _ask_robot_fix(
         "photo_path": photo_path,
         "employee_card_id": employee_card_id,
         "prompt_message_id": prompt_message_id,
-        # Склад: досыл по TTL идёт из фонового потока, где контекста топика
-        # уже нет, а запись обязана уйти на свой склад.
+        # Склад и топик: досыл по TTL идёт из фонового потока, где контекста
+        # уже нет, а запись обязана уйти на свой склад и в свой топик.
         "warehouse": current_warehouse(),
+        "thread_id": _reply_thread(chat_id),
     })
 
     logger.info(
@@ -2550,7 +2575,7 @@ def _handle_topics(chat_id, reply_to):
 
     lines.append("")
     lines.append(
-        "Strict error topic: " + ("on" if ERROR_TOPIC_STRICT else "off")
+        "Answers always go to the topic the message came from."
     )
     lines.append(
         "Send /id in a topic to learn its id, then set "
@@ -2652,10 +2677,85 @@ def _handle_digest(chat_id, reply_to):
     )
 
 
+def _handle_warehouse_choice(chat_id, sender, parts, message_id, callback_id):
+    """Нажатие кнопки выбора склада: номер есть на нескольких складах."""
+    if len(parts) != 4:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Unknown action")
+
+        return
+
+    _, action, key, number = parts
+
+    if action == "cancel":
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Cancelled")
+
+        _delete_quiet(chat_id, message_id)
+        return
+
+    title = WAREHOUSES.get(key)
+
+    if not title:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Unknown warehouse")
+
+        return
+
+    if action == "robot":
+        if callback_id:
+            tg.answer_callback_query(callback_id, title)
+
+        _show_robot_card(chat_id, number, title)
+        _delete_quiet(chat_id, message_id)
+        return
+
+    if action not in STATUS_DIRECTIONS:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Unknown action")
+
+        return
+
+    employee, db_error = _lookup_employee(chat_id, sender, message_id)
+
+    if db_error or not employee:
+        if callback_id:
+            tg.answer_callback_query(
+                callback_id,
+                "Database unavailable" if db_error else "Register first: /reg",
+            )
+
+        _delete_quiet(chat_id, message_id)
+        return
+
+    try:
+        robot = robot_status.find_robot(number, warehouse=title, strict=True)
+    except robot_status.StatusUnavailable:
+        if callback_id:
+            tg.answer_callback_query(
+                callback_id, "Database unavailable — try again in a minute"
+            )
+
+        return
+
+    if not robot:
+        if callback_id:
+            tg.answer_callback_query(callback_id, f"Not found in {title}")
+
+        _delete_quiet(chat_id, message_id)
+        return
+
+    if callback_id:
+        tg.answer_callback_query(callback_id, title)
+
+    start_status_flow(chat_id, action, robot, title)
+    _delete_quiet(chat_id, message_id)
+
+
 def _handle_robot(chat_id, args, reply_to):
     """Карточка робота: /robot [склад] <номер>."""
-    warehouse, rest = warehouse_from_args(args)
-    warehouse = warehouse or current_warehouse()
+    explicit, rest = warehouse_from_args(args)
+    warehouse = explicit or current_warehouse()
 
     rest = (rest or "").strip()
     keys = "|".join(WAREHOUSES)
@@ -2680,9 +2780,13 @@ def _handle_robot(chat_id, args, reply_to):
         )
         return
 
-    card = robot_card.robot_card(number, warehouse=warehouse)
+    if explicit:
+        _show_robot_card(chat_id, number, warehouse, reply_to)
+        return
 
-    if card is None:
+    try:
+        matches = find_robot_matches(number)
+    except robot_status.StatusUnavailable:
         _send(
             chat_id,
             DB_UNAVAILABLE_HINT,
@@ -2691,12 +2795,19 @@ def _handle_robot(chat_id, args, reply_to):
         )
         return
 
-    text = robot_card.format_robot_card(card)
+    if len(matches) > 1:
+        # Номер есть на нескольких складах: пусть выберет сотрудник.
+        _ask_warehouse(
+            chat_id, "robot", number, [title for title, _ in matches], reply_to
+        )
+        return
 
-    if not card.get("found"):
-        text += _warehouse_hint("robot", warehouse)
-
-    _send(chat_id, text, reply_to_message_id=reply_to)
+    _show_robot_card(
+        chat_id,
+        number,
+        matches[0][0] if matches else warehouse,
+        reply_to,
+    )
 
 
 def handle_error_text(chat_id, sender, text, message_id):
@@ -3073,6 +3184,7 @@ def handle_photo(chat_id, sender, message, message_id):
         message_id,
         caption,
         current_warehouse(),
+        _reply_thread(chat_id),
     )
 
     _send(
@@ -3193,6 +3305,9 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     # Склад сообщения: топик ошибок GLP-C -> GLP-C, топик ошибок SP3 -> SMALL-P3.
     # В общих топиках — склад по умолчанию (его можно переопределить в команде).
     set_current_warehouse(warehouse_for_thread(chat_id, thread_id))
+
+    # Ответ уходит только в этот топик — никуда больше.
+    set_origin_thread(chat_id, thread_id)
 
     text = message.get("text")
     caption = message.get("caption")
@@ -3322,15 +3437,6 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         # reply_to не передаём: команду бот сразу удалит, и ответ «в ответ
         # на удалённое сообщение» выглядел бы сломанным.
         if _handle_command(chat_id, sender, normalized, args, None, chat):
-            # Если ответ ушёл в другой топик (в топике ошибок только ошибки),
-            # коротко и самоудаляемо говорим об этом там, где спросили.
-            _hint_moved(
-                chat_id,
-                COMMAND_TOPICS.get(
-                    normalized,
-                    "status" if normalized in STATUS_DIRECTIONS else "service",
-                ),
-            )
             # Команда отработана — затираем её, чтобы чат не зарастал.
             _delete_user_message(chat_id, message_id)
             return
@@ -3348,8 +3454,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
                 "Send /help to see the available commands."
             )
 
-        with reply_kind("service"):
-            _send(chat_id, hint)
+        _send(chat_id, hint)
 
         _delete_user_message(chat_id, message_id)
         return
@@ -3364,11 +3469,9 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             text[:80],
         )
 
-        with reply_kind("status"):
-            changed = finish_status_change(
-                chat_id, sender, text, message_id, pending
-            )
-            _hint_moved(chat_id, "status")
+        changed = finish_status_change(
+            chat_id, sender, text, message_id, pending
+        )
 
         if changed:
             # Описание причины бот забирает себе — но только если статус

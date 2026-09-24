@@ -158,7 +158,18 @@ def fake_get_employee(telegram_id, strict=False):
 
 
 def fake_find_robot(robot_number, warehouse=None, strict=False):
-    return ROBOTS.get(str(robot_number).strip().lstrip("#"))
+    robot = ROBOTS.get(str(robot_number).strip().lstrip("#"))
+
+    if not robot or warehouse is None:
+        return robot
+
+    own = robot.get("warehouse")
+
+    # Робот принадлежит своему складу: для чужого склада его нет.
+    if own and own != warehouse:
+        return None
+
+    return robot
 
 
 def fake_find_robot_by_id(robot_id, strict=False):
@@ -5321,8 +5332,8 @@ def test_topic_map_and_resolution():
         bot._topic_names.update(original_names)
 
 
-def test_error_topic_keeps_only_errors():
-    """В топике ошибок — только ошибки: команды отвечают в своих топиках."""
+def test_answers_stay_in_origin_topic():
+    """Бот отвечает только в том топике, откуда пришло сообщение."""
     LINKS[100] = "Ivan Petrenko"
     ROBOTS.clear()
     ROBOTS["3783"] = _robot()
@@ -5330,153 +5341,104 @@ def test_error_topic_keeps_only_errors():
     original = (
         dict(bot.TOPIC_RAW),
         bot.TELEGRAM_TOPIC_ID,
-        bot.ERROR_TOPIC_STRICT,
-        bot.MOVED_HINT,
         bot.DELETE_USER_MESSAGES,
         bot.shift_metrics,
-        bot.robot_card.robot_card,
     )
     original_names = dict(bot._topic_names)
 
-    bot.TOPIC_RAW = {"error": "2", "status": "14", "stats": "15", "service": "16"}
-    bot.TELEGRAM_TOPIC_ID = 2
-    bot.ERROR_TOPIC_STRICT = True
-    bot.MOVED_HINT = True
-    bot.DELETE_USER_MESSAGES = True
-    bot.shift_metrics = lambda shift_date, shift_name: None
-    bot.robot_card.robot_card = lambda number, warehouse=None: {
-        "found": True,
-        "number": str(number),
-        "robot": {"robot_number": number, "robot_type": "RT", "status": "在线 | Online",
-                  "warehouse": "GLP-C"},
-        "errors_available": True,
-        "errors": 0,
-        "reporters": [],
-        "last_issues": [],
-        "history": [],
+    bot.TOPIC_RAW = {
+        "error": "2",
+        "error:SMALL-P3": "318",
+        "status": "319",
+        "stats": "320",
+        "service": "321",
     }
+    bot.TELEGRAM_TOPIC_ID = 2
+    bot.DELETE_USER_MESSAGES = True
+    bot.shift_metrics = lambda shift_date, shift_name, warehouse=None: None
+
+    def only_topics(sent, expected):
+        return sent and all(item["thread_id"] == expected for item in sent)
 
     try:
-        # 1) /stats из топика ошибок -> ответ в топике статистики
+        # команда из топика ошибок — ответ там же
         sent = run(make_update(text="/stats", message_id=9801, thread_id=2))
 
         check(
-            "topics: /stats из топика ошибок отвечает в топике статистики",
-            sent and sent[0]["thread_id"] == 15,
+            "origin: /stats из топика ошибок отвечает там же",
+            only_topics(sent, 2),
             [item["thread_id"] for item in sent],
         )
         check(
-            "topics: там же короткая подсказка, куда ушёл ответ",
-            any(
-                "The answer is in the Stats topic" in item["text"]
-                and item["thread_id"] == 2
-                for item in sent
-            ),
+            "origin: подсказок про другой топик нет",
+            not any("The answer is in the" in item["text"] for item in sent),
             sent,
         )
 
-        # 2) /help из топика ошибок -> служебный топик
-        sent = run(make_update(text="/help", message_id=9802, thread_id=2))
+        # команда из топика статистики — там же
+        sent = run(make_update(text="/stats", message_id=9802, thread_id=320))
 
         check(
-            "topics: /help отвечает в служебном топике",
-            any(item["thread_id"] == 16 for item in sent),
+            "origin: /stats из топика статистики отвечает там же",
+            only_topics(sent, 320),
             [item["thread_id"] for item in sent],
         )
+
+        # команда из служебного — там же
+        sent = run(make_update(text="/help", message_id=9803, thread_id=321))
+
         check(
-            "topics: помощь не попадает в топик ошибок",
-            all(item["thread_id"] != 2 for item in sent if "Robot exception bot" in item["text"]),
-            sent,
+            "origin: /help отвечает в служебном топике",
+            only_topics(sent, 321),
+            [item["thread_id"] for item in sent],
         )
 
-        # 3) /offline из топика ошибок -> флоу целиком в топике статусов
-        sent = run(make_update(text="/offline 3783", message_id=9803, thread_id=2))
+        # /offline из топика статусов — весь флоу там же
+        sent = run(make_update(text="/offline 3783", message_id=9804, thread_id=319))
         prompt = [item for item in sent if item.get("reply_markup")]
 
         check(
-            "topics: кнопки причин уходят в топик статусов",
-            prompt and prompt[0]["thread_id"] == 14,
+            "origin: кнопки причин в топике запроса",
+            prompt and prompt[0]["thread_id"] == 319,
             [(item["thread_id"], bool(item.get("reply_markup"))) for item in sent],
         )
         check(
-            "topics: подсказка про перенос есть в топике ошибок",
-            any(item["thread_id"] == 2 and "Robot status topic" in item["text"] for item in sent),
-            sent,
+            "origin: ни одного сообщения в другие топики",
+            only_topics(sent, 319),
+            [item["thread_id"] for item in sent],
         )
 
-        # 4) ошибка из топика ошибок -> всё остаётся там же, без подсказок
+        # ошибка из топика ошибок — там же
         sent = run(make_update(
             text="Unable to drive: Security module failure. 3780",
-            message_id=9804,
+            message_id=9805,
             thread_id=2,
         ))
 
         check(
-            "topics: ошибка остаётся в топике ошибок",
-            sent and all(item["thread_id"] == 2 for item in sent),
-            [item["thread_id"] for item in sent],
-        )
-        check(
-            "topics: для ошибок подсказок про перенос нет",
-            not any("The answer is in the" in item["text"] for item in sent),
-            sent,
-        )
-
-        # 5) команда из своего топика остаётся в нём
-        sent = run(make_update(text="/stats", message_id=9805, thread_id=15))
-
-        check(
-            "topics: /stats из топика статистики остаётся там",
-            sent and sent[0]["thread_id"] == 15,
-            [item["thread_id"] for item in sent],
-        )
-        check(
-            "topics: без переноса подсказки нет",
-            not any("The answer is in the" in item["text"] for item in sent),
-            sent,
-        )
-
-        # 6) строгий режим выключен -> отвечаем там, где спросили
-        bot.ERROR_TOPIC_STRICT = False
-        sent = run(make_update(text="/stats", message_id=9806, thread_id=2))
-
-        check(
-            "topics: strict=off — ответ остаётся в топике ошибок",
-            sent and sent[0]["thread_id"] == 2,
+            "origin: ошибка обрабатывается в своём топике",
+            only_topics(sent, 2),
             [item["thread_id"] for item in sent],
         )
 
-        bot.ERROR_TOPIC_STRICT = True
-
-        # 7) топик статусов не настроен -> падаем в служебный
-        bot.TOPIC_RAW = {**bot.TOPIC_RAW, "status": ""}
-        sent = run(make_update(text="/offline 3783", message_id=9807, thread_id=2))
-        prompt = [item for item in sent if item.get("reply_markup")]
-
-        check(
-            "topics: без топика статусов ответ уходит в служебный",
-            prompt and prompt[0]["thread_id"] == 16,
-            [(item["thread_id"], bool(item.get("reply_markup"))) for item in sent],
-        )
-
-        # 8) не настроено ничего -> отвечаем в топике-источнике (как раньше)
-        bot.TOPIC_RAW = {"error": "", "status": "", "stats": "", "service": ""}
-        sent = run(make_update(text="/stats", message_id=9808, thread_id=2))
+        # сообщение из топика ошибок SP3 — ответ там же
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 5016",
+            message_id=9806,
+            thread_id=318,
+        ))
 
         check(
-            "topics: ничего не настроено — поведение как раньше",
-            sent and sent[0]["thread_id"] == 2,
+            "origin: топик ошибок SP3 отвечает у себя",
+            only_topics(sent, 318),
             [item["thread_id"] for item in sent],
         )
     finally:
         (
             bot.TOPIC_RAW,
             bot.TELEGRAM_TOPIC_ID,
-            bot.ERROR_TOPIC_STRICT,
-            bot.MOVED_HINT,
             bot.DELETE_USER_MESSAGES,
             bot.shift_metrics,
-            bot.robot_card.robot_card,
         ) = original
         bot._topic_names.clear()
         bot._topic_names.update(original_names)
@@ -5520,6 +5482,11 @@ def test_topics_command():
     check(
         "topics: видно, где читаются ошибки",
         "Errors are read from these topics:" in text,
+        text,
+    )
+    check(
+        "topics: сказано, что ответы уходят в топик-источник",
+        "Answers always go to the topic the message came from." in text,
         text,
     )
     check(
@@ -5570,8 +5537,6 @@ def test_two_warehouses_strict_lookup():
     original = (
         dict(bot.TOPIC_RAW),
         bot.TELEGRAM_TOPIC_ID,
-        bot.ERROR_TOPIC_STRICT,
-        bot.MOVED_HINT,
     )
     original_names = dict(bot._topic_names)
     original_find = robot_status.find_robot
@@ -5587,8 +5552,6 @@ def test_two_warehouses_strict_lookup():
         "service": "321",
     }
     bot.TELEGRAM_TOPIC_ID = 2
-    bot.ERROR_TOPIC_STRICT = True
-    bot.MOVED_HINT = True
     bot._topic_names.clear()
 
     # #123 есть на ДВУХ складах — бот обязан брать робота своего склада.
@@ -5662,21 +5625,23 @@ def test_two_warehouses_strict_lookup():
             DB_CALLS[-1] if DB_CALLS else None,
         )
 
-        # 3) чужой склад не подставляется: SP3-робот из общего топика не найден
+        # 3) робот есть только на SP3 — находится и работает без лишних вопросов
         sent = run(make_update(text="/offline 5016", message_id=10003, thread_id=319))
+        prompt = [item for item in sent if item.get("reply_markup")]
+        markup = json.dumps(prompt[0]["reply_markup"], ensure_ascii=False) if prompt else ""
 
         check(
-            "warehouse: SP3-робот не подставляется в GLP-C",
-            sent and "not found in GLP-C" in sent[0]["text"],
-            sent,
+            "warehouse: единственный склад — сразу кнопки причин",
+            prompt and "5016" in prompt[0]["text"] and "SMALL-P3" in prompt[0]["text"],
+            prompt,
         )
         check(
-            "warehouse: подсказан способ указать склад",
-            sent and "/offline sp3" in sent[0]["text"],
-            sent,
+            "warehouse: выбора склада нет, когда он один",
+            "w:offline" not in markup,
+            markup[:120],
         )
 
-        # 4) тот же робот со явным складом — находится
+        # 4) явный склад работает как раньше
         sent = run(make_update(text="/offline sp3 5016", message_id=10004, thread_id=319))
         prompt = [item for item in sent if item.get("reply_markup")]
 
@@ -5686,20 +5651,53 @@ def test_two_warehouses_strict_lookup():
             prompt,
         )
 
-        # 5) тот же номер на двух складах — берём робота склада контекста
+        # 5) номер есть на двух складах — бот спрашивает кнопками
         sent = run(make_update(text="/offline 123", message_id=10005, thread_id=319))
+        ask = [item for item in sent if item.get("reply_markup")]
 
         check(
-            "warehouse: дубль номера — робот склада контекста (GLP-C)",
-            sent and "GLP-C" in sent[0]["text"] and "SMALL-P3" not in sent[0]["text"],
+            "warehouse: дубль номера — вопрос с кнопками",
+            ask and "2 warehouses" in ask[0]["text"],
             sent,
         )
-
-        sent = run(make_update(text="/offline sp3 123", message_id=10006, thread_id=319))
+        markup = json.dumps(ask[0]["reply_markup"], ensure_ascii=False) if ask else ""
 
         check(
-            "warehouse: дубль номера — робот SP3 при явном складе",
-            sent and "SMALL-P3" in sent[0]["text"],
+            "warehouse: в кнопках оба склада",
+            "w:offline:glpc:123" in markup and "w:offline:sp3:123" in markup,
+            markup,
+        )
+
+        # выбор GLP-C -> кнопки причин для робота GLP-C
+        SENT.clear()
+        run(make_callback("w:offline:glpc:123", message_id=1, thread_id=319))
+        chosen = [item for item in SENT if item.get("reply_markup")]
+
+        check(
+            "warehouse: после выбора GLP-C показаны причины",
+            chosen and "GLP-C" in chosen[0]["text"]
+            and "st:offline:101:" in json.dumps(chosen[0]["reply_markup"]),
+            chosen,
+        )
+
+        # выбор SP3 -> робот SP3
+        SENT.clear()
+        run(make_callback("w:offline:sp3:123", message_id=1, thread_id=319))
+        chosen = [item for item in SENT if item.get("reply_markup")]
+
+        check(
+            "warehouse: после выбора SMALL-P3 показаны причины",
+            chosen and "SMALL-P3" in chosen[0]["text"]
+            and "st:offline:201:" in json.dumps(chosen[0]["reply_markup"]),
+            chosen,
+        )
+
+        # 6) робота нет нигде — подсказка про другой склад
+        sent = run(make_update(text="/offline 99999", message_id=10009, thread_id=319))
+
+        check(
+            "warehouse: ненайденный робот перечисляет склады",
+            sent and "not found in GLP-C or SMALL-P3" in sent[0]["text"],
             sent,
         )
 
@@ -5733,12 +5731,7 @@ def test_two_warehouses_strict_lookup():
             cards,
         )
     finally:
-        (
-            bot.TOPIC_RAW,
-            bot.TELEGRAM_TOPIC_ID,
-            bot.ERROR_TOPIC_STRICT,
-            bot.MOVED_HINT,
-        ) = original
+        (bot.TOPIC_RAW, bot.TELEGRAM_TOPIC_ID) = original
         robot_status.find_robot = original_find
         robot_status.find_robot_by_id = original_find_by_id
         robot_status.change_robot_status = original_change
@@ -6048,6 +6041,120 @@ def test_no_spam_for_non_text_messages():
         sent,
     )
 
+def test_background_flush_keeps_topic():
+    """Фоновые досылки (фото, подсказка по номеру) отвечают в свой топик."""
+    LINKS[100] = "Ivan Petrenko"
+
+    import sendToDataBase as stdb
+
+    def fake_queue_notifies(robot_number, employee_card_id=None, chat_id=None,
+                            notify=True, warehouse=None):
+        """Как настоящий queue_missing_robot: ставит в очередь и уведомляет."""
+        if notify and chat_id is not None:
+            stdb.notify_user(
+                chat_id,
+                f"⚠️ Robot #{robot_number} is not in the system.",
+            )
+
+        return True
+
+    # Нотификатор как в main(): ответы пользователю идут через _send в Telegram.
+    stdb.set_notifier(lambda chat_id, text: bot._send(chat_id, text))
+
+    # Другие тесты подменяют send_message своими заглушками и восстанавливают
+    # «как было» — возвращаем общий фейк явно.
+    original_tg_send = tg.send_message
+    tg.send_message = fake_send_message
+
+    original_send = bot.send_photo
+    original_queue = bot.queue_missing_robot
+    original_raw = dict(bot.TOPIC_RAW)
+    original_names = dict(bot._topic_names)
+    t_notifier = stdb._notifier
+
+    bot.TOPIC_RAW = {
+        "error": "2",
+        "error:SMALL-P3": "318",
+        "status": "319",
+        "stats": "320",
+        "service": "321",
+    }
+
+    bot.send_photo = lambda path, caption=None, console=None, warehouse=None: {
+        "mode": "lark",
+        "url": None,
+    }
+
+    try:
+        # фото пришло в топик SP3 (318), ждёт текст, но текст не пришёл
+        bot.set_origin_thread(-500, 318)
+        bot.put_pending_photo(
+            -500, 100, "x.jpg", 1, "cap",
+            warehouse="SMALL-P3",
+            thread_id=bot._reply_thread(-500),
+        )
+
+        with bot._photo_lock:
+            stored = dict(bot._pending_photo.get((-500, 100)) or {})
+
+        check(
+            "origin: фото запомнило топик и склад",
+            stored.get("thread_id") == 318 and stored.get("warehouse") == "SMALL-P3",
+            stored,
+        )
+
+        SENT.clear()
+
+        with bot._photo_lock:
+            bot._pending_photo.pop((-500, 100), None)
+
+        bot.flush_pending_photo(-500, 100, stored)
+
+        check(
+            "origin: досыл фото ушёл в топик SP3",
+            SENT and all(item["thread_id"] == 318 for item in SENT),
+            [item["thread_id"] for item in SENT],
+        )
+
+        # подсказка по номеру из топика SP3, ответа нет — досылаем по TTL
+        bot.set_origin_thread(-500, 318)
+        bot._ask_robot_fix(
+            -500,
+            {"id": 100, "username": "tester", "first_name": "Tester"},
+            "Ivan Petrenko",
+            {"robot": "5016", "error_text": "Security module failure",
+             "error_type": "Unable to drive"},
+            None,
+            ["5160"],
+            60072001,
+        )
+
+        with bot._pending_robot_fix_lock:
+            for key in list(bot._pending_robot_fix):
+                bot._pending_robot_fix[key]["expires"] = time.time() - 1
+
+        SENT.clear()
+        bot.queue_missing_robot = fake_queue_notifies
+        bot.flush_expired_robot_fixes()
+
+        check(
+            "origin: досыл по номеру ушёл в топик SP3",
+            SENT and all(item["thread_id"] == 318 for item in SENT),
+            [item["thread_id"] for item in SENT],
+        )
+    finally:
+        tg.send_message = original_tg_send
+        stdb.set_notifier(t_notifier)
+        bot.send_photo = original_send
+        bot.queue_missing_robot = original_queue
+        bot.TOPIC_RAW = original_raw
+        bot._topic_names.clear()
+        bot._topic_names.update(original_names)
+        bot._pending_robot_fix.clear()
+
+        with bot._photo_lock:
+            bot._pending_photo.pop((-500, 100), None)
+
 
 def main():
     tests = [
@@ -6152,7 +6259,8 @@ def main():
         test_analytics_weekly_and_schedule,
         test_analytics_commands,
         test_topic_map_and_resolution,
-        test_error_topic_keeps_only_errors,
+        test_answers_stay_in_origin_topic,
+        test_background_flush_keeps_topic,
         test_topics_command,
         test_warehouses_config_and_args,
         test_two_warehouses_strict_lookup,
