@@ -160,6 +160,100 @@ TELEGRAM_TOPIC_NAME = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
 WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
 
 # ============================================================
+# БЕЛЫЙ СПИСОК ТОПИКОВ (для тестового бота)
+# ============================================================
+#
+# Если задан — бот берёт сообщения ТОЛЬКО из перечисленных топиков, а всё
+# остальное (включая топики ошибок и общие) игнорирует. Пусто — прежнее
+# поведение: фильтр по топикам ошибок.
+#
+# Зачем: тестовый бот сидит в той же форум-группе, что и рабочие, и без
+# этого он отвечал бы на боевые сообщения. Список избавляет от второго
+# бота/группы: рабочие боты про переменную не знают, потому что у них она
+# не задана.
+#
+# Значение — id топиков через запятую (надёжно) или их имена:
+#     TELEGRAM_LISTEN_TOPICS=27
+#     TELEGRAM_LISTEN_TOPICS=тест
+LISTEN_TOPICS_RAW = os.environ.get("TELEGRAM_LISTEN_TOPICS", "").strip()
+
+LISTEN_TOPIC_IDS = {
+    int(part.strip())
+    for part in LISTEN_TOPICS_RAW.replace(" ", "").split(",")
+    if part.strip().lstrip("-").isdigit()
+}
+
+# Имена топиков из того же списка (в нижнем регистре).
+LISTEN_TOPIC_NAMES = {
+    part.strip().casefold()
+    for part in LISTEN_TOPICS_RAW.split(",")
+    if part.strip() and not part.strip().lstrip("-").isdigit()
+}
+
+# ============================================================
+# ЧЁРНЫЙ СПИСОК ТОПИКОВ (боевой бот забывает тестовый топик)
+# ============================================================
+#
+# Топики, которые бот игнорирует ПОЛНОСТЬЮ: включая команды. Обычный фильтр
+# топиков команды пропускает (это нужно для настройки через /id), поэтому
+# в тестовом топике на команды отвечал боевой бот. Чёрный список закрывает
+# и этот путь: сообщение из такого топика не обрабатывается вообще.
+#
+# Зачем: тестовый бот и боевой сидят в одной группе. Чтобы боевой не мешал
+# тестам, его TELEGRAM_IGNORE_TOPICS указывает на тестовый топик.
+#
+# Значение — id топиков через запятую (надёжно) или имена:
+#     TELEGRAM_IGNORE_TOPICS=5994
+#     TELEGRAM_IGNORE_TOPICS=Test
+IGNORE_TOPICS_RAW = os.environ.get("TELEGRAM_IGNORE_TOPICS", "").strip()
+
+IGNORE_TOPIC_IDS = {
+    int(part.strip())
+    for part in IGNORE_TOPICS_RAW.replace(" ", "").split(",")
+    if part.strip().lstrip("-").isdigit()
+}
+
+IGNORE_TOPIC_NAMES = {
+    part.strip().casefold()
+    for part in IGNORE_TOPICS_RAW.split(",")
+    if part.strip() and not part.strip().lstrip("-").isdigit()
+}
+
+# ============================================================
+# DRY-RUN (тестовый бот ничего не пишет и никуда не отправляет)
+# ============================================================
+#
+# Если включён — бот разбирает сообщения и пишет в лог, что сделал бы, но
+# НЕ трогает Supabase, не отправляет в Lark и не удаляет сообщения.
+# Нужен, чтобы гонять тестового бота на боевой группе без риска.
+#
+# Читается при каждом обращении, а не один раз на импорте: иначе флаг
+# нельзя ни включить в тесте, ни снять без перезапуска процесса.
+def dry_run() -> bool:
+    """True — тестовый режим (ничего не пишем и не отправляем)."""
+    return _env_bool("TELEGRAM_DRY_RUN", False)
+
+
+# Пометка тестового бота в ответах. Работает только в dry-run: если бот
+# молчит совсем, в общей группе невозможно понять, кто ответил — тестовый
+# или боевой. С непустой пометкой ответы видны и их нельзя спутать с прод.
+# Пусто — тестовый бот не отвечает вообще (прежнее поведение).
+TEST_REPLY_PREFIX = os.environ.get("TELEGRAM_TEST_REPLY_PREFIX", "").strip()
+
+# Длина пометки ограничена: это метка, а не часть сообщения.
+TEST_REPLY_PREFIX = TEST_REPLY_PREFIX[:40]
+
+
+def _test_prefixed(text: str) -> str:
+    """Добавляет пометку тестового бота к тексту ответа."""
+    if not TEST_REPLY_PREFIX:
+        return text
+
+    body = text if text is not None else ""
+
+    return f"{TEST_REPLY_PREFIX} {body}".strip()
+
+# ============================================================
 # ТОПИКИ ФОРУМА ПО НАЗНАЧЕНИЮ
 # ============================================================
 #
@@ -244,6 +338,73 @@ PHOTO_HOLD_SECONDS = _env_int("PHOTO_HOLD_SECONDS", 90)
 # Объединять ли фото с записью об ошибке (привязка, ожидание текста,
 # photo_url). По умолчанию выключено: фото просто уходит в группу.
 PHOTO_ATTACH_ENABLED = _env_bool("PHOTO_ATTACH_ENABLED", False)
+
+# ============================================================
+# МЕНЮ ТИПА ОШИБКИ ПОД ФОТО
+# ============================================================
+#
+# Прислали фото — бот удаляет исходное сообщение, присылает это же фото
+# обратно с кнопками типов и по нажатию создаёт запись.
+#
+# Формат переменной TELEGRAM_ERROR_MENU:
+#
+#     Robot = Abnormal walking | Damaged body | Lost position
+#     Workstation = Offline | Wrong task
+#     Location = Wrong slot
+#     Qr Code = Unreadable
+#
+# Первый уровень — категории (Robot/Workstation/...). Если у категории
+# после «=» есть значения, показывается второй уровень с ними. Если
+# значений нет — категория сразу становится типом ошибки.
+#
+# Пусто — меню выключено, работает прежний ввод текстом.
+ERROR_MENU_RAW = os.environ.get("TELEGRAM_ERROR_MENU", "").strip()
+
+
+def parse_error_menu(raw: str) -> dict:
+    """
+    Разбирает описание меню в {категория: (подтип, ...)}.
+
+    Категории разделяются «;», подтипы внутри категории — «|»:
+
+        «Robot = A | B; Location = C» -> {"Robot": ("A", "B"), "Location": ("C",)}
+
+    «Location» без «=» -> {"Location": ()}: категория сама является типом.
+    Порядок кнопок совпадает с порядком в переменной.
+
+    Перенос строки тоже считается разделителем: многострочное значение в
+    .env не переживает загрузку, но вписанное руками не должно ломать меню.
+    """
+    menu = {}
+
+    for chunk in str(raw or "").replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+
+        if not chunk or chunk.startswith("#"):
+            continue
+
+        if "=" in chunk:
+            title, _, rest = chunk.partition("=")
+        else:
+            title, rest = chunk, ""
+
+        title = title.strip()
+
+        if not title:
+            continue
+
+        items = tuple(
+            item.strip()
+            for item in rest.split("|")
+            if item.strip()
+        )
+
+        menu[title] = items
+
+    return menu
+
+
+ERROR_MENU = parse_error_menu(ERROR_MENU_RAW)
 
 # Удалять ли сообщения сотрудников: команды боту и описание причины
 # при смене статуса (бот — админ группы, права позволяют).
@@ -789,6 +950,12 @@ def is_shared_topic(chat_id, thread_id) -> bool:
     if thread_id is None:
         return False
 
+    # При заданном белом списке «общих» топиков нет: бот слушает только
+    # перечисленные, иначе сообщение из топика статусов прошло бы мимо
+    # фильтра и тестовый бот вмешался бы в боевой поток.
+    if LISTEN_TOPIC_IDS or LISTEN_TOPIC_NAMES:
+        return False
+
     for kind in ("status", "stats", "service"):
         configured = topic_thread(kind, chat_id)
 
@@ -800,6 +967,13 @@ def is_shared_topic(chat_id, thread_id) -> bool:
 
 def monitored_topic_label() -> str:
     """Человекочитаемое описание топиков ошибок (по складам)."""
+    # Белый список важнее: если он задан, именно он описывает приём.
+    if LISTEN_TOPIC_IDS or LISTEN_TOPIC_NAMES:
+        parts = [str(tid) for tid in sorted(LISTEN_TOPIC_IDS)]
+        parts.extend(sorted(LISTEN_TOPIC_NAMES))
+
+        return "topic(s) " + ", ".join(parts)
+
     parts = []
 
     for title, thread_id in error_topic_map().items():
@@ -815,12 +989,72 @@ def monitored_topic_label() -> str:
     return "any topic"
 
 
+def ignored_topic(chat_id, thread_id) -> bool:
+    """
+    Топик из чёрного списка — бот не реагирует на него вообще.
+
+    В отличие от topic_allowed, здесь не делается исключения для команд:
+    именно команды и были дырой, через которую боевой бот отвечал в
+    тестовом топике.
+    """
+    if not IGNORE_TOPIC_IDS and not IGNORE_TOPIC_NAMES:
+        return False
+
+    if thread_id is None:
+        return False
+
+    if int(thread_id) in IGNORE_TOPIC_IDS:
+        return True
+
+    if IGNORE_TOPIC_NAMES:
+        name = (topic_name(chat_id, thread_id) or "").strip().casefold()
+
+        if name and name in IGNORE_TOPIC_NAMES:
+            return True
+
+    return False
+
+
+def listening_topic(chat_id, thread_id):
+    """
+    Сообщение из топика, который бот слушает по белому списку.
+
+    Возвращает (allowed, reason) или None, если белый список не задан —
+    тогда вызывающий код работает по обычному фильтру топиков ошибок.
+    """
+    if not LISTEN_TOPIC_IDS and not LISTEN_TOPIC_NAMES:
+        return None
+
+    if thread_id is None:
+        # «General» в белый список не попадает никогда: топик должен быть
+        # указан явно, иначе тестовый бот отвечал бы на всё подряд.
+        return False, "listen-general"
+
+    if int(thread_id) in LISTEN_TOPIC_IDS:
+        return True, "listen-id"
+
+    if LISTEN_TOPIC_NAMES:
+        name = (topic_name(chat_id, thread_id) or "").strip().casefold()
+
+        if name and name in LISTEN_TOPIC_NAMES:
+            return True, "listen-name"
+
+    return False, "listen-mismatch"
+
+
 def topic_allowed(chat_id, thread_id):
     """
     Можно ли брать сообщение из этого топика.
 
     Возвращает (allowed, reason).
     """
+    # Белый список (тестовый бот) важнее обычных правил: он сужает приём
+    # до конкретных топиков и отключает остальные пути приёма.
+    listened = listening_topic(chat_id, thread_id)
+
+    if listened is not None:
+        return listened
+
     configured_errors = error_topic_map(chat_id)
 
     if (
@@ -855,6 +1089,13 @@ def topic_allowed(chat_id, thread_id):
     return False, "id-mismatch"
 
 
+def _shorten_for_log(text, limit: int = 200) -> str:
+    """Однострочный обрезанный текст для лога (в dry-run вместо отправки)."""
+    flat = " ".join(str(text or "").split())
+
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 def _send(
     chat_id,
     text,
@@ -876,6 +1117,19 @@ def _send(
     """
     if thread_id is None:
         thread_id = _reply_thread(chat_id)
+
+    if dry_run():
+        # Отвечать ли в этот топик, решает telegram_api: он пропускает
+        # только топики из белого списка. Здесь — необязательная пометка
+        # и запись в лог, чтобы в логе было видно смысл ответа.
+        text = _test_prefixed(text)
+
+        logger.info(
+            "[DRY-RUN] ответ: chat=%s thread=%s text=%r",
+            chat_id,
+            thread_id,
+            _shorten_for_log(text),
+        )
 
     result = tg.send_message(
         chat_id,
@@ -1032,6 +1286,8 @@ def images_janitor_loop(interval_seconds: int = 3600):
         try:
             cleanup_old_images()
             sweep_pending_status()
+            sweep_error_menus()
+            sweep_error_choices()
         except Exception:
             logger.exception("Ошибка очистки старых фото")
 
@@ -1326,6 +1582,91 @@ def warehouse_keyboard(action: str, number, titles):
     return {"inline_keyboard": rows}
 
 
+def error_menu_keyboard(path: tuple = ()) -> dict:
+    """
+    Кнопки меню типа ошибки.
+
+    Первый уровень — категории. Если у категории есть подтипы, кнопка
+    ведёт на второй уровень; иначе категория сама является типом.
+
+    Выбранный путь едет в callback_data (em:c:<индексы>), поэтому серверное
+    состояние не нужно: нажатие обрабатывается в любом порядке.
+    """
+    rows = []
+
+    if not path:
+        for index, (title, items) in enumerate(ERROR_MENU.items()):
+            rows.append([{
+                "text": f"{'📂' if items else '•'} {title}",
+                "callback_data": f"em:c:{index}",
+            }])
+    else:
+        parent = _error_menu_node(path)
+
+        if parent is None:
+            return {"inline_keyboard": []}
+
+        _title, items = parent
+
+        for index, item in enumerate(items):
+            rows.append([{
+                "text": f"• {item}",
+                # Путь до листа: em:l:<индексы через точку>
+                "callback_data": f"em:l:{'.'.join(str(p) for p in path + (index,))}",
+            }])
+
+        parent_path = ".".join(str(p) for p in path[:-1])
+
+        rows.append([{
+            "text": "⬅️ Back",
+            "callback_data": f"em:c:{parent_path}",
+        }])
+
+    rows.append([{"text": "✖️ Cancel", "callback_data": "em:x"}])
+
+    return {"inline_keyboard": rows}
+
+
+def _error_menu_node(path: tuple):
+    """Узел меню по пути индексов: (название, подтипы) или None."""
+    entries = list(ERROR_MENU.items())
+    node = None
+
+    for depth, index in enumerate(path):
+        if index < 0 or index >= len(entries):
+            return None
+
+        node = entries[index]
+
+        if depth < len(path) - 1:
+            if not node[1]:
+                # У листа нет детей — путь длиннее дерева.
+                return None
+
+            entries = [(item, ()) for item in node[1]]
+
+    return node
+
+
+def error_menu_label(path: tuple) -> str:
+    """Человекочитаемый тип ошибки по пути: «Robot · Abnormal walking»."""
+    parts = []
+
+    for depth, index in enumerate(path):
+        if depth == 0:
+            entries = list(ERROR_MENU.keys())
+            if 0 <= index < len(entries):
+                parts.append(entries[index])
+            continue
+
+        parent = _error_menu_node(path[:depth])
+
+        if parent and 0 <= index < len(parent[1]):
+            parts.append(parent[1][index])
+
+    return " · ".join(parts)
+
+
 def _ask_warehouse(chat_id, action: str, number, titles, reply_to=None):
     """Спрашивает склад, если номер есть на нескольких складах."""
     _send(
@@ -1493,6 +1834,12 @@ def handle_status_callback(callback: dict):
 
     if parts and parts[0] == "rf":
         _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id)
+        return
+
+    if parts and parts[0] == "em":
+        _handle_error_menu_callback(
+            chat_id, sender, parts, message_id, callback_id
+        )
         return
 
     if parts and parts[0] == "w":
@@ -1758,6 +2105,132 @@ def _handle_cancel(chat_id, sender, reply_to):
 _pending_photo = {}   # (chat_id, user_id) -> данные фото, ждущего текст
 _last_error = {}      # (chat_id, user_id) -> последняя запись сотрудника
 _photo_lock = threading.Lock()
+
+# (chat_id, user_id) -> фото и контекст для меню типа ошибки.
+# Ключ тот же, что у _pending_photo: одно ожидающее фото на сотрудника.
+_pending_error_menu = {}
+_menu_lock = threading.Lock()
+
+# Сколько живёт меню, если по нему не нажали.
+ERROR_MENU_TTL_SECONDS = _env_int("TELEGRAM_ERROR_MENU_TTL", 900)
+
+
+def put_error_menu(chat_id, user_id, data: dict):
+    """Запоминает фото и контекст, пока сотрудник выбирает тип ошибки."""
+    with _menu_lock:
+        _pending_error_menu[_photo_key(chat_id, user_id)] = dict(
+            data,
+            expires=time.time() + ERROR_MENU_TTL_SECONDS,
+        )
+
+
+def take_error_menu(chat_id, user_id):
+    """Забирает контекст меню. None — меню нет или оно просрочено."""
+    key = _photo_key(chat_id, user_id)
+
+    with _menu_lock:
+        data = _pending_error_menu.pop(key, None)
+
+    if not data:
+        return None
+
+    if data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
+def peek_error_menu(chat_id, user_id):
+    """Контекст меню без удаления — для перерисовки второго уровня."""
+    key = _photo_key(chat_id, user_id)
+
+    with _menu_lock:
+        data = _pending_error_menu.get(key)
+
+    if not data or data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
+def sweep_error_menus() -> int:
+    """Убирает просроченные меню, чтобы словарь не рос."""
+    now = time.time()
+
+    with _menu_lock:
+        stale = [
+            key for key, data in _pending_error_menu.items()
+            if data.get("expires", 0) < now
+        ]
+
+        for key in stale:
+            _pending_error_menu.pop(key, None)
+
+    return len(stale)
+
+
+def _show_error_menu(
+    chat_id,
+    sender,
+    photo_path,
+    message_id,
+    warehouse,
+    path: tuple = (),
+):
+    """
+    Показывает фото с кнопками типов ошибки.
+
+    Исходное сообщение сотрудника удаляется, а фото возвращается заново
+    уже с кнопками — так в чате не остаётся «висящего» фото без меню.
+    """
+    keyboard = error_menu_keyboard(path)
+
+    if not keyboard.get("inline_keyboard"):
+        # Кривой путь (кнопка устарела) — показываем первый уровень.
+        path = ()
+        keyboard = error_menu_keyboard(())
+
+    caption = "📷 Выберите тип ошибки:"
+
+    if path:
+        caption = f"📷 {error_menu_label(path)}\nВыберите подробнее:"
+
+    sent = tg.send_photo(
+        chat_id,
+        photo_path,
+        caption=caption,
+        message_thread_id=_reply_thread(chat_id),
+        reply_markup=keyboard,
+    )
+
+    if not sent:
+        _send(
+            chat_id,
+            "⚠️ Не удалось отправить фото с кнопками. Отправьте фото ещё раз.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
+    # Старое сообщение с фото убираем только после успешной отправки:
+    # если отправка не удалась, сотрудник хоть что-то видит в чате.
+    _delete_user_message(chat_id, message_id)
+
+    put_error_menu(chat_id, sender.get("id"), {
+        "chat_id": chat_id,
+        "sender": sender,
+        "path": photo_path,
+        "menu_message_id": (sent or {}).get("message_id"),
+        "warehouse": warehouse or current_warehouse(),
+        "thread_id": _reply_thread(chat_id),
+    })
+
+    logger.info(
+        "Меню типа ошибки показано: chat=%s thread=%s path=%s",
+        chat_id,
+        _reply_thread(chat_id),
+        path or "root",
+    )
 
 
 def _photo_key(chat_id, user_id):
@@ -2451,6 +2924,187 @@ def _complete_missing_robot(
         "Робот %s не найден в системе — ошибка переслана в Lark "
         "без записи в базу (сотрудник уведомлён в Telegram)",
         parsed["robot"],
+    )
+
+
+def _parse_menu_path(raw: str) -> tuple:
+    """«0.1» -> (0, 1). Мусор и пустая строка -> ()."""
+    path = []
+
+    for chunk in str(raw or "").split("."):
+        chunk = chunk.strip()
+
+        if not chunk:
+            continue
+
+        if not chunk.lstrip("-").isdigit():
+            return ()
+
+        path.append(int(chunk))
+
+    return tuple(path)
+
+
+# (chat_id, user_id) -> выбранный тип, ожидающий номер робота.
+_pending_error_choice = {}
+_choice_lock = threading.Lock()
+
+
+def set_pending_error_choice(chat_id, user_id, data: dict):
+    with _choice_lock:
+        _pending_error_choice[_photo_key(chat_id, user_id)] = dict(
+            data,
+            expires=time.time() + ERROR_MENU_TTL_SECONDS,
+        )
+
+
+def peek_pending_error_choice(chat_id, user_id):
+    key = _photo_key(chat_id, user_id)
+
+    with _choice_lock:
+        data = _pending_error_choice.get(key)
+
+    if not data or data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
+def clear_pending_error_choice(chat_id, user_id):
+    with _choice_lock:
+        return _pending_error_choice.pop(_photo_key(chat_id, user_id), None)
+
+
+def sweep_error_choices() -> int:
+    """Убирает просроченные выборы, чтобы словарь не рос."""
+    now = time.time()
+
+    with _choice_lock:
+        stale = [
+            key for key, data in _pending_error_choice.items()
+            if data.get("expires", 0) < now
+        ]
+
+        for key in stale:
+            _pending_error_choice.pop(key, None)
+
+    return len(stale)
+
+
+def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id):
+    """
+    Нажатие кнопки в меню типа ошибки.
+
+    em:c:<путь> — открыть уровень (категория с подтипами);
+    em:l:<путь> — выбран конечный тип, спрашиваем номер робота;
+    em:x        — отмена.
+    """
+    action = parts[1] if len(parts) > 1 else ""
+    raw_path = parts[2] if len(parts) > 2 else ""
+    path = _parse_menu_path(raw_path)
+
+    if action == "x":
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Отменено")
+
+        take_error_menu(chat_id, sender.get("id"))
+        _delete_quiet(chat_id, message_id)
+        return
+
+    pending = peek_error_menu(chat_id, sender.get("id"))
+
+    if not pending:
+        if callback_id:
+            tg.answer_callback_query(
+                callback_id,
+                "Меню устарело — отправьте фото заново",
+            )
+
+        _delete_quiet(chat_id, message_id)
+        return
+
+    node = _error_menu_node(path) if path else None
+
+    if action == "c":
+        if path and node and node[1]:
+            # Категория с подтипами: перерисовываем на новый уровень.
+            if callback_id:
+                tg.answer_callback_query(callback_id)
+
+            tg.edit_message_caption(
+                chat_id,
+                message_id,
+                f"📷 {error_menu_label(path)}\nВыберите подробнее:",
+                reply_markup=error_menu_keyboard(path),
+            )
+            return
+
+        if path and node and not node[1]:
+            # Категория без подтипов — это и есть тип ошибки.
+            _finish_error_menu(
+                chat_id, sender, pending, path, message_id, callback_id
+            )
+            return
+
+        # Корень (или битый путь) — показываем первый уровень.
+        if callback_id:
+            tg.answer_callback_query(callback_id)
+
+        tg.edit_message_caption(
+            chat_id,
+            message_id,
+            "📷 Выберите тип ошибки:",
+            reply_markup=error_menu_keyboard(()),
+        )
+        return
+
+    if action == "l":
+        _finish_error_menu(
+            chat_id, sender, pending, path, message_id, callback_id
+        )
+        return
+
+    if callback_id:
+        tg.answer_callback_query(callback_id)
+
+
+def _finish_error_menu(chat_id, sender, pending, path, message_id, callback_id):
+    """Тип выбран: запоминаем его и спрашиваем номер робота."""
+    label = error_menu_label(path)
+
+    if not label:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Не понял выбор")
+
+        return
+
+    if callback_id:
+        tg.answer_callback_query(callback_id, label)
+
+    take_error_menu(chat_id, sender.get("id"))
+
+    sent = _send(
+        chat_id,
+        f"✅ Тип: {label}\n\n"
+        "Отправьте номер робота (только цифры), например:\n3780",
+        reply_to_message_id=message_id,
+    )
+
+    set_pending_error_choice(chat_id, sender.get("id"), {
+        "chat_id": chat_id,
+        "sender": sender,
+        "label": label,
+        "photo_path": pending.get("path"),
+        "warehouse": pending.get("warehouse") or current_warehouse(),
+        "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
+        "menu_message_id": message_id,
+        "prompt_message_id": (sent or {}).get("message_id"),
+    })
+
+    logger.info(
+        "Тип ошибки выбран: %s (chat=%s, ждём номер робота)",
+        label,
+        chat_id,
     )
 
 
@@ -3176,6 +3830,18 @@ def handle_photo(chat_id, sender, message, message_id):
         )
         return
 
+    # 2.5) Меню типа ошибки: фото возвращается с кнопками, исходное
+    # сообщение удаляется. Так сотрудник не набирает текст вручную.
+    if ERROR_MENU and not caption:
+        _show_error_menu(
+            chat_id,
+            sender,
+            destination,
+            message_id,
+            current_warehouse(),
+        )
+        return
+
     # 3) Держим фото: возможно, текст ошибки придёт следующим сообщением.
     put_pending_photo(
         chat_id,
@@ -3243,6 +3909,18 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     callback = update.get("callback_query")
 
     if callback:
+        # Кнопка в игнорируемом топике: бот не должен на неё реагировать.
+        cb_message = callback.get("message") or {}
+        cb_chat = cb_message.get("chat") or {}
+
+        if ignored_topic(cb_chat.get("id"), cb_message.get("message_thread_id")):
+            logger.info(
+                "Ignored: кнопка в игнорируемом топике (chat=%s thread=%s)",
+                cb_chat.get("id"),
+                cb_message.get("message_thread_id"),
+            )
+            return
+
         try:
             handle_status_callback(callback)
         except Exception:
@@ -3266,6 +3944,15 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     # бот (createForumTopic), и другой бот.
     if message.get("forum_topic_created") or message.get("forum_topic_edited"):
         _learn_topic_from_message(chat_id, message)
+
+    # Чёрный список: сообщение не обрабатываем вообще, включая команды.
+    if ignored_topic(chat_id, message.get("message_thread_id")):
+        logger.info(
+            "Ignored: топик в чёрном списке (chat=%s thread=%s)",
+            chat_id,
+            message.get("message_thread_id"),
+        )
+        return
 
     if any(message.get(field) for field in SERVICE_MESSAGE_FIELDS):
         logger.info(
@@ -3396,6 +4083,69 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     )
 
 
+def _looks_like_robot_number(text: str) -> bool:
+    """«3780», «#3780» — похоже на номер робота, а не на текст ошибки."""
+    cleaned = str(text or "").strip().lstrip("#").strip()
+
+    return bool(cleaned) and cleaned.isdigit() and len(cleaned) <= 6
+
+
+def _finish_error_choice(chat_id, sender, choice, number, message_id):
+    """
+    Номер получен: создаём запись с выбранным типом и шлём её в Lark.
+
+    Запись идёт тем же путём, что и обычная ошибка, поэтому фото
+    прикрепляется к карточке, а не уходит отдельным сообщением.
+    """
+    employee_name = get_employee_name(sender.get("id"))
+    label = choice.get("label") or "Issue"
+
+    if not employee_name:
+        _send(
+            chat_id,
+            "⚠️ Сначала зарегистрируйтесь: /reg <Фамилия Имя>",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+
+        clear_pending_error_choice(chat_id, sender.get("id"))
+        return
+
+    # Склад и топик берём из снимка: меню могло быть открыто до того, как
+    # бот переключился в другой топик.
+    warehouse = choice.get("warehouse") or current_warehouse()
+    thread_id = choice.get("thread_id")
+
+    parsed = {
+        "error_type": label,
+        "error_text": label,
+        "robot": str(number).strip().lstrip("#"),
+    }
+
+    logger.info(
+        "Ошибка из меню: robot=%s type=%s employee=%s warehouse=%s",
+        parsed["robot"],
+        label,
+        employee_name,
+        warehouse,
+    )
+
+    clear_pending_error_choice(chat_id, sender.get("id"))
+
+    with reply_thread(thread_id):
+        save_and_forward_error(
+            chat_id,
+            sender,
+            parsed,
+            message_id,
+            employee_name,
+            photo_path=choice.get("photo_path"),
+            allow_fix=True,
+        )
+
+    _delete_quiet(chat_id, choice.get("prompt_message_id"))
+
+
 def _handle_text_message(chat_id, sender, text, message_id, chat):
     if text.startswith("/"):
         command, args = parse_command(text, BOT_USERNAME)
@@ -3481,6 +4231,17 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         return
 
     parsed = parse_error_message(text)
+
+    # Меню типа ошибки уже пройдено: ждём номер робота. Проверяем раньше
+    # обычного разбора, иначе «3780» не распознается как ошибка (нет формата).
+    if not parsed and _looks_like_robot_number(text):
+        choice = peek_pending_error_choice(chat_id, sender.get("id"))
+
+        if choice:
+            _finish_error_choice(
+                chat_id, sender, choice, text.strip(), message_id
+            )
+            return
 
     _show_console_message(
         chat,

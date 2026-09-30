@@ -10,3 +10,6 @@ logs/
 .env.*
 !.env.example
 .pycache
+
+# Локальный запуск тестового бота (содержит токен)
+run_test_bot.sh

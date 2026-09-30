@@ -57,6 +57,18 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 _notifier = None
 
 
+def _dry_run() -> bool:
+    """
+    Тестовый режим: ничего не пишем в базу.
+
+    Читается при каждом вызове, а не на импорте, чтобы тесты и запуск
+    с другим .env работали без перезагрузки модуля.
+    """
+    return os.environ.get("TELEGRAM_DRY_RUN", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def set_notifier(notify):
     """
     Регистрирует функцию notify(chat_id, text) для ответов пользователю.
@@ -150,6 +162,13 @@ def _rest_post(table: str, payload: dict, ignore_conflict: bool = False):
     ignore_conflict — для вставок в очереди: 409 означает «строка уже есть»,
     это не ошибка и не должно выглядеть как сбой в логах.
     """
+    if _dry_run():
+        # Тестовый бот: в базу не пишем, но отдаём «как будто записали»,
+        # иначе сработали бы ветки обработки ошибки и поведение в тесте
+        # отличалось бы от прода.
+        logger.info("[DRY-RUN] POST %s не выполнен: %r", table, payload)
+        return []
+
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
     headers = _headers()
@@ -305,6 +324,10 @@ def rest_upsert(table: str, payload: dict, on_conflict: str):
 
     Возвращает список строк при успехе, иначе None.
     """
+    if _dry_run():
+        logger.info("[DRY-RUN] UPSERT %s не выполнен: %r", table, payload)
+        return [payload]
+
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
     headers = _headers()
@@ -391,6 +414,15 @@ def rest_patch(table: str, params: dict, payload: dict):
     """
     PATCH /rest/v1/<table>?<params>. Возвращает обновлённые строки или None.
     """
+    if _dry_run():
+        logger.info(
+            "[DRY-RUN] PATCH %s не выполнен: params=%r payload=%r",
+            table,
+            params,
+            payload,
+        )
+        return [payload]
+
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
     headers = _headers()

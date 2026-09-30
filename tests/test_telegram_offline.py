@@ -6156,6 +6156,620 @@ def test_background_flush_keeps_topic():
             bot._pending_photo.pop((-500, 100), None)
 
 
+def test_listen_topics_whitelist():
+    """Тестовый бот слушает только топики из белого списка."""
+    original_ids = bot.LISTEN_TOPIC_IDS
+    original_names = bot.LISTEN_TOPIC_NAMES
+
+    try:
+        # Белый список по id: «тест» = 4242.
+        bot.LISTEN_TOPIC_IDS = {4242}
+        bot.LISTEN_TOPIC_NAMES = set()
+
+        allowed, reason = bot.topic_allowed(-500, 4242)
+        check("listen: нужный топик принят", allowed and reason == "listen-id", reason)
+
+        allowed, reason = bot.topic_allowed(-500, 777)
+        check("listen: чужой топик отклонён", not allowed, reason)
+
+        allowed, reason = bot.topic_allowed(-500, None)
+        check("listen: General отклонён", not allowed and reason == "listen-general", reason)
+
+        # Даже топик ошибок склада не должен проходить мимо белого списка.
+        original_raw = dict(bot.TOPIC_RAW)
+        bot.TOPIC_RAW["error:GLP-C"] = "555"
+        try:
+            allowed, reason = bot.topic_allowed(-500, 555)
+            check(
+                "listen: топик ошибок GLP-C игнорируется",
+                not allowed and reason == "listen-mismatch",
+                reason,
+            )
+            check(
+                "listen: общие топики отключены",
+                bot.is_shared_topic(-500, 555) is False,
+            )
+        finally:
+            bot.TOPIC_RAW = original_raw
+
+        # Белый список по имени.
+        bot.LISTEN_TOPIC_IDS = set()
+        bot.LISTEN_TOPIC_NAMES = {"тест"}
+        bot._topic_names.clear()
+        bot._topic_names[(-500, 4242)] = "тест"
+        bot._topic_names[(-500, 777)] = "Ex GLPC"
+
+        allowed, reason = bot.topic_allowed(-500, 4242)
+        check("listen: топик по имени принят", allowed and reason == "listen-name", reason)
+
+        allowed, reason = bot.topic_allowed(-500, 777)
+        check("listen: другое имя отклонено", not allowed, reason)
+
+        # Пустой список — прежнее поведение (фильтр топиков ошибок).
+        bot.LISTEN_TOPIC_IDS = set()
+        bot.LISTEN_TOPIC_NAMES = set()
+        check(
+            "listen: без списка фильтр не активен",
+            bot.listening_topic(-500, 4242) is None,
+        )
+
+        bot.LISTEN_TOPIC_IDS = {4242}
+        bot.LISTEN_TOPIC_NAMES = set()
+        check(
+            "listen: подпись топиков содержит id",
+            "4242" in bot.monitored_topic_label(),
+            bot.monitored_topic_label(),
+        )
+    finally:
+        bot.LISTEN_TOPIC_IDS = original_ids
+        bot.LISTEN_TOPIC_NAMES = original_names
+        bot._topic_names.clear()
+
+
+def test_listen_topics_end_to_end():
+    """Через бота: из белого списка — обрабатываем, из чужого — молчим."""
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    original_ids = bot.LISTEN_TOPIC_IDS
+    original_names = bot.LISTEN_TOPIC_NAMES
+    original_hint = bot.WRONG_TOPIC_HINT
+
+    try:
+        bot.LISTEN_TOPIC_IDS = {4242}
+        bot.LISTEN_TOPIC_NAMES = set()
+        bot.WRONG_TOPIC_HINT = False  # иначе в чужом топике будет подсказка
+        reset_topics()
+
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=4242,
+        ))
+        check(
+            "listen e2e: сообщение из «тест» сохранено",
+            len(DB_CALLS) == 1,
+            DB_CALLS,
+        )
+        check("listen e2e: карточка ушла в Lark", len(FORWARDED) == 1, FORWARDED)
+
+        # run() очищает счётчики, поэтому после чужого топика они должны
+        # остаться пустыми — ни записи в базу, ни карточки в Lark.
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=777,
+        ))
+        check(
+            "listen e2e: чужой топик полностью проигнорирован",
+            DB_CALLS == [] and FORWARDED == [],
+            (DB_CALLS, FORWARDED),
+        )
+    finally:
+        bot.LISTEN_TOPIC_IDS = original_ids
+        bot.LISTEN_TOPIC_NAMES = original_names
+        bot.WRONG_TOPIC_HINT = original_hint
+        bot._hinted_threads.clear()
+
+
+def test_ignore_topics_blocks_everything():
+    """
+    Чёрный список: боевой бот полностью забывает тестовый топик.
+
+    Главное отличие от белого списка — блокируются и команды: именно через
+    них боевой бот раньше отвечал в тестовом топике.
+    """
+    original_ids = bot.IGNORE_TOPIC_IDS
+    original_names = bot.IGNORE_TOPIC_NAMES
+
+    try:
+        bot.IGNORE_TOPIC_IDS = {4242}
+        bot.IGNORE_TOPIC_NAMES = set()
+        bot._topic_names.clear()
+
+        check(
+            "ignore: топик из чёрного списка распознан",
+            bot.ignored_topic(-500, 4242) is True,
+        )
+        check(
+            "ignore: обычный топик не задет",
+            bot.ignored_topic(-500, 777) is False,
+        )
+        check(
+            "ignore: General не задет",
+            bot.ignored_topic(-500, None) is False,
+        )
+
+        # Пустой список — проверка выключена.
+        bot.IGNORE_TOPIC_IDS = set()
+        check(
+            "ignore: без списка ничего не игнорируется",
+            bot.ignored_topic(-500, 4242) is False,
+        )
+        bot.IGNORE_TOPIC_IDS = {4242}
+
+        # Совпадение по имени (регистр не важен).
+        bot.IGNORE_TOPIC_IDS = set()
+        bot.IGNORE_TOPIC_NAMES = {"test"}
+        bot._topic_names[(-500, 4242)] = "TEST"
+        check(
+            "ignore: совпадение по имени без учёта регистра",
+            bot.ignored_topic(-500, 4242) is True,
+        )
+        bot.IGNORE_TOPIC_NAMES = set()
+        bot.IGNORE_TOPIC_IDS = {4242}
+
+        # Команда в игнорируемом топике не должна обрабатываться вообще.
+        LINKS[100] = "Ivan Petrenko"
+        reset_topics()
+
+        run(make_update(text="/id", thread_id=4242))
+        check(
+            "ignore: команда в чёрном топике не обработана",
+            SENT == [] and DELETED == [],
+            (SENT, DELETED),
+        )
+
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=4242,
+        ))
+        check(
+            "ignore: обычное сообщение тоже проигнорировано",
+            DB_CALLS == [] and FORWARDED == [] and SENT == [],
+            (DB_CALLS, FORWARDED, SENT),
+        )
+
+        # А в обычном топике бот работает как раньше.
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=777,
+        ))
+        check(
+            "ignore: обычный топик продолжает работать",
+            len(DB_CALLS) == 1 and len(FORWARDED) == 1,
+            (DB_CALLS, FORWARDED),
+        )
+    finally:
+        bot.IGNORE_TOPIC_IDS = original_ids
+        bot.IGNORE_TOPIC_NAMES = original_names
+        bot._topic_names.clear()
+
+
+def test_dry_run_suppresses_everything():
+    """В dry-run бот не пишет в базу и Lark; в чат — только с пометкой теста."""
+    import lark_media as lm
+
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    original_stdb_post = stdb.requests.post
+    original_hook_post = lm.requests.post
+    original_tg_post = bot.tg.requests.post
+    original_tg_send = tg.send_message
+    original_flag = os.environ.get("TELEGRAM_DRY_RUN")
+    original_prefix = os.environ.get("TELEGRAM_TEST_REPLY_PREFIX")
+    original_listen = os.environ.get("TELEGRAM_LISTEN_TOPICS")
+
+    real_http_calls = []
+    sent = []
+
+    os.environ["TELEGRAM_DRY_RUN"] = "1"
+    os.environ.pop("TELEGRAM_TEST_REPLY_PREFIX", None)
+
+    def spy_http(*args, **kwargs):
+        real_http_calls.append(args)
+        raise AssertionError("в dry-run сетевой вызов недопустим")
+
+    try:
+        # Заглушки на уровне примитивов: если guard не сработает — упадём.
+        # telegram_api целиком не подменяем: разрешённые ответы (внутри
+        # тестового топика) перехватываются ниже, на capture_post.
+        stdb.requests.post = spy_http
+        lm.requests.post = spy_http
+
+        # Белого списка нет — ответы в dry-run запрещены полностью.
+        check("dry-run: сетевых вызовов Telegram нет", real_http_calls == [], real_http_calls)
+
+        deleted = bot.tg.call("delete_message", {"chat_id": -500, "message_id": 1})
+        check("dry-run: delete_message вернул True", deleted is True, deleted)
+
+        # getUpdates обязан работать, иначе бот не получит сообщения.
+        check(
+            "dry-run: getUpdates разрешён",
+            "getUpdates" in bot.tg._DRY_RUN_ALLOWED,
+            bot.tg._DRY_RUN_ALLOWED,
+        )
+
+        # С пометкой — сообщение уходит (его видно в группе как тестовое).
+        # Перехватываем на уровне requests: call() ходит в сеть сам.
+        os.environ["TELEGRAM_LISTEN_TOPICS"] = "5994"
+        os.environ["TELEGRAM_TEST_REPLY_PREFIX"] = "[ТЕСТ]"
+
+        captured = []
+
+        class _FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"ok": True, "result": {"message_id": 999}}
+
+        def capture_post(url, json=None, **kwargs):
+            captured.append((url, json))
+            return _FakeResponse()
+
+        bot.tg.requests.post = capture_post
+        sent_result = bot.tg.call(
+            "sendMessage",
+            {
+                "chat_id": -500,
+                "text": "проверка",
+                "message_thread_id": 5994,
+            },
+        )
+        check(
+            "dry-run: ответ внутри тестового топика уходит",
+            isinstance(sent_result, dict) and sent_result.get("message_id") == 999,
+            sent_result,
+        )
+        check(
+            "dry-run: к ответу добавлена пометка",
+            captured and captured[0][1]["text"].startswith("[ТЕСТ]"),
+            captured,
+        )
+
+        # А в боевой топик — блокируется, даже с пометкой.
+        blocked = bot.tg.call(
+            "sendMessage",
+            {
+                "chat_id": -500,
+                "text": "[ТЕСТ] в боевой",
+                "message_thread_id": 2,
+            },
+        )
+        check(
+            "dry-run: в боевой топик ответ блокируется",
+            isinstance(blocked, dict) and blocked.get("dry_run") is True,
+            blocked,
+        )
+
+        # И без топика (General) — тоже блокируется.
+        blocked_general = bot.tg.call("sendMessage", {"chat_id": -500, "text": "hi"})
+        check(
+            "dry-run: ответ без топика блокируется",
+            isinstance(blocked_general, dict) and blocked_general.get("dry_run") is True,
+            blocked_general,
+        )
+        check(
+            "dry-run: ушло ровно одно сообщение — в тестовый топик",
+            len(captured) == 1,
+            captured,
+        )
+
+        # Без белого списка не уходит вообще ничего: непонятно, какой топик
+        # тестовый, поэтому безопасное поведение — молчать.
+        os.environ["TELEGRAM_LISTEN_TOPICS"] = ""
+        none_allowed = bot.tg.call(
+            "sendMessage",
+            {"chat_id": -500, "text": "x", "message_thread_id": 5994},
+        )
+        check(
+            "dry-run: без белого списка ответ не уходит",
+            isinstance(none_allowed, dict) and none_allowed.get("dry_run") is True,
+            none_allowed,
+        )
+        os.environ["TELEGRAM_LISTEN_TOPICS"] = "5994"
+
+        # Lark: _hook_post не должен ходить в сеть.
+        hook_result = lm._hook_post(
+            "https://open.larksuite.com/open-apis/bot/v2/hook/deadbeef",
+            {"msg_type": "text", "content": {"text": "тест"}},
+        )
+        check(
+            "dry-run: Lark-хук не отправлен",
+            isinstance(hook_result, dict) and hook_result.get("code") == 0,
+            hook_result,
+        )
+
+        # Supabase: запись не должна уйти.
+        posted = stdb.rest_post("exceptions_glpc", {"a": 1})
+        check("dry-run: POST в базу заглушен", posted == [], posted)
+        patched = stdb.rest_patch("robots_maintenance_list", {"id": "eq.1"}, {"x": 1})
+        check("dry-run: PATCH в базу заглушен", patched == [{"x": 1}], patched)
+        upserted = stdb.rest_upsert("bot_leases", {"a": 1}, "id")
+        check("dry-run: UPSERT в базу заглушен", upserted == [{"a": 1}], upserted)
+
+        # Удаление сообщений: у delete_message свой requests.post, мимо call().
+        # Раньше guard его не покрывал — бот удалял сообщения в боевой группе.
+        check(
+            "dry-run: delete_message не удаляет чужое сообщение",
+            tg.delete_message(-500, 12345) is True,
+            None,
+        )
+
+        # И полный прогон сообщения через бота: в базу и Lark ничего,
+        # а в чат — только внутри тестового топика.
+        sent.clear()
+        captured.clear()
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=5994,
+        ))
+        check(
+            "dry-run: ответ ушёл только в тестовый топик",
+            bool(SENT) and all(item["thread_id"] == 5994 for item in SENT),
+            SENT,
+        )
+        check(
+            "dry-run: в боевой топик ничего не ушло",
+            all(item["thread_id"] != 2 for item in SENT),
+            SENT,
+        )
+        check("dry-run: сообщения в чате не удалялись", DELETED == [], DELETED)
+        check(
+            "dry-run: в Lark и Supabase не ходили",
+            real_http_calls == [],
+            real_http_calls,
+        )
+    finally:
+        stdb.requests.post = original_stdb_post
+        lm.requests.post = original_hook_post
+        bot.tg.requests.post = original_tg_post
+        tg.send_message = original_tg_send
+        bot.tg.send_message = original_tg_send
+
+        if original_flag is None:
+            os.environ.pop("TELEGRAM_DRY_RUN", None)
+        else:
+            os.environ["TELEGRAM_DRY_RUN"] = original_flag
+
+        if original_prefix is None:
+            os.environ.pop("TELEGRAM_TEST_REPLY_PREFIX", None)
+        else:
+            os.environ["TELEGRAM_TEST_REPLY_PREFIX"] = original_prefix
+
+        if original_listen is None:
+            os.environ.pop("TELEGRAM_LISTEN_TOPICS", None)
+        else:
+            os.environ["TELEGRAM_LISTEN_TOPICS"] = original_listen
+
+
+def test_error_menu_parse_and_keyboard():
+    """Разбор TELEGRAM_ERROR_MENU и построение кнопок обоих уровней."""
+    menu = bot.parse_error_menu(
+        "Robot = Abnormal walking | Stuck; Location = Wrong slot; Qr Code"
+    )
+
+    check(
+        "меню: категории и подтипы разобраны",
+        menu == {
+            "Robot": ("Abnormal walking", "Stuck"),
+            "Location": ("Wrong slot",),
+            "Qr Code": (),
+        },
+        menu,
+    )
+    check(
+        "меню: порядок категорий сохранён",
+        list(menu) == ["Robot", "Location", "Qr Code"],
+        list(menu),
+    )
+    check(
+        "меню: перенос строки работает как разделитель",
+        bot.parse_error_menu("A = 1\nB = 2") == {"A": ("1",), "B": ("2",)},
+        bot.parse_error_menu("A = 1\nB = 2"),
+    )
+    check("меню: пустая строка даёт пустое меню", bot.parse_error_menu("   ") == {})
+    check(
+        "меню: пустые подтипы отбрасываются",
+        bot.parse_error_menu("A = x |  | y") == {"A": ("x", "y")},
+        bot.parse_error_menu("A = x |  | y"),
+    )
+
+    original = bot.ERROR_MENU
+
+    try:
+        bot.ERROR_MENU = menu
+
+        root = bot.error_menu_keyboard(())
+        labels = [row[0]["text"] for row in root["inline_keyboard"]]
+        check(
+            "меню: первый уровень — категории",
+            labels == ["📂 Robot", "📂 Location", "• Qr Code", "✖️ Cancel"],
+            labels,
+        )
+        check(
+            "меню: категория с подтипами ведёт внутрь",
+            root["inline_keyboard"][0][0]["callback_data"] == "em:c:0",
+        )
+        check(
+            "меню: категория без подтипов помечена точкой",
+            "📂" not in root["inline_keyboard"][2][0]["text"],
+        )
+
+        second = bot.error_menu_keyboard((0,))
+        labels = [row[0]["text"] for row in second["inline_keyboard"]]
+        check(
+            "меню: второй уровень — подтипы, назад и отмена",
+            labels == ["• Abnormal walking", "• Stuck", "⬅️ Back", "✖️ Cancel"],
+            labels,
+        )
+        check(
+            "меню: подтип ведёт на лист",
+            second["inline_keyboard"][1][0]["callback_data"] == "em:l:0.1",
+        )
+        check(
+            "меню: метка листа склеена из уровней",
+            bot.error_menu_label((0, 1)) == "Robot · Stuck",
+            bot.error_menu_label((0, 1)),
+        )
+        check(
+            "меню: битый путь даёт пустую метку",
+            bot.error_menu_label((9, 9)) == "",
+            bot.error_menu_label((9, 9)),
+        )
+        check(
+            "меню: метка категории без подтипов",
+            bot.error_menu_label((1,)) == "Location",
+            bot.error_menu_label((1,)),
+        )
+        check("меню: разбор пути «0.1»", bot._parse_menu_path("0.1") == (0, 1))
+        check("меню: мусорный путь игнорируется", bot._parse_menu_path("abc") == ())
+    finally:
+        bot.ERROR_MENU = original
+
+
+def test_error_menu_photo_flow():
+    """Фото → меню с кнопками → тип → номер → запись с фото."""
+    original_menu = bot.ERROR_MENU
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_send_photo = bot.tg.send_photo
+    original_edit_caption = bot.tg.edit_message_caption
+    original_delete = bot.tg.delete_message
+
+    bot.ERROR_MENU = bot.parse_error_menu("Robot = Abnormal walking | Stuck")
+    bot.PHOTO_ATTACH_ENABLED = True
+
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    with bot._menu_lock:
+        bot._pending_error_menu.clear()
+
+    with bot._choice_lock:
+        bot._pending_error_choice.clear()
+
+    sent_photos = []
+    edited = []
+    deleted = []
+
+    bot.tg.send_photo = lambda chat_id, path, **kw: (
+        sent_photos.append(kw), {"message_id": 777}
+    )[1]
+    bot.tg.edit_message_caption = lambda chat_id, mid, caption, **kw: (
+        edited.append((mid, caption, kw.get("reply_markup"))), {"message_id": mid}
+    )[1]
+    bot.tg.delete_message = lambda chat_id, mid: (deleted.append(mid), True)[1]
+
+    try:
+        # 1. Фото без подписи: возвращается с кнопками, исходное удаляется.
+        run(make_update(photo=True, thread_id=2))
+
+        check(
+            "меню-фото: фото отправлено с кнопками",
+            len(sent_photos) == 1
+            and "inline_keyboard" in (sent_photos[0].get("reply_markup") or {}),
+            sent_photos,
+        )
+        check(
+            "меню-фото: подпись предлагает выбрать тип",
+            sent_photos
+            and "Выберите тип ошибки" in (sent_photos[0].get("caption") or ""),
+            sent_photos,
+        )
+        check(
+            "меню-фото: исходное сообщение удалено",
+            len(deleted) == 1,
+            deleted,
+        )
+
+        # 2. Нажатие категории перерисовывает подпись на второй уровень.
+        run(make_callback("em:c:0"))
+
+        check(
+            "меню-фото: нажатие категории меняет подпись",
+            len(edited) == 1 and "Выберите подробнее" in edited[0][1],
+            edited,
+        )
+        labels = [
+            row[0]["text"]
+            for row in (edited[0][2] or {}).get("inline_keyboard", [])
+        ]
+        check(
+            "меню-фото: показаны подтипы",
+            labels == ["• Abnormal walking", "• Stuck", "⬅️ Back", "✖️ Cancel"],
+            labels,
+        )
+
+        # 3. Выбор подтипа: бот спрашивает номер робота.
+        sent = run(make_callback("em:l:0.1"))
+
+        check(
+            "меню-фото: после выбора типа просят номер",
+            any("номер робота" in item["text"] for item in sent),
+            sent,
+        )
+        check(
+            "меню-фото: тип запомнен",
+            (bot.peek_pending_error_choice(-500, 100) or {}).get("label")
+            == "Robot · Stuck",
+            bot.peek_pending_error_choice(-500, 100),
+        )
+
+        # 4. Номер робота: запись создаётся вместе с фото.
+        forwarded = []
+        original_forward = bot.send_error_with_photo
+        original_store = bot.store_photo_for_record
+        bot.send_error_with_photo = (
+            lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
+                forwarded.append((parsed, photo_path)), "link"
+            )[1]
+        )
+        bot.store_photo_for_record = lambda saved, path: "https://storage/p.jpg"
+
+        try:
+            run(make_update(text="3780", thread_id=2))
+        finally:
+            bot.send_error_with_photo = original_forward
+            bot.store_photo_for_record = original_store
+
+        check(
+            "меню-фото: запись создана с выбранным типом",
+            len(forwarded) == 1
+            and forwarded[0][0]["error_text"] == "Robot · Stuck",
+            forwarded,
+        )
+        check(
+            "меню-фото: фото прикреплено к записи",
+            len(forwarded) == 1 and bool(forwarded[0][1]),
+            forwarded,
+        )
+        check(
+            "меню-фото: состояние очищено",
+            bot.peek_pending_error_choice(-500, 100) is None,
+        )
+    finally:
+        bot.ERROR_MENU = original_menu
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.tg.send_photo = original_send_photo
+        bot.tg.edit_message_caption = original_edit_caption
+        bot.tg.delete_message = original_delete
+
+        with bot._menu_lock:
+            bot._pending_error_menu.clear()
+
+        with bot._choice_lock:
+            bot._pending_error_choice.clear()
+
+
 def main():
     tests = [
         test_parse_command,
@@ -6269,6 +6883,12 @@ def main():
         test_lark_hooks_resolve,
         test_error_and_status_hooks_by_warehouse,
         test_no_spam_for_non_text_messages,
+        test_listen_topics_whitelist,
+        test_listen_topics_end_to_end,
+        test_ignore_topics_blocks_everything,
+        test_dry_run_suppresses_everything,
+        test_error_menu_parse_and_keyboard,
+        test_error_menu_photo_flow,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

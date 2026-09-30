@@ -79,7 +79,33 @@ def _hook_post(url: str, payload: dict):
 
     Возвращает dict: при сбое — {"code": -1, ...}, чтобы вызывающий код
     увидел неуспех (hook_ok) и сработал fallback, а не получил исключение.
+
+    В режиме TELEGRAM_DRY_RUN (тестовый бот) в сеть не ходим вообще:
+    сообщение печатается в лог, а наружу отдаётся успешный ответ, чтобы
+    вызывающий код не уходил в fallback-ветки.
     """
+    if os.environ.get("TELEGRAM_DRY_RUN", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        kind = payload.get("msg_type")
+
+        if kind == "text":
+            preview = (payload.get("content") or {}).get("text", "")
+        elif kind == "interactive":
+            header = (payload.get("card") or {}).get("header") or {}
+            preview = (header.get("title") or {}).get("content", "")
+        else:
+            preview = json.dumps(payload, ensure_ascii=False)
+
+        logger.info(
+            "[DRY-RUN] в Lark не отправлено: hook=…%s type=%s payload=%r",
+            str(url or "").rstrip("/").split("/")[-1][:8],
+            kind,
+            " ".join(str(preview).split())[:200],
+        )
+
+        return {"code": 0, "msg": "dry-run"}
+
     try:
         response = requests.post(url, json=payload, timeout=15)
     except requests.exceptions.RequestException as e:
