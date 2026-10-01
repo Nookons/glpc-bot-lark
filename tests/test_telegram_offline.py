@@ -6911,6 +6911,89 @@ def test_menu_card_includes_module():
             store.clear()
 
 
+def test_menu_on_any_photo_and_caption_kept():
+    """Меню открывается на фото с подписью; подпись не теряется."""
+    original_menu = bot.ERROR_MENU
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_send_photo = bot.tg.send_photo
+    original_edit_caption = bot.tg.edit_message_caption
+
+    bot.ERROR_MENU = bot.parse_error_menu("Robot = Lifting | !bug")
+    bot.PHOTO_ATTACH_ENABLED = False
+
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    for store in (bot._pending_error_menu, bot._pending_error_choice,
+                  bot._pending_custom_text):
+        store.clear()
+
+    bot.tg.send_photo = lambda chat_id, path, **kw: {"message_id": 777}
+    bot.tg.edit_message_caption = lambda *a, **kw: {"message_id": 1}
+
+    captured = []
+    original_forward = bot.send_error_with_photo
+    original_store = bot.store_photo_for_record
+    original_plain = bot.forward_error
+
+    bot.send_error_with_photo = (
+        lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
+            captured.append((parsed, dict(lines))), "link"
+        )[1]
+    )
+    bot.store_photo_for_record = lambda saved, path: "https://storage/p.jpg"
+    bot.forward_error = lambda parsed, lines, warehouse=None: (
+        captured.append((parsed, dict(lines))), True
+    )[1]
+
+    try:
+        # Фото С ПОДПИСЬЮ (не в формате ошибки) тоже открывает меню.
+        run(make_update(
+            photo=True,
+            caption="тут видно ошибку на экране",
+            thread_id=2,
+        ))
+
+        check(
+            "подпись: меню открылось на фото с подписью",
+            bot.peek_error_menu(-500, 100) is not None,
+        )
+        check(
+            "подпись: текст подписи сохранён в меню",
+            (bot.peek_error_menu(-500, 100) or {}).get("note")
+            == "тут видно ошибку на экране",
+            bot.peek_error_menu(-500, 100),
+        )
+
+        # Проходим флоу до карточки и проверяем, что подпись доехала.
+        run(make_callback("em:l:0.0"))
+        run(make_update(text="3780", thread_id=2))
+
+        parsed, lines = captured[0] if captured else ({}, {})
+        check(
+            "подпись: ушла в карточку как Note",
+            parsed.get("note") == "тут видно ошибку на экране",
+            parsed.get("note"),
+        )
+        check(
+            "подпись: в карточке есть строка Note",
+            any("Note" in k for k in lines),
+            list(lines),
+        )
+    finally:
+        bot.ERROR_MENU = original_menu
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.tg.send_photo = original_send_photo
+        bot.tg.edit_message_caption = original_edit_caption
+        bot.send_error_with_photo = original_forward
+        bot.store_photo_for_record = original_store
+        bot.forward_error = original_plain
+
+        for store in (bot._pending_error_menu, bot._pending_error_choice,
+                      bot._pending_custom_text):
+            store.clear()
+
+
 def test_error_menu_photo_flow():
     """Фото → меню с кнопками → тип → номер → запись с фото."""
     original_menu = bot.ERROR_MENU
@@ -7169,6 +7252,7 @@ def main():
         test_error_menu_modules_and_actions,
         test_error_menu_bug_other_and_custom_text,
         test_menu_card_includes_module,
+        test_menu_on_any_photo_and_caption_kept,
         test_error_menu_photo_flow,
     ]
 

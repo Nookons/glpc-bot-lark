@@ -2208,6 +2208,7 @@ def _show_error_menu(
     photo_path,
     message_id,
     warehouse,
+    note: str = "",
     path: tuple = (),
 ):
     """
@@ -2256,6 +2257,8 @@ def _show_error_menu(
         "menu_message_id": (sent or {}).get("message_id"),
         "warehouse": warehouse or current_warehouse(),
         "thread_id": _reply_thread(chat_id),
+        # Подпись к фото не теряем: она уйдёт в карточку как комментарий.
+        "note": (note or "").strip(),
     })
 
     logger.info(
@@ -3159,6 +3162,7 @@ def _handle_menu_action(chat_id, sender, pending, code, message_id, callback_id)
         set_pending_custom_text(chat_id, sender.get("id"), {
             "sender": sender,
             "photo_path": pending.get("path"),
+            "note": pending.get("note") or "",
             "warehouse": pending.get("warehouse") or current_warehouse(),
             "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
             "menu_message_id": message_id,
@@ -3248,6 +3252,7 @@ def _ask_robot_number(chat_id, sender, pending, label, message_id):
         "sender": sender,
         "label": label,
         "photo_path": pending.get("path"),
+        "note": pending.get("note") or "",
         "warehouse": pending.get("warehouse") or current_warehouse(),
         "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
         "menu_message_id": message_id,
@@ -3321,6 +3326,7 @@ def _finish_error_menu(chat_id, sender, pending, path, message_id, callback_id):
         "sender": sender,
         "label": label,
         "photo_path": pending.get("path"),
+        "note": pending.get("note") or "",
         "warehouse": pending.get("warehouse") or current_warehouse(),
         "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
         "menu_message_id": message_id,
@@ -3830,6 +3836,12 @@ def save_and_forward_error(
     if module:
         table_lines.insert(3, ("🔧 Module", module))
 
+    # Подпись к фото сотрудника — отдельной строкой.
+    note = parsed.get("note")
+
+    if note:
+        table_lines.append(("💬 Note", note))
+
     # Фото, которое ждало текст ошибки (сотрудник прислал фото раньше).
     # Это отдельная legacy-механизм: её и включает PHOTO_ATTACH_ENABLED.
     # А фото, переданное аргументом (меню типа ошибки, подпись к фото),
@@ -3996,13 +4008,17 @@ def handle_photo(chat_id, sender, message, message_id):
     # Меню типа ошибки идёт ПЕРВЫМ: иначе фото перехватит ветка «просто
     # переслать в Lark» (PHOTO_ATTACH_ENABLED выключен по умолчанию), и
     # кнопок не будет.
-    if ERROR_MENU and not caption:
+    #
+    # Меню показывается на ЛЮБОЕ фото, включая с подписью: так сотрудник
+    # одинаково выбирает тип кнопками, и подпись не ломает флоу.
+    if ERROR_MENU:
         _show_error_menu(
             chat_id,
             sender,
             destination,
             message_id,
             current_warehouse(),
+            note=caption,
         )
         return
 
@@ -4360,6 +4376,8 @@ def _finish_error_choice(chat_id, sender, choice, number, message_id):
         "robot": str(number).strip().lstrip("#"),
         "category": category or None,
         "module": module or None,
+        # Подпись к фото — как комментарий сотрудника.
+        "note": (choice.get("note") or "").strip() or None,
     }
 
     logger.info(
@@ -4488,6 +4506,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             sender,
             {
                 "path": custom.get("photo_path"),
+                "note": custom.get("note") or "",
                 "warehouse": custom.get("warehouse"),
                 "thread_id": custom.get("thread_id"),
             },
