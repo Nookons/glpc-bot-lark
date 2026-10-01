@@ -348,17 +348,35 @@ PHOTO_ATTACH_ENABLED = _env_bool("PHOTO_ATTACH_ENABLED", False)
 #
 # Формат переменной TELEGRAM_ERROR_MENU:
 #
-#     Robot = Abnormal walking | Damaged body | Lost position
+#     Robot = Lifting | Rotation | Tray | Chassis | !bug | !other | !custom
 #     Workstation = Offline | Wrong task
 #     Location = Wrong slot
-#     Qr Code = Unreadable
 #
 # Первый уровень — категории (Robot/Workstation/...). Если у категории
 # после «=» есть значения, показывается второй уровень с ними. Если
 # значений нет — категория сразу становится типом ошибки.
 #
+# Специальные пункты начинаются с «!» и делают не просто тип ошибки:
+#
+#     !bug     — тип «Bug» (сбой ПО)
+#     !other   — тип «Other» (всё остальное)
+#     !custom  — попросить сотрудника описать ошибку текстом
+#
+# Обычный пункт (без «!») — это модуль/узел: нажатие сразу даёт тип
+# «<категория> · <пункт>», например «Robot · Lifting».
+#
 # Пусто — меню выключено, работает прежний ввод текстом.
 ERROR_MENU_RAW = os.environ.get("TELEGRAM_ERROR_MENU", "").strip()
+
+# Какие спец-пункты распознаём и как они называются на кнопке.
+MENU_ACTIONS = {
+    "!bug": ("Bug", "🐞 Bug"),
+    "!other": ("Other", "• Other"),
+    "!custom": ("", "✏️ Описать самому"),
+}
+
+# Срок, в течение которого ждём описание ошибки текстом.
+CUSTOM_TEXT_TTL_SECONDS = _env_int("TELEGRAM_CUSTOM_TEXT_TTL", 900)
 
 
 def parse_error_menu(raw: str) -> dict:
@@ -1609,10 +1627,25 @@ def error_menu_keyboard(path: tuple = ()) -> dict:
         _title, items = parent
 
         for index, item in enumerate(items):
+            action = MENU_ACTIONS.get(item.strip().casefold())
+
+            if action:
+                # Спец-пункт: Bug/Other сразу дают тип, «Описать» просит текст.
+                label, button = action
+                code = "custom" if not label else label.lower()
+
+                rows.append([{
+                    "text": button,
+                    "callback_data": f"em:a:{code}",
+                }])
+                continue
+
+            row_path = ".".join(str(p) for p in path + (index,))
+
             rows.append([{
                 "text": f"• {item}",
                 # Путь до листа: em:l:<индексы через точку>
-                "callback_data": f"em:l:{'.'.join(str(p) for p in path + (index,))}",
+                "callback_data": f"em:l:{row_path}",
             }])
 
         parent_path = ".".join(str(p) for p in path[:-1])
@@ -2947,6 +2980,10 @@ def _parse_menu_path(raw: str) -> tuple:
 
 # (chat_id, user_id) -> выбранный тип, ожидающий номер робота.
 _pending_error_choice = {}
+
+# (chat_id, user_id) -> ждём описание ошибки текстом («Описать самому»).
+_pending_custom_text = {}
+
 _choice_lock = threading.Lock()
 
 
@@ -3011,6 +3048,28 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
         _delete_quiet(chat_id, message_id)
         return
 
+    # Кнопки с номером робота живут на шаге ПОСЛЕ выбора типа, когда меню
+    # уже закрыто, поэтому их проверяем до требования активного меню.
+    if action == "n":
+        choice = peek_pending_error_choice(chat_id, sender.get("id"))
+
+        if not choice:
+            if callback_id:
+                tg.answer_callback_query(callback_id, "\u041c\u0435\u043d\u044e \u0443\u0441\u0442\u0430\u0440\u0435\u043b\u043e")
+
+            _delete_quiet(chat_id, message_id)
+            return
+
+        if callback_id:
+            tg.answer_callback_query(callback_id, f"Robot #{raw_path}")
+
+        _delete_quiet(chat_id, message_id)
+
+        with reply_thread(choice.get("thread_id")):
+            _finish_error_choice(chat_id, sender, choice, raw_path, message_id)
+
+        return
+
     pending = peek_error_menu(chat_id, sender.get("id"))
 
     if not pending:
@@ -3064,8 +3123,175 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
         )
         return
 
+    if action == "a":
+        _handle_menu_action(
+            chat_id, sender, pending, raw_path, message_id, callback_id
+        )
+        return
+
     if callback_id:
         tg.answer_callback_query(callback_id)
+
+
+def _handle_menu_action(chat_id, sender, pending, code, message_id, callback_id):
+    """
+    Спец-пункт меню: Bug, Other или «Описать самому».
+
+    Bug и Other — сразу финальный тип. «Описать самому» переводит бота в
+    режим ожидания текста: сотрудник пишет, что случилось, и его текст
+    становится типом ошибки.
+    """
+    code = str(code or "").strip().casefold()
+
+    if code == "custom":
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Опишите ошибку")
+
+        sent = _send(
+            chat_id,
+            "✏️ Опишите ошибку одним сообщением.\n"
+            "Например: «не поднимает полку, мигает красный индикатор»",
+            reply_to_message_id=message_id,
+        )
+
+        take_error_menu(chat_id, sender.get("id"))
+
+        set_pending_custom_text(chat_id, sender.get("id"), {
+            "sender": sender,
+            "photo_path": pending.get("path"),
+            "warehouse": pending.get("warehouse") or current_warehouse(),
+            "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
+            "menu_message_id": message_id,
+            "prompt_message_id": (sent or {}).get("message_id"),
+        })
+
+        logger.info("Меню: выбран режим «описать самому» (chat=%s)", chat_id)
+        return
+
+    # Bug / Other — финальные типы, номер робота спрашиваем сразу.
+    if code == "bug":
+        label = MENU_ACTIONS["!bug"][0]
+    elif code == "other":
+        label = MENU_ACTIONS["!other"][0]
+    else:
+        if callback_id:
+            tg.answer_callback_query(callback_id, "Не понял выбор")
+
+        return
+
+    take_error_menu(chat_id, sender.get("id"))
+
+    if callback_id:
+        tg.answer_callback_query(callback_id, label)
+
+    _ask_robot_number(chat_id, sender, pending, label, message_id)
+
+
+def set_pending_custom_text(chat_id, user_id, data: dict):
+    with _choice_lock:
+        _pending_custom_text[_photo_key(chat_id, user_id)] = dict(
+            data,
+            expires=time.time() + CUSTOM_TEXT_TTL_SECONDS,
+        )
+
+
+def peek_pending_custom_text(chat_id, user_id):
+    key = _photo_key(chat_id, user_id)
+
+    with _choice_lock:
+        data = _pending_custom_text.get(key)
+
+    if not data or data.get("expires", 0) < time.time():
+        return None
+
+    return data
+
+
+def clear_pending_custom_text(chat_id, user_id):
+    with _choice_lock:
+        return _pending_custom_text.pop(_photo_key(chat_id, user_id), None)
+
+
+def sweep_custom_texts() -> int:
+    """Убирает просроченные ожидания описания, чтобы словарь не рос."""
+    now = time.time()
+
+    with _choice_lock:
+        stale = [
+            key for key, data in _pending_custom_text.items()
+            if data.get("expires", 0) < now
+        ]
+
+        for key in stale:
+            _pending_custom_text.pop(key, None)
+
+    return len(stale)
+
+
+def _ask_robot_number(chat_id, sender, pending, label, message_id):
+    """
+    Спрашивает номер робота: текстом и быстрыми кнопками.
+
+    Кнопки — подсказки по номерам этого склада: часто робота вводят с
+    опечаткой, а так его можно выбрать одним нажатием.
+    """
+    sent = _send(
+        chat_id,
+        f"✅ Тип: {label}\n\n"
+        "Отправьте номер робота (только цифры), например:\n3780",
+        reply_to_message_id=message_id,
+        reply_markup=robot_number_keyboard(chat_id),
+    )
+
+    set_pending_error_choice(chat_id, sender.get("id"), {
+        "chat_id": chat_id,
+        "sender": sender,
+        "label": label,
+        "photo_path": pending.get("path"),
+        "warehouse": pending.get("warehouse") or current_warehouse(),
+        "thread_id": pending.get("thread_id") or _reply_thread(chat_id),
+        "menu_message_id": message_id,
+        "prompt_message_id": (sent or {}).get("message_id"),
+    })
+
+
+def robot_number_keyboard(chat_id) -> dict:
+    """
+    Кнопки с частыми номерами роботов склада.
+
+    Ошибка чтения справочника — не повод ломать флоу: тогда кнопок просто
+    нет, и сотрудник вводит номер текстом, как раньше.
+    """
+    try:
+        numbers = robot_card.robot_numbers(warehouse=current_warehouse())
+    except Exception:
+        logger.exception("Не удалось получить номера роботов для кнопок")
+        numbers = None
+
+    if not numbers:
+        return None
+
+    # Последние в справочнике — обычно самые «свежие» и нужные.
+    recent = list(numbers)[-8:][::-1]
+    rows = []
+    row = []
+
+    for number in recent:
+        row.append({
+            "text": str(number),
+            "callback_data": f"em:n:{number}",
+        })
+
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([{"text": "✖️ Отмена", "callback_data": "em:x"}])
+
+    return {"inline_keyboard": rows}
 
 
 def _finish_error_menu(chat_id, sender, pending, path, message_id, callback_id):
@@ -3597,15 +3823,22 @@ def save_and_forward_error(
         ("📊 Shift issues", str(count)),
     ]
 
+    # Меню типа ошибки под фото: показываем выбранный модуль отдельной
+    # строкой, чтобы в карточке было видно и узел, и что с ним случилось.
+    module = parsed.get("module")
+
+    if module:
+        table_lines.insert(3, ("🔧 Module", module))
+
     # Фото, которое ждало текст ошибки (сотрудник прислал фото раньше).
+    # Это отдельная legacy-механизм: её и включает PHOTO_ATTACH_ENABLED.
+    # А фото, переданное аргументом (меню типа ошибки, подпись к фото),
+    # от этого флага не зависит — оно уже у бота на руках.
     waited_photo = (
         take_pending_photo(chat_id, sender.get("id"))
         if PHOTO_ATTACH_ENABLED
         else None
     )
-
-    if not PHOTO_ATTACH_ENABLED:
-        photo_path = None
 
     if waited_photo and not photo_path:
         photo_path = waited_photo.get("path")
@@ -3760,6 +3993,19 @@ def handle_photo(chat_id, sender, message, message_id):
     caption = (message.get("caption") or "").strip()
     employee_name = get_employee_name(sender.get("id"))
 
+    # Меню типа ошибки идёт ПЕРВЫМ: иначе фото перехватит ветка «просто
+    # переслать в Lark» (PHOTO_ATTACH_ENABLED выключен по умолчанию), и
+    # кнопок не будет.
+    if ERROR_MENU and not caption:
+        _show_error_menu(
+            chat_id,
+            sender,
+            destination,
+            message_id,
+            current_warehouse(),
+        )
+        return
+
     if not PHOTO_ATTACH_ENABLED:
         # Привязка выключена: фото просто уходит в группу (как раньше).
         photo_caption = (
@@ -3827,18 +4073,6 @@ def handle_photo(chat_id, sender, message, message_id):
             recent,
             destination,
             message_id,
-        )
-        return
-
-    # 2.5) Меню типа ошибки: фото возвращается с кнопками, исходное
-    # сообщение удаляется. Так сотрудник не набирает текст вручную.
-    if ERROR_MENU and not caption:
-        _show_error_menu(
-            chat_id,
-            sender,
-            destination,
-            message_id,
-            current_warehouse(),
         )
         return
 
@@ -4116,10 +4350,16 @@ def _finish_error_choice(chat_id, sender, choice, number, message_id):
     warehouse = choice.get("warehouse") or current_warehouse()
     thread_id = choice.get("thread_id")
 
+    # category/module — из меню: "Robot \u00b7 Lifting" -> category="Robot",
+    # module="Lifting". В карточке они идут отдельными строками.
+    category, _, module = label.partition(" \u00b7 ")
+
     parsed = {
         "error_type": label,
         "error_text": label,
         "robot": str(number).strip().lstrip("#"),
+        "category": category or None,
+        "module": module or None,
     }
 
     logger.info(
@@ -4234,6 +4474,28 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
 
     # Меню типа ошибки уже пройдено: ждём номер робота. Проверяем раньше
     # обычного разбора, иначе «3780» не распознается как ошибка (нет формата).
+    # "Custom" from the menu: any text is a free-form issue description,
+    # not a "<type>: <text>. <robot>" message, so handle it before parsing
+    # and before the robot-number step.
+    custom = peek_pending_custom_text(chat_id, sender.get("id"))
+
+    if custom:
+        clear_pending_custom_text(chat_id, sender.get("id"))
+        _delete_quiet(chat_id, custom.get("prompt_message_id"))
+
+        _ask_robot_number(
+            chat_id,
+            sender,
+            {
+                "path": custom.get("photo_path"),
+                "warehouse": custom.get("warehouse"),
+                "thread_id": custom.get("thread_id"),
+            },
+            text.strip(),
+            message_id,
+        )
+        return
+
     if not parsed and _looks_like_robot_number(text):
         choice = peek_pending_error_choice(chat_id, sender.get("id"))
 

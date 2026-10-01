@@ -6637,6 +6637,280 @@ def test_error_menu_parse_and_keyboard():
         bot.ERROR_MENU = original
 
 
+def test_error_menu_modules_and_actions():
+    """Модули HAI, кнопки Bug/Other и режим «описать самому»."""
+    original_menu = bot.ERROR_MENU
+
+    try:
+        bot.ERROR_MENU = bot.parse_error_menu(
+            "Robot = Lifting | Rotation | Chassis | !bug | !other | !custom"
+        )
+
+        second = bot.error_menu_keyboard((0,))
+        rows = [row[0] for row in second["inline_keyboard"]]
+
+        check(
+            "модули: перечислены как листья",
+            [r["text"] for r in rows[:3]]
+            == ["\u2022 Lifting", "\u2022 Rotation", "\u2022 Chassis"],
+            [r["text"] for r in rows],
+        )
+        check(
+            "модули: нажатие модуля даёт лист",
+            rows[0]["callback_data"] == "em:l:0.0",
+            rows[0],
+        )
+
+        by_code = {r["callback_data"]: r["text"] for r in rows}
+        check(
+            "модули: Bug — отдельное действие",
+            "em:a:bug" in by_code and "Bug" in by_code["em:a:bug"],
+            by_code.get("em:a:bug"),
+        )
+        check(
+            "модули: Other — отдельное действие",
+            "em:a:other" in by_code,
+            by_code.get("em:a:other"),
+        )
+        check(
+            "модули: «Описать самому» — отдельное действие",
+            "em:a:custom" in by_code and "\u270f" in by_code["em:a:custom"],
+            by_code.get("em:a:custom"),
+        )
+        check(
+            "модули: спец-пункты не стали листьями",
+            not any(
+                r["callback_data"].startswith("em:l:")
+                for r in rows if r["text"] in ("Bug", "Other")
+            ),
+            [r["callback_data"] for r in rows],
+        )
+
+        # Метка модуля склеена из категории и модуля.
+        check(
+            "модули: метка «Robot \u00b7 Lifting»",
+            bot.error_menu_label((0, 0)) == "Robot \u00b7 Lifting",
+            bot.error_menu_label((0, 0)),
+        )
+    finally:
+        bot.ERROR_MENU = original_menu
+
+
+def test_error_menu_bug_other_and_custom_text():
+    """Bug/Other сразу просят номер, «описать» берёт текст как тип."""
+    original_menu = bot.ERROR_MENU
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_send_photo = bot.tg.send_photo
+    original_edit_caption = bot.tg.edit_message_caption
+    original_delete = bot.tg.delete_message
+
+    bot.ERROR_MENU = bot.parse_error_menu(
+        "Robot = Lifting | Chassis | !bug | !other | !custom"
+    )
+    bot.PHOTO_ATTACH_ENABLED = False
+
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    for store in (bot._pending_error_menu, bot._pending_error_choice,
+                  bot._pending_custom_text):
+        store.clear()
+
+    bot.tg.send_photo = lambda chat_id, path, **kw: {"message_id": 777}
+    bot.tg.edit_message_caption = lambda *a, **kw: {"message_id": 1}
+    bot.tg.delete_message = lambda *a: True
+
+    original_numbers = robot_card_module.robot_numbers
+    robot_card_module.robot_numbers = lambda warehouse=None: ["3777", "3780"]
+
+    try:
+        # Bug: сразу спрашивает номер, без промежуточного уровня.
+        run(make_update(photo=True, thread_id=2))
+        sent = run(make_callback("em:a:bug"))
+
+        check(
+            "bug: сразу просит номер робота",
+            any("номер робота" in item["text"] for item in sent),
+            sent,
+        )
+        check(
+            "bug: тип записан как Bug",
+            (bot.peek_pending_error_choice(-500, 100) or {}).get("label") == "Bug",
+            bot.peek_pending_error_choice(-500, 100),
+        )
+        check(
+            "bug: кнопки с номерами роботов показаны",
+            any(item["reply_markup"] for item in sent),
+            sent,
+        )
+
+        bot.clear_pending_error_choice(-500, 100)
+
+        # Другая ветка: «описать самому» -> текст -> номер.
+        run(make_update(photo=True, thread_id=2))
+        sent = run(make_callback("em:a:custom"))
+
+        check(
+            "custom: просят описать ошибку",
+            any("Опишите ошибку" in item["text"] for item in sent),
+            sent,
+        )
+        check(
+            "custom: бот ждёт текст",
+            bot.peek_pending_custom_text(-500, 100) is not None,
+        )
+
+        sent = run(make_update(text="не поднимает полку", thread_id=2))
+
+        check(
+            "custom: текст стал типом ошибки",
+            (bot.peek_pending_error_choice(-500, 100) or {}).get("label")
+            == "не поднимает полку",
+            bot.peek_pending_error_choice(-500, 100),
+        )
+        check(
+            "custom: после текста просят номер",
+            any("номер робота" in item["text"] for item in sent),
+            sent,
+        )
+        check(
+            "custom: ожидание текста сброшено",
+            bot.peek_pending_custom_text(-500, 100) is None,
+        )
+
+        # Номер кнопкой: создаётся запись с выбранным типом.
+        forwarded = []
+        original_forward = bot.send_error_with_photo
+        original_store = bot.store_photo_for_record
+        original_plain = bot.forward_error
+
+        bot.send_error_with_photo = (
+            lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
+                forwarded.append(parsed), "link"
+            )[1]
+        )
+        bot.store_photo_for_record = lambda saved, path: "https://storage/p.jpg"
+        bot.forward_error = lambda parsed, lines, warehouse=None: (
+            forwarded.append(parsed), True
+        )[1]
+
+        try:
+            run(make_callback("em:n:3780", message_id=2))
+        finally:
+            bot.send_error_with_photo = original_forward
+            bot.store_photo_for_record = original_store
+            bot.forward_error = original_plain
+
+        check(
+            "номер кнопкой: запись создана с типом из текста",
+            forwarded
+            and forwarded[0]["error_text"] == "не поднимает полку"
+            and forwarded[0]["robot"] == "3780",
+            forwarded,
+        )
+    finally:
+        bot.ERROR_MENU = original_menu
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.tg.send_photo = original_send_photo
+        bot.tg.edit_message_caption = original_edit_caption
+        bot.tg.delete_message = original_delete
+        robot_card_module.robot_numbers = original_numbers
+
+        for store in (bot._pending_error_menu, bot._pending_error_choice,
+                      bot._pending_custom_text):
+            store.clear()
+
+
+def test_menu_card_includes_module():
+    """Карточка в Lark содержит и узел (Module), и робота, и фото."""
+    original_menu = bot.ERROR_MENU
+    original_flag = bot.PHOTO_ATTACH_ENABLED
+    original_send_photo = bot.tg.send_photo
+    original_edit_caption = bot.tg.edit_message_caption
+
+    bot.ERROR_MENU = bot.parse_error_menu("Robot = Lifting | Chassis | !bug")
+    bot.PHOTO_ATTACH_ENABLED = False
+
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+
+    for store in (bot._pending_error_menu, bot._pending_error_choice,
+                  bot._pending_custom_text):
+        store.clear()
+
+    bot.tg.send_photo = lambda chat_id, path, **kw: {"message_id": 777}
+    bot.tg.edit_message_caption = lambda *a, **kw: {"message_id": 1}
+
+    captured = []
+    original_forward = bot.send_error_with_photo
+    original_store = bot.store_photo_for_record
+
+    bot.send_error_with_photo = (
+        lambda parsed, lines, photo_path=None, photo_url=None, warehouse=None: (
+            captured.append((parsed, lines)), "link"
+        )[1]
+    )
+    bot.store_photo_for_record = lambda saved, path: "https://storage/p.jpg"
+
+    try:
+        # Robot -> Lifting -> номер
+        run(make_update(photo=True, thread_id=2))
+        run(make_callback("em:c:0"))
+        run(make_callback("em:l:0.0"))
+        run(make_update(text="3780", thread_id=2))
+
+        parsed = captured[0][0] if captured else {}
+        lines = dict(captured[0][1]) if captured else {}
+
+        check(
+            "карточка: категория и модуль разобраны",
+            parsed.get("category") == "Robot" and parsed.get("module") == "Lifting",
+            {k: parsed.get(k) for k in ("category", "module")},
+        )
+        check(
+            "карточка: есть отдельная строка Module",
+            any("Lifting" in str(v) for k, v in lines.items() if "Module" in k),
+            lines,
+        )
+        check(
+            "карточка: робот и сотрудник на месте",
+            any("3780" in str(v) for v in lines.values())
+            and any("Ivan" in str(v) for v in lines.values()),
+            lines,
+        )
+
+        # Bug без модуля: строки Module быть не должно.
+        captured.clear()
+        run(make_update(photo=True, thread_id=2))
+        run(make_callback("em:a:bug"))
+        run(make_update(text="3780", thread_id=2))
+
+        parsed = captured[0][0] if captured else {}
+        lines = dict(captured[0][1]) if captured else {}
+
+        check(
+            "карточка: у Bug модуля нет",
+            parsed.get("module") is None,
+            parsed.get("module"),
+        )
+        check(
+            "карточка: пустой Module не добавляется",
+            not any("Module" in k for k in lines),
+            list(lines),
+        )
+    finally:
+        bot.ERROR_MENU = original_menu
+        bot.PHOTO_ATTACH_ENABLED = original_flag
+        bot.tg.send_photo = original_send_photo
+        bot.tg.edit_message_caption = original_edit_caption
+        bot.send_error_with_photo = original_forward
+        bot.store_photo_for_record = original_store
+
+        for store in (bot._pending_error_menu, bot._pending_error_choice,
+                      bot._pending_custom_text):
+            store.clear()
+
+
 def test_error_menu_photo_flow():
     """Фото → меню с кнопками → тип → номер → запись с фото."""
     original_menu = bot.ERROR_MENU
@@ -6646,7 +6920,11 @@ def test_error_menu_photo_flow():
     original_delete = bot.tg.delete_message
 
     bot.ERROR_MENU = bot.parse_error_menu("Robot = Abnormal walking | Stuck")
-    bot.PHOTO_ATTACH_ENABLED = True
+
+    # ВАЖНО: привязка фото ВЫКЛЮЧЕНА — как в боевом конфиге. Меню обязано
+    # работать и в этом случае, иначе фото перехватит ветка «переслать в
+    # Lark как есть» и кнопок не будет.
+    bot.PHOTO_ATTACH_ENABLED = False
 
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
@@ -6888,6 +7166,9 @@ def main():
         test_ignore_topics_blocks_everything,
         test_dry_run_suppresses_everything,
         test_error_menu_parse_and_keyboard,
+        test_error_menu_modules_and_actions,
+        test_error_menu_bug_other_and_custom_text,
+        test_menu_card_includes_module,
         test_error_menu_photo_flow,
     ]
 
