@@ -1,0 +1,2352 @@
+{
+  "root_id": "root",
+  "nodes": {
+    "resolution-chassis-camera-malfunction": {
+      "id": "resolution-chassis-camera-malfunction",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery-key-and-set-to-dm-code",
+          "label": "Recovery key and set to DM code",
+          "next_node": null,
+          "description": "209 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery key and set to DM code",
+          "only_for": []
+        },
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "11 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "restart",
+          "label": "Restart",
+          "next_node": null,
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "Restart",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-problem-cannot-located": {
+      "id": "resolution-problem-cannot-located",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "145 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "change-of-position-and-recovery",
+          "label": "Change of position and recovery",
+          "next_node": null,
+          "description": "22 times",
+          "icon": "",
+          "status": "",
+          "value": "Change of position and recovery",
+          "only_for": []
+        },
+        {
+          "id": "changing-cs",
+          "label": "Changing CS",
+          "next_node": null,
+          "description": "8 times",
+          "icon": "",
+          "status": "",
+          "value": "Changing CS",
+          "only_for": []
+        },
+        {
+          "id": "moved-out",
+          "label": "Moved out",
+          "next_node": null,
+          "description": "8 times",
+          "icon": "",
+          "status": "",
+          "value": "Moved out",
+          "only_for": []
+        },
+        {
+          "id": "remote-recovery",
+          "label": "Remote recovery",
+          "next_node": null,
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "Remote recovery",
+          "only_for": []
+        },
+        {
+          "id": "key",
+          "label": "Key",
+          "next_node": null,
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "Key",
+          "only_for": []
+        },
+        {
+          "id": "moved-to-charging-station",
+          "label": "Moved to charging station",
+          "next_node": null,
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "Moved to charging station",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-lifting-height-error": {
+      "id": "resolution-lifting-height-error",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "case-placed-on-robot-recovery",
+          "label": "Case placed on robot, recovery",
+          "next_node": null,
+          "description": "117 times",
+          "icon": "",
+          "status": "",
+          "value": "Case placed on robot, recovery",
+          "only_for": []
+        },
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-wrong-pick-and-place-box-position": {
+      "id": "resolution-wrong-pick-and-place-box-position",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "82 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "change-of-position-and-recovery",
+          "label": "Change of position and recovery",
+          "next_node": null,
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "Change of position and recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-bug-program-logic-bug": {
+      "id": "resolution-bug-program-logic-bug",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "79 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "key",
+          "label": "Key",
+          "next_node": null,
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "Key",
+          "only_for": []
+        },
+        {
+          "id": "put-box-back",
+          "label": "Put box back",
+          "next_node": null,
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "Put box back",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-abnormal-lifting-mechanism": {
+      "id": "resolution-abnormal-lifting-mechanism",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "50 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "case-placed-on-robot-recovery",
+          "label": "Case placed on robot, recovery",
+          "next_node": null,
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "Case placed on robot, recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-foreign-objects-on-the-ground": {
+      "id": "resolution-foreign-objects-on-the-ground",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "dm-was-cleaned-recovery-key",
+          "label": "DM was cleaned, recovery key",
+          "next_node": null,
+          "description": "37 times",
+          "icon": "",
+          "status": "",
+          "value": "DM was cleaned, recovery key",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-obstacle-on-the-path": {
+      "id": "resolution-obstacle-on-the-path",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "moved-out",
+          "label": "Moved out",
+          "next_node": null,
+          "description": "30 times",
+          "icon": "",
+          "status": "",
+          "value": "Moved out",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-ground-code-dirty": {
+      "id": "resolution-ground-code-dirty",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "dm-was-cleaned-recovery-key",
+          "label": "DM was cleaned, recovery key",
+          "next_node": null,
+          "description": "26 times",
+          "icon": "",
+          "status": "",
+          "value": "DM was cleaned, recovery key",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-security-module-failure": {
+      "id": "resolution-security-module-failure",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "20 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        },
+        {
+          "id": "key",
+          "label": "Key",
+          "next_node": null,
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "Key",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-parameter-configuration-error": {
+      "id": "resolution-parameter-configuration-error",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "changed-mode-to-auto",
+          "label": "Changed mode to Auto",
+          "next_node": null,
+          "description": "15 times",
+          "icon": "",
+          "status": "",
+          "value": "Changed mode to Auto",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-hardware-damage": {
+      "id": "resolution-hardware-damage",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "remove-the-box",
+          "label": "Remove the box",
+          "next_node": null,
+          "description": "9 times",
+          "icon": "",
+          "status": "",
+          "value": "Remove the box",
+          "only_for": []
+        },
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-ground-positioning-deviation": {
+      "id": "resolution-ground-positioning-deviation",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "move-closer",
+          "label": "Move closer",
+          "next_node": null,
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "Move closer",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-driver-component-exception": {
+      "id": "resolution-driver-component-exception",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "key",
+          "label": "Key",
+          "next_node": null,
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "Key",
+          "only_for": []
+        },
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-uneven-ground": {
+      "id": "resolution-uneven-ground",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "resolution-ground-seam-effect": {
+      "id": "resolution-ground-seam-effect",
+      "title": "How was it resolved?",
+      "type": "choice",
+      "key": "resolution",
+      "description": "",
+      "next_node": "summary",
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Resolution",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "recovery",
+          "label": "Recovery",
+          "next_node": null,
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "Recovery",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-unable-to-drive": {
+      "id": "cause-unable-to-drive",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "chassis-camera-malfunction",
+          "label": "底盘相机故障 Chassis camera malfunction",
+          "next_node": "resolution-chassis-camera-malfunction",
+          "description": "222 times",
+          "icon": "",
+          "status": "",
+          "value": "底盘相机故障 Chassis camera malfunction",
+          "only_for": []
+        },
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "134 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        },
+        {
+          "id": "foreign-objects-on-the-ground",
+          "label": "地面异物Foreign objects on the ground",
+          "next_node": "resolution-foreign-objects-on-the-ground",
+          "description": "37 times",
+          "icon": "",
+          "status": "",
+          "value": "地面异物Foreign objects on the ground",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-lifting-mechanism",
+          "label": "举升机构异常 Abnormal lifting mechanism",
+          "next_node": "resolution-abnormal-lifting-mechanism",
+          "description": "34 times",
+          "icon": "",
+          "status": "",
+          "value": "举升机构异常 Abnormal lifting mechanism",
+          "only_for": []
+        },
+        {
+          "id": "ground-code-dirty",
+          "label": "地面码脏污 Ground code dirty",
+          "next_node": "resolution-ground-code-dirty",
+          "description": "26 times",
+          "icon": "",
+          "status": "",
+          "value": "地面码脏污 Ground code dirty",
+          "only_for": []
+        },
+        {
+          "id": "obstacle-on-the-path",
+          "label": "路径上有障碍物 Obstacle on the path",
+          "next_node": "resolution-obstacle-on-the-path",
+          "description": "24 times",
+          "icon": "",
+          "status": "",
+          "value": "路径上有障碍物 Obstacle on the path",
+          "only_for": []
+        },
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "11 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        },
+        {
+          "id": "driver-component-exception",
+          "label": "驱动组件异常 Driver component exception",
+          "next_node": "resolution-driver-component-exception",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "驱动组件异常 Driver component exception",
+          "only_for": []
+        },
+        {
+          "id": "uneven-ground",
+          "label": "地面不平 Uneven ground",
+          "next_node": "resolution-uneven-ground",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "地面不平 Uneven ground",
+          "only_for": []
+        },
+        {
+          "id": "lifting-height-error",
+          "label": "举升高度误差Lifting height error",
+          "next_node": "resolution-lifting-height-error",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "举升高度误差Lifting height error",
+          "only_for": []
+        },
+        {
+          "id": "ground-seam-effect",
+          "label": "地缝影响 Ground seam effect",
+          "next_node": "resolution-ground-seam-effect",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "地缝影响 Ground seam effect",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-no-object-detected": {
+      "id": "cause-no-object-detected",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "lifting-height-error",
+          "label": "举升高度误差Lifting height error",
+          "next_node": "resolution-lifting-height-error",
+          "description": "117 times",
+          "icon": "",
+          "status": "",
+          "value": "举升高度误差Lifting height error",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-lifting-mechanism",
+          "label": "举升机构异常 Abnormal lifting mechanism",
+          "next_node": "resolution-abnormal-lifting-mechanism",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "举升机构异常 Abnormal lifting mechanism",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-abnormal-pick-up-and-delivery": {
+      "id": "cause-abnormal-pick-up-and-delivery",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "wrong-pick-and-place-box-position",
+          "label": "取放箱位置错误 Wrong pick and place box position",
+          "next_node": "resolution-wrong-pick-and-place-box-position",
+          "description": "70 times",
+          "icon": "",
+          "status": "",
+          "value": "取放箱位置错误 Wrong pick and place box position",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-lifting-mechanism",
+          "label": "举升机构异常 Abnormal lifting mechanism",
+          "next_node": "resolution-abnormal-lifting-mechanism",
+          "description": "16 times",
+          "icon": "",
+          "status": "",
+          "value": "举升机构异常 Abnormal lifting mechanism",
+          "only_for": []
+        },
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "14 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-speed-error": {
+      "id": "cause-speed-error",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "26 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        },
+        {
+          "id": "security-module-failure",
+          "label": "安全模块故障Security module failure",
+          "next_node": "resolution-security-module-failure",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "安全模块故障Security module failure",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-robot-safety-device-triggered": {
+      "id": "cause-robot-safety-device-triggered",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "security-module-failure",
+          "label": "安全模块故障Security module failure",
+          "next_node": "resolution-security-module-failure",
+          "description": "14 times",
+          "icon": "",
+          "status": "",
+          "value": "安全模块故障Security module failure",
+          "only_for": []
+        },
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "14 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        },
+        {
+          "id": "hardware-damage",
+          "label": "硬件损坏 Hardware damage",
+          "next_node": "resolution-hardware-damage",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "硬件损坏 Hardware damage",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-abnormal-charging": {
+      "id": "cause-abnormal-charging",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "parameter-configuration-error",
+          "label": "参数配置错误 Parameter configuration error",
+          "next_node": "resolution-parameter-configuration-error",
+          "description": "15 times",
+          "icon": "",
+          "status": "",
+          "value": "参数配置错误 Parameter configuration error",
+          "only_for": []
+        },
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "8 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        },
+        {
+          "id": "ground-positioning-deviation",
+          "label": "地脚定位偏差 Ground positioning deviation",
+          "next_node": "resolution-ground-positioning-deviation",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "地脚定位偏差 Ground positioning deviation",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-two-robots-collide": {
+      "id": "cause-two-robots-collide",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "22 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-network-communication-abnormality": {
+      "id": "cause-network-communication-abnormality",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "21 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-collision-with-shelf": {
+      "id": "cause-collision-with-shelf",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "wrong-pick-and-place-box-position",
+          "label": "取放箱位置错误 Wrong pick and place box position",
+          "next_node": "resolution-wrong-pick-and-place-box-position",
+          "description": "15 times",
+          "icon": "",
+          "status": "",
+          "value": "取放箱位置错误 Wrong pick and place box position",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-obstacle-avoidance": {
+      "id": "cause-obstacle-avoidance",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        },
+        {
+          "id": "obstacle-on-the-path",
+          "label": "路径上有障碍物 Obstacle on the path",
+          "next_node": "resolution-obstacle-on-the-path",
+          "description": "6 times",
+          "icon": "",
+          "status": "",
+          "value": "路径上有障碍物 Obstacle on the path",
+          "only_for": []
+        },
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-box-stuck": {
+      "id": "cause-box-stuck",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "hardware-damage",
+          "label": "硬件损坏 Hardware damage",
+          "next_node": "resolution-hardware-damage",
+          "description": "9 times",
+          "icon": "",
+          "status": "",
+          "value": "硬件损坏 Hardware damage",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-drop-box-or-items": {
+      "id": "cause-drop-box-or-items",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "8 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-power-module-is-abnormal": {
+      "id": "cause-power-module-is-abnormal",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "problem-cannot-located",
+          "label": "无法定义异常 Problem Cannot located",
+          "next_node": "resolution-problem-cannot-located",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "无法定义异常 Problem Cannot located",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-zone-speed-limitation-failure": {
+      "id": "cause-zone-speed-limitation-failure",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        }
+      ]
+    },
+    "cause-forklift-detection-without-container": {
+      "id": "cause-forklift-detection-without-container",
+      "title": "What is the cause?",
+      "type": "choice",
+      "key": "cause",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Cause",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "bug-program-logic-bug",
+          "label": "程序逻辑BUG Program logic bug",
+          "next_node": "resolution-bug-program-logic-bug",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "程序逻辑BUG Program logic bug",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-equipment": {
+      "id": "problem-k50h-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "300 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        },
+        {
+          "id": "no-object-detected",
+          "label": "料箱检测无容器No object detected",
+          "next_node": "cause-no-object-detected",
+          "description": "66 times",
+          "icon": "",
+          "status": "",
+          "value": "料箱检测无容器No object detected",
+          "only_for": []
+        },
+        {
+          "id": "speed-error",
+          "label": "速度错误Speed Error",
+          "next_node": "cause-speed-error",
+          "description": "31 times",
+          "icon": "",
+          "status": "",
+          "value": "速度错误Speed Error",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-pick-up-and-delivery",
+          "label": "取放货异常Abnormal pick-up and delivery",
+          "next_node": "cause-abnormal-pick-up-and-delivery",
+          "description": "21 times",
+          "icon": "",
+          "status": "",
+          "value": "取放货异常Abnormal pick-up and delivery",
+          "only_for": []
+        },
+        {
+          "id": "robot-safety-device-triggered",
+          "label": "机器人安全装置触发Robot safety device triggered",
+          "next_node": "cause-robot-safety-device-triggered",
+          "description": "17 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人安全装置触发Robot safety device triggered",
+          "only_for": []
+        },
+        {
+          "id": "two-robots-collide",
+          "label": "机器人相互碰撞 Two robots collide",
+          "next_node": "cause-two-robots-collide",
+          "description": "6 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人相互碰撞 Two robots collide",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-charging",
+          "label": "充电异常Abnormal charging",
+          "next_node": "cause-abnormal-charging",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "充电异常Abnormal charging",
+          "only_for": []
+        },
+        {
+          "id": "collision-with-shelf",
+          "label": "撞货架Collision with Shelf",
+          "next_node": "cause-collision-with-shelf",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "撞货架Collision with Shelf",
+          "only_for": []
+        },
+        {
+          "id": "power-module-is-abnormal",
+          "label": "电源模块异常Power module is abnormal",
+          "next_node": "cause-power-module-is-abnormal",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "电源模块异常Power module is abnormal",
+          "only_for": []
+        },
+        {
+          "id": "obstacle-avoidance",
+          "label": "避障Obstacle avoidance",
+          "next_node": "cause-obstacle-avoidance",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "避障Obstacle avoidance",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-a42t-e2-hook-equipment": {
+      "id": "problem-a42t-e2-hook-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "116 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-pick-up-and-delivery",
+          "label": "取放货异常Abnormal pick-up and delivery",
+          "next_node": "cause-abnormal-pick-up-and-delivery",
+          "description": "67 times",
+          "icon": "",
+          "status": "",
+          "value": "取放货异常Abnormal pick-up and delivery",
+          "only_for": []
+        },
+        {
+          "id": "two-robots-collide",
+          "label": "机器人相互碰撞 Two robots collide",
+          "next_node": "cause-two-robots-collide",
+          "description": "16 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人相互碰撞 Two robots collide",
+          "only_for": []
+        },
+        {
+          "id": "collision-with-shelf",
+          "label": "撞货架Collision with Shelf",
+          "next_node": "cause-collision-with-shelf",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "撞货架Collision with Shelf",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-charging",
+          "label": "充电异常Abnormal charging",
+          "next_node": "cause-abnormal-charging",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "充电异常Abnormal charging",
+          "only_for": []
+        },
+        {
+          "id": "obstacle-avoidance",
+          "label": "避障Obstacle avoidance",
+          "next_node": "cause-obstacle-avoidance",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "避障Obstacle avoidance",
+          "only_for": []
+        },
+        {
+          "id": "speed-error",
+          "label": "速度错误Speed Error",
+          "next_node": "cause-speed-error",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "速度错误Speed Error",
+          "only_for": []
+        },
+        {
+          "id": "robot-safety-device-triggered",
+          "label": "机器人安全装置触发Robot safety device triggered",
+          "next_node": "cause-robot-safety-device-triggered",
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人安全装置触发Robot safety device triggered",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-work-station-equipment": {
+      "id": "problem-work-station-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "no-object-detected",
+          "label": "料箱检测无容器No object detected",
+          "next_node": "cause-no-object-detected",
+          "description": "52 times",
+          "icon": "",
+          "status": "",
+          "value": "料箱检测无容器No object detected",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-pick-up-and-delivery",
+          "label": "取放货异常Abnormal pick-up and delivery",
+          "next_node": "cause-abnormal-pick-up-and-delivery",
+          "description": "11 times",
+          "icon": "",
+          "status": "",
+          "value": "取放货异常Abnormal pick-up and delivery",
+          "only_for": []
+        },
+        {
+          "id": "collision-with-shelf",
+          "label": "撞货架Collision with Shelf",
+          "next_node": "cause-collision-with-shelf",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "撞货架Collision with Shelf",
+          "only_for": []
+        },
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-customer": {
+      "id": "problem-k50h-customer",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "37 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-environment": {
+      "id": "problem-k50h-environment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "27 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-system": {
+      "id": "problem-k50h-system",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "robot-safety-device-triggered",
+          "label": "机器人安全装置触发Robot safety device triggered",
+          "next_node": "cause-robot-safety-device-triggered",
+          "description": "11 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人安全装置触发Robot safety device triggered",
+          "only_for": []
+        },
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        },
+        {
+          "id": "zone-speed-limitation-failure",
+          "label": "区域限速故障 Zone speed limitation failure",
+          "next_node": "cause-zone-speed-limitation-failure",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "区域限速故障 Zone speed limitation failure",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-a42t-e2-hook-system": {
+      "id": "problem-a42t-e2-hook-system",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "obstacle-avoidance",
+          "label": "避障Obstacle avoidance",
+          "next_node": "cause-obstacle-avoidance",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "避障Obstacle avoidance",
+          "only_for": []
+        },
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        },
+        {
+          "id": "robot-safety-device-triggered",
+          "label": "机器人安全装置触发Robot safety device triggered",
+          "next_node": "cause-robot-safety-device-triggered",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "机器人安全装置触发Robot safety device triggered",
+          "only_for": []
+        },
+        {
+          "id": "forklift-detection-without-container",
+          "label": "货叉检测无容器Forklift detection without container",
+          "next_node": "cause-forklift-detection-without-container",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "货叉检测无容器Forklift detection without container",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-network": {
+      "id": "problem-k50h-network",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "network-communication-abnormality",
+          "label": "网络通讯异常Network communication abnormality",
+          "next_node": "cause-network-communication-abnormality",
+          "description": "16 times",
+          "icon": "",
+          "status": "",
+          "value": "网络通讯异常Network communication abnormality",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-charging-station-equipment": {
+      "id": "problem-charging-station-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "abnormal-charging",
+          "label": "充电异常Abnormal charging",
+          "next_node": "cause-abnormal-charging",
+          "description": "11 times",
+          "icon": "",
+          "status": "",
+          "value": "充电异常Abnormal charging",
+          "only_for": []
+        },
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-material-box-equipment": {
+      "id": "problem-material-box-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "drop-box-or-items",
+          "label": "掉箱子或掉落件Drop Box or items",
+          "next_node": "cause-drop-box-or-items",
+          "description": "8 times",
+          "icon": "",
+          "status": "",
+          "value": "掉箱子或掉落件Drop Box or items",
+          "only_for": []
+        },
+        {
+          "id": "abnormal-pick-up-and-delivery",
+          "label": "取放货异常Abnormal pick-up and delivery",
+          "next_node": "cause-abnormal-pick-up-and-delivery",
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "取放货异常Abnormal pick-up and delivery",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-charging-station-unknown": {
+      "id": "problem-charging-station-unknown",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "abnormal-charging",
+          "label": "充电异常Abnormal charging",
+          "next_node": "cause-abnormal-charging",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "充电异常Abnormal charging",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-a42t-e2-hook-network": {
+      "id": "problem-a42t-e2-hook-network",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "network-communication-abnormality",
+          "label": "网络通讯异常Network communication abnormality",
+          "next_node": "cause-network-communication-abnormality",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "网络通讯异常Network communication abnormality",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-material-box-customer": {
+      "id": "problem-material-box-customer",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "box-stuck",
+          "label": "卡箱异常Box stuck",
+          "next_node": "cause-box-stuck",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "卡箱异常Box stuck",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-work-station-customer": {
+      "id": "problem-work-station-customer",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "box-stuck",
+          "label": "卡箱异常Box stuck",
+          "next_node": "cause-box-stuck",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "卡箱异常Box stuck",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-tally-station-equipment": {
+      "id": "problem-tally-station-equipment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        },
+        {
+          "id": "no-object-detected",
+          "label": "料箱检测无容器No object detected",
+          "next_node": "cause-no-object-detected",
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "料箱检测无容器No object detected",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-a42t-e2-hook-environment": {
+      "id": "problem-a42t-e2-hook-environment",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "unable-to-drive",
+          "label": "行走异常Unable to drive",
+          "next_node": "cause-unable-to-drive",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "行走异常Unable to drive",
+          "only_for": []
+        }
+      ]
+    },
+    "problem-k50h-unknown": {
+      "id": "problem-k50h-unknown",
+      "title": "What is the problem?",
+      "type": "choice",
+      "key": "problem_type",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Problem",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "abnormal-charging",
+          "label": "充电异常Abnormal charging",
+          "next_node": "cause-abnormal-charging",
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "充电异常Abnormal charging",
+          "only_for": []
+        }
+      ]
+    },
+    "category-k50h": {
+      "id": "category-k50h",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-k50h-equipment",
+          "description": "457 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        },
+        {
+          "id": "customer",
+          "label": "客户Customer",
+          "next_node": "problem-k50h-customer",
+          "description": "37 times",
+          "icon": "",
+          "status": "",
+          "value": "客户Customer",
+          "only_for": []
+        },
+        {
+          "id": "environment",
+          "label": "环境Environment",
+          "next_node": "problem-k50h-environment",
+          "description": "27 times",
+          "icon": "",
+          "status": "",
+          "value": "环境Environment",
+          "only_for": []
+        },
+        {
+          "id": "system",
+          "label": "系统System",
+          "next_node": "problem-k50h-system",
+          "description": "21 times",
+          "icon": "",
+          "status": "",
+          "value": "系统System",
+          "only_for": []
+        },
+        {
+          "id": "network",
+          "label": "网络Network",
+          "next_node": "problem-k50h-network",
+          "description": "16 times",
+          "icon": "",
+          "status": "",
+          "value": "网络Network",
+          "only_for": []
+        },
+        {
+          "id": "unknown",
+          "label": "未知Unknown",
+          "next_node": "problem-k50h-unknown",
+          "description": "1 times",
+          "icon": "",
+          "status": "",
+          "value": "未知Unknown",
+          "only_for": []
+        }
+      ]
+    },
+    "category-a42t-e2-hook": {
+      "id": "category-a42t-e2-hook",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-a42t-e2-hook-equipment",
+          "description": "218 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        },
+        {
+          "id": "system",
+          "label": "系统System",
+          "next_node": "problem-a42t-e2-hook-system",
+          "description": "16 times",
+          "icon": "",
+          "status": "",
+          "value": "系统System",
+          "only_for": []
+        },
+        {
+          "id": "network",
+          "label": "网络Network",
+          "next_node": "problem-a42t-e2-hook-network",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "网络Network",
+          "only_for": []
+        },
+        {
+          "id": "environment",
+          "label": "环境Environment",
+          "next_node": "problem-a42t-e2-hook-environment",
+          "description": "2 times",
+          "icon": "",
+          "status": "",
+          "value": "环境Environment",
+          "only_for": []
+        }
+      ]
+    },
+    "category-work-station": {
+      "id": "category-work-station",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-work-station-equipment",
+          "description": "69 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        },
+        {
+          "id": "customer",
+          "label": "客户Customer",
+          "next_node": "problem-work-station-customer",
+          "description": "4 times",
+          "icon": "",
+          "status": "",
+          "value": "客户Customer",
+          "only_for": []
+        }
+      ]
+    },
+    "category-charging-station": {
+      "id": "category-charging-station",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-charging-station-equipment",
+          "description": "14 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        },
+        {
+          "id": "unknown",
+          "label": "未知Unknown",
+          "next_node": "problem-charging-station-unknown",
+          "description": "7 times",
+          "icon": "",
+          "status": "",
+          "value": "未知Unknown",
+          "only_for": []
+        }
+      ]
+    },
+    "category-material-box": {
+      "id": "category-material-box",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-material-box-equipment",
+          "description": "9 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        },
+        {
+          "id": "customer",
+          "label": "客户Customer",
+          "next_node": "problem-material-box-customer",
+          "description": "5 times",
+          "icon": "",
+          "status": "",
+          "value": "客户Customer",
+          "only_for": []
+        }
+      ]
+    },
+    "category-tally-station": {
+      "id": "category-tally-station",
+      "title": "What is the source of the problem?",
+      "type": "choice",
+      "key": "category",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Category",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "equipment",
+          "label": "设备Equipment",
+          "next_node": "problem-tally-station-equipment",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "设备Equipment",
+          "only_for": []
+        }
+      ]
+    },
+    "root": {
+      "id": "root",
+      "title": "What is shown in the photo?",
+      "type": "choice",
+      "key": "object",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "",
+      "summary_title": "",
+      "summary_label": "Object",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": [
+        {
+          "id": "k50h",
+          "label": "K50H",
+          "next_node": "category-k50h",
+          "description": "559 times",
+          "icon": "",
+          "status": "",
+          "value": "K50H",
+          "only_for": []
+        },
+        {
+          "id": "a42t-e2-hook",
+          "label": "A42T-E2 hook",
+          "next_node": "category-a42t-e2-hook",
+          "description": "241 times",
+          "icon": "",
+          "status": "",
+          "value": "A42T-E2 hook",
+          "only_for": []
+        },
+        {
+          "id": "work-station",
+          "label": "Work Station",
+          "next_node": "category-work-station",
+          "description": "73 times",
+          "icon": "",
+          "status": "",
+          "value": "Work Station",
+          "only_for": []
+        },
+        {
+          "id": "charging-station",
+          "label": "Charging station",
+          "next_node": "category-charging-station",
+          "description": "21 times",
+          "icon": "",
+          "status": "",
+          "value": "Charging station",
+          "only_for": []
+        },
+        {
+          "id": "material-box",
+          "label": "Material box",
+          "next_node": "category-material-box",
+          "description": "14 times",
+          "icon": "",
+          "status": "",
+          "value": "Material box",
+          "only_for": []
+        },
+        {
+          "id": "tally-station",
+          "label": "Tally station",
+          "next_node": "category-tally-station",
+          "description": "3 times",
+          "icon": "",
+          "status": "",
+          "value": "Tally station",
+          "only_for": []
+        }
+      ]
+    },
+    "summary": {
+      "id": "summary",
+      "title": "Inspection result",
+      "type": "final",
+      "key": "",
+      "description": "",
+      "next_node": null,
+      "placeholder": "",
+      "min_value": null,
+      "max_value": null,
+      "final_action": "save_inspection",
+      "summary_title": "Inspection result",
+      "summary_label": "",
+      "is_stub": false,
+      "stub_hint": "",
+      "options": []
+    }
+  }
+}
