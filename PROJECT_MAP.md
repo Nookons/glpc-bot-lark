@@ -122,8 +122,21 @@ QR Code          → Shelf | Floor
 
 | Файл | Чеков | Роль |
 | --- | --- | --- |
-| `tests/test_telegram_offline.py` | ~599 | Полный offline-набор бота, без сети (121 функция). |
+| `tests/test_telegram_offline.py` | 605 | Полный offline-набор бота, без сети (121 функция). |
+| `tests/test_equipment_intake_production.py` | 27 | Offline-проверки производственного приёма оборудования. |
+| `tests/test_report_writer.py` | 127 | Offline-проверки записи отчётов. |
+| `tests/test_live_test_harness.py` | 25 | Проверки живого стенда и запускателя (без сети наружу). |
 | `tests/lark_sink.py` | — | Локальная заглушка Lark-вебхука на `127.0.0.1:8899`. |
+| `tools/live_stub.py` | — | Живой стенд: PostgREST + Storage + Lark в памяти процесса. |
+| `tools/live_test_bot.py` | — | Запускатель живого теста через Telegram (см. `LIVE_TEST.md`). |
+
+### Живой тест через Telegram
+
+`LIVE_TEST.md` — инструкция владельцу; `tools/live_test_bot.py`
+(`check` / `discover` / `dry-run` / `live` / `selftest`) поднимает
+`tools/live_stub.py` и переводит на него Supabase, Storage и все
+Lark-вебхуки, блокируя в процессе бота всё, кроме `api.telegram.org`.
+Отдельный `BOT_LEASE_NAME=live-test-lease` не даёт отобрать лиз у прода.
 
 ### SQL
 

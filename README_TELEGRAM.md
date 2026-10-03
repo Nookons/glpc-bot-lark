@@ -668,3 +668,19 @@ workstation — Offline, Wrong task.
 ### Проверка доставки Lark
 
 Внешние проверки изолированы в отдельной папке `../LarkBot-Test`. Тестовые Telegram и Supabase credentials хранятся там в `.env.testbot`, а Lark webhook — в `.env.test`; эти файлы исключены из Git. Все тестовые карточки направляются только на `TEST_LARK_HOOK_URL`. Инструкции и fail-closed запускатель: `../LarkBot-Test/README_TEST_SETUP.md` и `../LarkBot-Test/run_test_bot.py`. Не запускайте тестовый бот без отдельного TEST Supabase проекта.
+
+### Живой тест через Telegram без отдельной базы
+
+Если отдельного TEST-проекта Supabase нет, живой прогон делает
+`tools/live_test_bot.py`: он поднимает локальный стенд
+(`tools/live_stub.py` — PostgREST, Storage и Lark-вебхук в памяти процесса)
+и переводит на него весь бот. Наружу уходит только `api.telegram.org`.
+Отдельный `BOT_LEASE_NAME=live-test-lease` не даёт локальному прогону
+отобрать лиз у продового инстанса. Пошаговый чек-лист сценариев и список
+того, что подставить владельцу, — `LIVE_TEST.md`.
+
+```
+python3 tools/live_test_bot.py selftest   # стенд без сети и токена
+python3 tools/live_test_bot.py check      # конфиг (нужен .env.livetest)
+python3 tools/live_test_bot.py live       # живой прогон
+```
