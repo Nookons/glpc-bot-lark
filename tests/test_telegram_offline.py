@@ -28,6 +28,17 @@ os.environ["TELEGRAM_TOPIC_ID"] = ""
 os.environ["TELEGRAM_TOPIC_NAME"] = ""
 os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
 
+# Per-warehouse error topics must be pinned too. They are read from `.env` at
+# import time, so a real value there (e.g. TELEGRAM_TOPIC_ERROR_SP3=318) would
+# make the bot monitor only those topics and silently turn the "no filter" and
+# wrong-topic cases into different behaviour. Clearing them here keeps the
+# suite independent of the operator's configuration.
+for _warehouse_key in ("GLPC", "SP3"):
+    os.environ[f"TELEGRAM_TOPIC_ERROR_{_warehouse_key}"] = ""
+
+for _shared_key in ("STATUS", "STATS", "SERVICE"):
+    os.environ[f"TELEGRAM_TOPIC_{_shared_key}"] = ""
+
 # load_dotenv() не перезаписывает уже заданные переменные, поэтому здесь
 # подставляем заведомо нерабочие значения: если какой-то вызов забудут
 # заглушить, тест упадёт, а не постучится в боевую базу из .env.
@@ -42,6 +53,7 @@ REAL_SEND_MESSAGE = tg.send_message
 REAL_EDIT_MESSAGE_TEXT = tg.edit_message_text
 
 import telegram_bot as bot  # noqa: E402
+import equipment_intake.flow as intake_flow  # noqa: E402
 import bot_lease  # noqa: E402
 import robot_status  # noqa: E402
 import shift_report as sr  # noqa: E402
@@ -111,8 +123,15 @@ def fake_delete_message(chat_id, message_id):
     return True
 
 
-def fake_edit_message_text(chat_id, message_id, text, reply_markup=None):
-    EDITED.append({"chat_id": chat_id, "message_id": message_id, "text": text})
+def fake_edit_message_text(
+    chat_id, message_id, text, reply_markup=None, message_thread_id=None
+):
+    EDITED.append({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "thread_id": message_thread_id,
+    })
     return {"message_id": message_id}
 
 
@@ -2182,6 +2201,11 @@ def test_status_flow_end_to_end():
         EDITED and "Describe the reason" in EDITED[-1]["text"],
         EDITED,
     )
+    check(
+        "flow: правка ушла в топик-источник",
+        EDITED and EDITED[-1].get("thread_id") == 2,
+        EDITED,
+    )
 
     pending = bot.peek_pending_status(-500, 100)
     check(
@@ -2882,6 +2906,45 @@ def test_edit_message_truncates():
         "telegram: editMessageText тоже обрезает текст",
         text.endswith("…") and len(text) <= 4000,
         len(text),
+    )
+
+
+def test_edit_message_thread_id_passthrough():
+    """Правки обязаны нести message_thread_id: без него Telegram в форуме
+    отклоняет editMessageText/editMessageCaption."""
+    original_call = tg.call
+    payloads = []
+
+    tg.call = lambda method, payload=None, timeout=40: (
+        payloads.append((method, payload)), {"message_id": 1}
+    )[1]
+
+    try:
+        REAL_EDIT_MESSAGE_TEXT(-500, 1, "hello", message_thread_id=77)
+    finally:
+        tg.call = original_call
+
+    check(
+        "telegram: editMessageText передаёт message_thread_id",
+        payloads and payloads[0][1].get("message_thread_id") == 77,
+        payloads,
+    )
+
+    payloads.clear()
+    original_caption = tg.call
+    tg.call = lambda method, payload=None, timeout=40: (
+        payloads.append((method, payload)), {"message_id": 1}
+    )[1]
+
+    try:
+        tg.edit_message_caption(-500, 1, "cap", message_thread_id=88)
+    finally:
+        tg.call = original_caption
+
+    check(
+        "telegram: editMessageCaption передаёт message_thread_id",
+        payloads and payloads[0][1].get("message_thread_id") == 88,
+        payloads,
     )
 
 
@@ -4066,6 +4129,25 @@ def test_cache_helpers_are_bounded():
         (0 in store, 0 in flags),
     )
 
+    # _routes и _chat_types пишутся на каждом сообщении, поэтому тоже должны
+    # быть ограничены — иначе долгоживущий процесс растёт без предела.
+    bot._routes.clear()
+    bot._chat_types.clear()
+
+    for index in range(bot._CACHE_LIMIT + 5):
+        bot._set_route(-1000 - index, index, "supergroup")
+
+    check(
+        "cache L3: _routes ограничен",
+        len(bot._routes) <= bot._CACHE_LIMIT,
+        len(bot._routes),
+    )
+    check(
+        "cache L3: _chat_types ограничен",
+        len(bot._chat_types) <= bot._CACHE_LIMIT,
+        len(bot._chat_types),
+    )
+
 
 def test_user_messages_not_deleted_in_private_chats():
     """L7: в личной переписке чужие сообщения не удаляем."""
@@ -5151,6 +5233,38 @@ def test_analytics_weekly_and_schedule():
         "weekly: отчёт ушёл в Lark и день помечен",
         result["sent"] is True and len(hooks) == 1 and marked == ["2026-09-28"],
         (result, marked),
+    )
+
+    # вебхук ответил HTTP 200, но с ненулевым code: это НЕ успех —
+    # день не помечаем, иначе отчёт теряется до следующей недели.
+    analytics.top_report = lambda period="week", now=None, warehouse=None: {
+        "period": "week", "days": 7, "since": None, "total": 1,
+        "issues": [], "robots": [],
+    }
+    analytics.downtime_report = lambda days=7, now=None, warehouse=None: None
+    analytics.retirement_candidates = lambda days=30, min_offlines=None, now=None, warehouse=None: []
+    analytics.send_text_via_hook = lambda url, text: {"code": 9499, "msg": "Bad Request"}
+    analytics.was_sent = lambda now: False
+    bad_marked = []
+    analytics.mark_sent = lambda now: bad_marked.append(now.strftime("%Y-%m-%d")) or True
+
+    try:
+        bad = analytics.send_weekly_report(monday)
+    finally:
+        (
+            analytics.top_report,
+            analytics.downtime_report,
+            analytics.retirement_candidates,
+            analytics.send_text_via_hook,
+            analytics.was_sent,
+            analytics.mark_sent,
+            analytics.WEEKLY_REPORT_ENABLED,
+        ) = original
+
+    check(
+        "weekly: ошибка вебхука не помечает день отправленным",
+        bad["sent"] is False and bad_marked == [],
+        (bad, bad_marked),
     )
 
     # флаг выключен -> никогда не пора
@@ -6698,6 +6812,9 @@ def test_error_menu_modules_and_actions():
 
 def test_error_menu_bug_other_and_custom_text():
     """Bug/Other сразу просят номер, «описать» берёт текст как тип."""
+    # These tests cover the legacy fallback when the guided intake cannot start.
+    original_intake_start = intake_flow.start
+    intake_flow.start = lambda *args, **kwargs: False
     original_menu = bot.ERROR_MENU
     original_flag = bot.PHOTO_ATTACH_ENABLED
     original_send_photo = bot.tg.send_photo
@@ -6810,6 +6927,7 @@ def test_error_menu_bug_other_and_custom_text():
         )
     finally:
         bot.ERROR_MENU = original_menu
+        intake_flow.start = original_intake_start
         bot.PHOTO_ATTACH_ENABLED = original_flag
         bot.tg.send_photo = original_send_photo
         bot.tg.edit_message_caption = original_edit_caption
@@ -6823,6 +6941,9 @@ def test_error_menu_bug_other_and_custom_text():
 
 def test_menu_card_includes_module():
     """Карточка в Lark содержит и узел (Module), и робота, и фото."""
+    # These tests cover the legacy fallback when the guided intake cannot start.
+    original_intake_start = intake_flow.start
+    intake_flow.start = lambda *args, **kwargs: False
     original_menu = bot.ERROR_MENU
     original_flag = bot.PHOTO_ATTACH_ENABLED
     original_send_photo = bot.tg.send_photo
@@ -6900,6 +7021,7 @@ def test_menu_card_includes_module():
         )
     finally:
         bot.ERROR_MENU = original_menu
+        intake_flow.start = original_intake_start
         bot.PHOTO_ATTACH_ENABLED = original_flag
         bot.tg.send_photo = original_send_photo
         bot.tg.edit_message_caption = original_edit_caption
@@ -6913,6 +7035,9 @@ def test_menu_card_includes_module():
 
 def test_menu_on_any_photo_and_caption_kept():
     """Меню открывается на фото с подписью; подпись не теряется."""
+    # These tests cover the legacy fallback when the guided intake cannot start.
+    original_intake_start = intake_flow.start
+    intake_flow.start = lambda *args, **kwargs: False
     original_menu = bot.ERROR_MENU
     original_flag = bot.PHOTO_ATTACH_ENABLED
     original_send_photo = bot.tg.send_photo
@@ -6982,6 +7107,7 @@ def test_menu_on_any_photo_and_caption_kept():
         )
     finally:
         bot.ERROR_MENU = original_menu
+        intake_flow.start = original_intake_start
         bot.PHOTO_ATTACH_ENABLED = original_flag
         bot.tg.send_photo = original_send_photo
         bot.tg.edit_message_caption = original_edit_caption
@@ -6996,6 +7122,9 @@ def test_menu_on_any_photo_and_caption_kept():
 
 def test_error_menu_photo_flow():
     """Фото → меню с кнопками → тип → номер → запись с фото."""
+    # These tests cover the legacy fallback when the guided intake cannot start.
+    original_intake_start = intake_flow.start
+    intake_flow.start = lambda *args, **kwargs: False
     original_menu = bot.ERROR_MENU
     original_flag = bot.PHOTO_ATTACH_ENABLED
     original_send_photo = bot.tg.send_photo
@@ -7119,6 +7248,7 @@ def test_error_menu_photo_flow():
         )
     finally:
         bot.ERROR_MENU = original_menu
+        intake_flow.start = original_intake_start
         bot.PHOTO_ATTACH_ENABLED = original_flag
         bot.tg.send_photo = original_send_photo
         bot.tg.edit_message_caption = original_edit_caption
@@ -7185,6 +7315,7 @@ def main():
         test_rest_count_parses_content_range,
         test_stats_endpoint_handles_db_error,
         test_edit_message_truncates,
+        test_edit_message_thread_id_passthrough,
         test_missing_robot_is_queued_and_reported,
         test_bot_forwards_missing_robot_to_lark,
         test_lease_acquire_and_refresh,

@@ -55,7 +55,6 @@ from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
 from pending_photos import (
     TARGET_HOOK_URL,
     forward_error,
-    handle_incoming_photo,
     send_error_with_photo,
     send_photo,
 )
@@ -76,11 +75,12 @@ from sendToDataBase import (
     send_to_data_base,
     set_notifier,
     shift_stats,
+    supabase_key_configured,
     table_exists,
 )
 from shift import get_current_shift
 from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
-from text_utils import truncate
+from text_utils import ascii_digits, truncate
 from telegram_store import (
     StoreUnavailable,
     get_employee,
@@ -233,25 +233,6 @@ def dry_run() -> bool:
     """True — тестовый режим (ничего не пишем и не отправляем)."""
     return _env_bool("TELEGRAM_DRY_RUN", False)
 
-
-# Пометка тестового бота в ответах. Работает только в dry-run: если бот
-# молчит совсем, в общей группе невозможно понять, кто ответил — тестовый
-# или боевой. С непустой пометкой ответы видны и их нельзя спутать с прод.
-# Пусто — тестовый бот не отвечает вообще (прежнее поведение).
-TEST_REPLY_PREFIX = os.environ.get("TELEGRAM_TEST_REPLY_PREFIX", "").strip()
-
-# Длина пометки ограничена: это метка, а не часть сообщения.
-TEST_REPLY_PREFIX = TEST_REPLY_PREFIX[:40]
-
-
-def _test_prefixed(text: str) -> str:
-    """Добавляет пометку тестового бота к тексту ответа."""
-    if not TEST_REPLY_PREFIX:
-        return text
-
-    body = text if text is not None else ""
-
-    return f"{TEST_REPLY_PREFIX} {body}".strip()
 
 # ============================================================
 # ТОПИКИ ФОРУМА ПО НАЗНАЧЕНИЮ
@@ -728,10 +709,13 @@ def _set_route(chat_id, thread_id, chat_type: str = None):
     key = _chat_key(chat_id)
 
     with _routes_lock:
-        _routes[key] = thread_id
+        # _routes и _chat_types — кэши активных чатов, а не журнал: держим их
+        # в тех же границах _CACHE_LIMIT, что и остальные словари, иначе на
+        # долгоживущем процессе они растут бесконечно.
+        _remember_bounded(_routes, key, thread_id)
 
         if chat_type:
-            _chat_types[key] = chat_type
+            _remember_bounded(_chat_types, key, chat_type)
 
         if thread_id is not None and len(_topic_seen) < _CACHE_LIMIT:
             observed = (key, int(thread_id))
@@ -855,6 +839,82 @@ def error_topic_map(chat_id=None) -> dict:
     }
 
 
+def topic_configuration_problems(chat_id=None) -> list:
+    """
+    Конфликты конфигурации топиков, при которых ошибки уйдут не туда.
+
+    Молчаливая подмена опасна: если двум складам назначен один топик, второй
+    склад недостижим, и все его ошибки запишутся на первый. Если топик ошибок
+    совпал со служебным, фото ошибки оттуда отклоняется как «общий топик».
+
+    Возвращает список человекочитаемых предупреждений (пустой — всё в порядке).
+    """
+    problems = []
+    titles = list(WAREHOUSES.values())
+    error_topics = error_topic_map(chat_id)
+
+    seen = {}
+
+    for title in titles:
+        thread_id = error_topics.get(title)
+
+        if thread_id is None:
+            continue
+
+        if thread_id in seen:
+            problems.append(
+                f"Топики ошибок {seen[thread_id]} и {title} совпадают "
+                f"(id {thread_id}): ошибки {title} будут записаны как "
+                f"{seen[thread_id]}. Задайте разные топики."
+            )
+        else:
+            seen[thread_id] = title
+
+    for topic_kind in ("status", "stats", "service"):
+        shared_id = topic_thread(topic_kind)
+
+        if shared_id is None:
+            continue
+
+        for title, thread_id in error_topics.items():
+            if thread_id is not None and int(thread_id) == int(shared_id):
+                problems.append(
+                    f"Топик ошибок {title} совпадает со служебным топиком "
+                    f"{TOPIC_TITLES.get(topic_kind, topic_kind)} (id {shared_id}): "
+                    f"фото ошибок оттуда будут отклоняться."
+                )
+
+    # Топик может быть задан ИМЕНЕМ: тогда он не разрешается, пока бот не
+    # увидит сервисное сообщение о создании топика. До этого момента приём
+    # ошибок молча отклоняет всё, поэтому предупреждаем на старте.
+    #
+    # Имя склада по умолчанию берётся ещё и из TELEGRAM_TOPIC_NAME, когда
+    # TELEGRAM_TOPIC_ID пуст — этот путь тоже надо проверить.
+    candidates = [(DEFAULT_WAREHOUSE, TOPIC_RAW.get("error")),
+                  (DEFAULT_WAREHOUSE, TELEGRAM_TOPIC_NAME)]
+
+    for title in titles:
+        candidates.append((title, TOPIC_RAW.get(f"error:{title}")))
+
+    reported = set()
+
+    for title, raw in candidates:
+        name = str(raw or "").strip()
+
+        if not name or name.lstrip("-").isdigit() or name in reported:
+            continue
+
+        if error_topic(title, chat_id) is None:
+            reported.add(name)
+            problems.append(
+                f"Топик ошибок {title} задан именем {name!r}, но бот ещё его не "
+                f"видел: приём ошибок отклоняется, пока имя не выучено. "
+                f"Надёжнее указать id (команда /id в этом топике)."
+            )
+
+    return problems
+
+
 def warehouse_for_thread(chat_id, thread_id) -> str:
     """Склад по топику: в топике ошибок SP3 пишут ошибки SP3."""
     if thread_id is None:
@@ -867,6 +927,49 @@ def warehouse_for_thread(chat_id, thread_id) -> str:
             return title
 
     return DEFAULT_WAREHOUSE
+
+
+def error_routing_configured() -> bool:
+    """
+    Настроен ли хотя бы один топик ошибок.
+
+    Пока не настроен ни один, у бота нет способа узнать склад: он работает в
+    историческом режиме «без фильтра» и берёт склад по умолчанию. Отказывать в
+    приёме фото в этом режиме нельзя — иначе бот не примет ничего вообще.
+    """
+    if TOPIC_RAW.get("error"):
+        return True
+
+    return any(TOPIC_RAW.get(f"error:{title}") for title in WAREHOUSES.values())
+
+
+def error_warehouse_for_thread(chat_id, thread_id):
+    """
+    Склад топика ошибок или None, если это не топик ошибок.
+
+    `warehouse_for_thread` намеренно отдаёт `DEFAULT_WAREHOUSE` (GLP-C) для
+    всего неизвестного — это удобно для чтения в общих топиках, но опасно для
+    записи: фото из служебного топика ушло бы как ошибка GLP-C.
+
+    Приём ошибок обязан знать склад точно, поэтому здесь неизвестный топик
+    возвращает None, и вызывающий код отказывается принимать фото. Пока
+    маршрутизация не настроена вовсе, отказывать нечему: см.
+    `error_routing_configured`.
+    """
+    if not error_routing_configured():
+        return DEFAULT_WAREHOUSE
+
+    if thread_id is None:
+        # Без топиков (личка/не-форум) склад определить нечем.
+        return None
+
+    for title in WAREHOUSES.values():
+        configured = error_topic(title, chat_id)
+
+        if configured is not None and int(configured) == int(thread_id):
+            return title
+
+    return None
 
 
 def topic_thread(kind: str, chat_id=None):
@@ -1140,7 +1243,6 @@ def _send(
         # Отвечать ли в этот топик, решает telegram_api: он пропускает
         # только топики из белого списка. Здесь — необязательная пометка
         # и запись в лог, чтобы в логе было видно смысл ответа.
-        text = _test_prefixed(text)
 
         logger.info(
             "[DRY-RUN] ответ: chat=%s thread=%s text=%r",
@@ -1306,6 +1408,17 @@ def images_janitor_loop(interval_seconds: int = 3600):
             sweep_pending_status()
             sweep_error_menus()
             sweep_error_choices()
+
+            # Словари ожиданий живут в памяти процесса. Без этой уборки
+            # брошенные шаги накапливаются до перезапуска бота.
+            sweep_custom_texts()
+
+            import equipment_intake.flow as intake_flow
+
+            swept = intake_flow.sweep_sessions()
+
+            if swept:
+                logger.info("Убрано просроченных сессий приёма: %s", swept)
         except Exception:
             logger.exception("Ошибка очистки старых фото")
 
@@ -1865,6 +1978,24 @@ def handle_status_callback(callback: dict):
 
     parts = (callback.get("data") or "").split(":")
 
+    # Guided equipment intake callbacks.
+    if parts and parts[0] == "dt":
+        import equipment_intake.flow as intake_flow
+
+        if intake_flow.handle_callback(
+            chat_id, sender, parts, message_id, callback_id
+        ):
+            return
+
+    # Equipment option editor callbacks.
+    if parts and parts[0] == "ed":
+        import equipment_intake.editor as intake_editor
+
+        if intake_editor.handle_callback(
+            chat_id, sender, parts, message_id, callback_id
+        ):
+            return
+
     if parts and parts[0] == "rf":
         _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id)
         return
@@ -1955,6 +2086,7 @@ def handle_status_callback(callback: dict):
         f"Reason: {label}\n"
         "\n"
         "✍️ Describe the reason in one message (or /cancel).",
+        message_thread_id=_reply_thread(chat_id, thread_id),
     )
 
 
@@ -2703,6 +2835,13 @@ def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -
         _handle_whoami(chat_id, sender, reply_to)
         return True
 
+    # Let all employees add menu options through the guided editor.
+    if command == "tree":
+        import equipment_intake.editor as intake_editor
+
+        if intake_editor.handle_command(chat_id, sender, command, reply_to):
+            return True
+
     if command == "stats":
         _handle_stats(chat_id, args, reply_to)
         return True
@@ -3098,6 +3237,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
                 message_id,
                 f"📷 {error_menu_label(path)}\nВыберите подробнее:",
                 reply_markup=error_menu_keyboard(path),
+                message_thread_id=_reply_thread(chat_id, pending.get("thread_id")),
             )
             return
 
@@ -3117,6 +3257,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
             message_id,
             "📷 Выберите тип ошибки:",
             reply_markup=error_menu_keyboard(()),
+            message_thread_id=_reply_thread(chat_id, pending.get("thread_id")),
         )
         return
 
@@ -3356,7 +3497,7 @@ def _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id):
 
     action = parts[1] if len(parts) > 1 else "no"
 
-    if action.isdigit():
+    if ascii_digits(action):
         parsed = dict(pending["parsed"])
         parsed["robot"] = action
 
@@ -3657,7 +3798,7 @@ def _handle_robot(chat_id, args, reply_to):
 
     number = rest.split()[0]
 
-    if not number.lstrip("#").isdigit():
+    if not ascii_digits(number.lstrip("#")):
         _send(
             chat_id,
             f"⚠️ Robot number must be digits, got {number!r}.\n"
@@ -3713,7 +3854,7 @@ def handle_error_text(chat_id, sender, text, message_id):
         _send(chat_id, FORMAT_HINT, reply_to_message_id=message_id)
         return
 
-    if not parsed["robot"].isdigit():
+    if not ascii_digits(parsed["robot"]):
         _send(
             chat_id,
             f"⚠️ Robot number must be digits, got {parsed['robot']!r}.\n"
@@ -4005,6 +4146,14 @@ def handle_photo(chat_id, sender, message, message_id):
     caption = (message.get("caption") or "").strip()
     employee_name = get_employee_name(sender.get("id"))
 
+    # Start the guided production intake for every photo.
+    import equipment_intake.flow as intake_flow
+
+    if intake_flow.start(
+            chat_id, sender, destination, message_id, warehouse=current_warehouse()
+    ):
+        return
+
     # Меню типа ошибки идёт ПЕРВЫМ: иначе фото перехватит ветка «просто
     # переслать в Lark» (PHOTO_ATTACH_ENABLED выключен по умолчанию), и
     # кнопок не будет.
@@ -4067,7 +4216,7 @@ def handle_photo(chat_id, sender, message, message_id):
     # 1) В подписи целиком ошибка — создаём запись вместе с фото.
     parsed = parse_error_message(caption) if caption else None
 
-    if parsed and parsed["robot"].isdigit() and employee_name:
+    if parsed and ascii_digits(parsed["robot"]) and employee_name:
         logger.info("Ошибка из подписи к фото: robot=%s", parsed["robot"])
         save_and_forward_error(
             chat_id,
@@ -4295,6 +4444,14 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         return
 
     if message.get("photo"):
+        # Ошибка принимается только из топика ошибок: его склад обязан быть
+        # известен. Общий топик (статусы/статистика/служебный) проходит мимо
+        # раннего фильтра, и раньше фото оттуда уходило на склад по умолчанию
+        # (GLP-C) — то есть ошибка SP3 могла быть filed как GLP-C.
+        if error_warehouse_for_thread(chat_id, thread_id) is None:
+            _handle_wrong_topic(chat_id, thread_id, reason, error_attempt=True)
+            return
+
         _show_console_message(chat, sender, "photo", extra_rows=[("🖼 Caption", caption or "-")])
         _send_action(chat_id, "upload_photo")
         handle_photo(chat_id, sender, message, message_id)
@@ -4337,7 +4494,7 @@ def _looks_like_robot_number(text: str) -> bool:
     """«3780», «#3780» — похоже на номер робота, а не на текст ошибки."""
     cleaned = str(text or "").strip().lstrip("#").strip()
 
-    return bool(cleaned) and cleaned.isdigit() and len(cleaned) <= 6
+    return ascii_digits(cleaned) and len(cleaned) <= 6
 
 
 def _finish_error_choice(chat_id, sender, choice, number, message_id):
@@ -4465,6 +4622,18 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         _send(chat_id, hint)
 
         _delete_user_message(chat_id, message_id)
+        return
+
+    # Handle text only when this employee has an active intake step.
+    import equipment_intake.flow as intake_flow
+
+    if intake_flow.handle_text(chat_id, sender, text, message_id):
+        return
+
+    # Handle option editor text only while an editor prompt is pending.
+    import equipment_intake.editor as intake_editor
+
+    if intake_editor.handle_text(chat_id, sender, text, message_id):
         return
 
     pending = take_pending_status(chat_id, sender.get("id"))
@@ -4959,6 +5128,15 @@ def main():
             "Add it to .env (see README_TELEGRAM.md)."
         )
 
+    # Без сервисного ключа Supabase бот «работает», но ни одна запись не
+    # проходит: PostgREST отвечает ошибкой, и её легко не заметить. Лучше
+    # упасть сразу с понятным сообщением, чем молча терять данные.
+    if not supabase_key_configured():
+        raise SystemExit(
+            "SUPABASE_SERVICE_KEY is not set. "
+            "Add it to .env — иначе записи об ошибках не сохраняются."
+        )
+
     me = tg.get_me()
 
     if not me:
@@ -5040,6 +5218,9 @@ def main():
             "из ЛЮБОГО топика и любого чата. Задайте TELEGRAM_TOPIC_ID "
             "(узнать: /id в нужном топике).[/bold red]"
         )
+
+    for problem in topic_configuration_problems():
+        console.print(f"[bold red]⚠️ {problem}[/bold red]")
 
     global USERS_TABLE_OK
     USERS_TABLE_OK = table_exists(USERS_TABLE)

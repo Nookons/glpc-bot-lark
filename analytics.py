@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from env_utils import env_bool, env_int
-from lark_media import send_text_via_hook
+from lark_media import hook_ok, send_text_via_hook
 from pending_photos import TARGET_HOOK_URL
 from sendToDataBase import WAREHOUSE, rest_get_all
 from supabase_storage import download_json, upload_json
@@ -383,8 +383,12 @@ def send_weekly_report(now: datetime = None, force: bool = False) -> dict:
 
     result = send_text_via_hook(TARGET_HOOK_URL, text)
 
-    if result is None:
-        logger.error("Недельный отчёт не ушёл в Lark")
+    # Проверяем именно код ответа: вебхук может ответить HTTP 200 с
+    # ненулевым `code` (например, 9499 Bad Request). Раньше такой ответ
+    # считался успехом, и день помечался отправленным — отчёт терялся
+    # до следующей недели.
+    if not hook_ok(result):
+        logger.error("Недельный отчёт не ушёл в Lark: %r", result)
         return {"sent": False, "reason": "hook failed"}
 
     mark_sent(now)

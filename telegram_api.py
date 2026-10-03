@@ -292,8 +292,21 @@ def send_message(
     return call("sendMessage", payload, timeout=15)
 
 
-def edit_message_text(chat_id, message_id, text: str, reply_markup: dict = None):
-    """Меняет текст сообщения бота (и убирает кнопки, если markup не передан)."""
+def edit_message_text(
+    chat_id,
+    message_id,
+    text: str,
+    reply_markup: dict = None,
+    message_thread_id: int = None,
+):
+    """
+    Меняет текст сообщения бота (и убирает кнопки, если markup не передан).
+
+    message_thread_id нужен и на правке: Telegram адресует сообщение по
+    (chat_id, message_id), но без thread_id не понимает, что правка идёт
+    внутри форум-топика, и отклоняет запрос. Поэтому топик передаётся явно —
+    бот всегда знает, откуда пришло сообщение.
+    """
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -304,15 +317,25 @@ def edit_message_text(chat_id, message_id, text: str, reply_markup: dict = None)
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
 
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
+
     return call("editMessageText", payload, timeout=15)
 
 
-def edit_message_caption(chat_id, message_id, caption: str, reply_markup: dict = None):
+def edit_message_caption(
+    chat_id,
+    message_id,
+    caption: str,
+    reply_markup: dict = None,
+    message_thread_id: int = None,
+):
     """
     Меняет подпись к фото и его кнопки.
 
     Нужно для многоуровневого меню: сообщение с фото остаётся тем же,
     меняются только подпись и кнопки (иначе чат засоряется копиями фото).
+    message_thread_id обязателен по той же причине, что и в edit_message_text.
     """
     payload = {
         "chat_id": chat_id,
@@ -322,6 +345,9 @@ def edit_message_caption(chat_id, message_id, caption: str, reply_markup: dict =
 
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
+
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
 
     return call("editMessageCaption", payload, timeout=15)
 

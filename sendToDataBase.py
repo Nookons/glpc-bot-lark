@@ -12,6 +12,7 @@ from rapidfuzz import fuzz, process
 from lark_send import send_text_message
 from shift import get_current_shift
 from logging_config import setup_logging
+from text_utils import to_int
 
 
 logger = setup_logging(__name__)
@@ -38,6 +39,18 @@ SUPABASE_SERVICE_KEY = os.environ.get(
     "SUPABASE_SERVICE_KEY",
     "",
 )
+
+
+def supabase_key_configured() -> bool:
+    """
+    True, если сервисный ключ Supabase задан.
+
+    Ключ по умолчанию пустой, и без него все запросы к PostgREST молча
+    возвращают ошибку — бот выглядит рабочим, но не читает и не пишет
+    данные. Проверка на старте превращает это в явное сообщение.
+    """
+    return bool(SUPABASE_SERVICE_KEY)
+
 
 WAREHOUSE = "GLP-C"
 
@@ -914,7 +927,9 @@ def send_to_data_base(
         "robots_maintenance_list",
         params={
             "select": "*",
-            "robot_number": f"eq.{int(table_lines['robot'])}",
+            # ASCII-проверка, а не int(): Unicode-цифры («٣٧٨٠») прошли бы
+            # проверку и превратились бы в ДРУГОЙ номер робота.
+            "robot_number": f"eq.{to_int(table_lines['robot'])}",
             "warehouse": f"eq.{warehouse}",
             "order": "updated_at.desc",
             "limit": "1",

@@ -33,14 +33,23 @@ KINDS = ("error", "status")
 
 
 def _warehouse_key(warehouse: str):
-    """Ключ склада (glpc/sp3) для имени переменной."""
+    """
+    Ключ склада (glpc/sp3) для имени переменной.
+
+    Сопоставление намеренно нестрогое (регистр и пробелы не важны). Точное
+    сравнение молча уводило карточку в общий вебхук, если написание склада
+    отличалось хоть пробелом: сообщение попадало не в ту группу, и заметить это
+    можно было только по содержимому чата.
+    """
     from warehouses import WAREHOUSES
 
-    if not warehouse:
+    wanted = str(warehouse or "").strip().casefold()
+
+    if not wanted:
         return None
 
     for key, title in WAREHOUSES.items():
-        if title == warehouse:
+        if str(title).strip().casefold() == wanted:
             return key
 
     return None
