@@ -65,7 +65,7 @@ def _build_nodes() -> dict:
         "What is shown in the photo?",
         key="object",
         summary_label="Object",
-        description="Выберите, что на фото.",
+        description="Choose what is in the photo.",
         options=(
             opt("robot", "Robot", "robot_type"),
             opt("workstation", "Workstation", "workstation_type"),
@@ -82,7 +82,7 @@ def _build_nodes() -> dict:
         "Which robot?",
         key="device_type",
         summary_label="Type",
-        description="Выберите модель робота.",
+        description="Choose the robot model.",
         options=(
             opt("a42t_c2", "A42T C2", "robot_module"),
             opt("a42t", "A42T", "robot_module"),
@@ -95,7 +95,7 @@ def _build_nodes() -> dict:
         "Which workstation?",
         key="device_type",
         summary_label="Type",
-        description="Выберите тип рабочей станции.",
+        description="Choose the workstation type.",
         options=(
             opt("ws_pick", "Pick", "workstation_module"),
             opt("ws_conveyor", "Conveyor", "workstation_module"),
@@ -108,7 +108,7 @@ def _build_nodes() -> dict:
         "Which robot module?",
         key="module",
         summary_label="Module",
-        description="Выберите неисправный модуль или добавьте вариант через /tree.",
+        description="Choose the faulty module or add an option via /tree.",
         options=(
             opt("lifting", "Lifting", ASK_NUMBER),
             opt("rotation", "Rotation", ASK_NUMBER),
@@ -122,7 +122,7 @@ def _build_nodes() -> dict:
         "Which workstation module?",
         key="module",
         summary_label="Module",
-        description="Выберите неисправный модуль или добавьте вариант через /tree.",
+        description="Choose the faulty module or add an option via /tree.",
         options=(
             opt("offline", "Offline", ASK_NUMBER),
             opt("wrong_task", "Wrong task", ASK_NUMBER),
@@ -134,7 +134,7 @@ def _build_nodes() -> dict:
         "Which charging station?",
         key="device_type",
         summary_label="Type",
-        description="Выберите, для какого робота станция.",
+        description="Choose which robot this station is for.",
         options=(
             opt("cs_a42t_c2", "Charge for big robot", ASK_NUMBER),
             opt("cs_k50h", "Charge for small robot", ASK_NUMBER),
@@ -146,7 +146,7 @@ def _build_nodes() -> dict:
         "Which QR code?",
         key="device_type",
         summary_label="Type",
-        description="Выберите, где находится QR-код.",
+        description="Choose where the QR code is located.",
         options=(
             opt("qr_shelf", "Shelf", ASK_NUMBER),
             opt("qr_floor", "Floor", ASK_NUMBER),
@@ -165,8 +165,8 @@ def _build_nodes() -> dict:
         type=NodeType.INPUT,
         key="device_number",
         summary_label="Device",
-        description="Уникальный номер оборудования.",
-        placeholder="Например: 3780 или H108/1834",
+        description="Unique equipment number.",
+        placeholder="For example: 3780 or H108/1834",
         next_node=ASK_DESCRIPTION,
     ))
 
@@ -181,8 +181,8 @@ def _build_nodes() -> dict:
         type=NodeType.INPUT,
         key="description",
         summary_label="Problem",
-        description="Опишите проблему своими словами.",
-        placeholder="Например: не поднимает вилы, мигает красный индикатор",
+        description="Describe the problem in your own words.",
+        placeholder="For example: does not lift the forks, red light is blinking",
         next_node=SUMMARY,
     ))
 

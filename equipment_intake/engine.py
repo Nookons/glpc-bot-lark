@@ -194,7 +194,7 @@ class Session:
         node = self.tree.node(target)
 
         if node is None:
-            raise EngineError(f"Следующий узел {target!r} не найден")
+            raise EngineError(f"Next node {target!r} not found")
 
         self.current_id = target
         self.is_completed = node.type == NodeType.FINAL
@@ -233,7 +233,7 @@ class Session:
         node = self.current_node()
 
         if node is None:
-            raise EngineError("Дерево уже завершено")
+            raise EngineError("The tree is already complete")
 
         if node.type == NodeType.MULTI:
             self.toggle(option_id)
@@ -241,18 +241,18 @@ class Session:
 
         if node.type not in (NodeType.CHOICE, NodeType.YESNO):
             raise EngineError(
-                f"Узел {node.id!r} не поддерживает выбор варианта"
+                f"Node {node.id!r} does not support option selection"
             )
 
         option = node.option(option_id)
 
         if option is None:
-            raise EngineError(f"Неизвестный вариант {option_id!r}")
+            raise EngineError(f"Unknown option {option_id!r}")
 
         # Скрытый для этого пути вариант — как если бы его не было.
         if option not in self.visible_options(node):
             raise EngineError(
-                "Этот вариант недоступен для выбранной модели"
+                "This option is not available for the selected model"
             )
 
         target = self._target_after(node, option)
@@ -271,10 +271,10 @@ class Session:
         node = self.current_node()
 
         if node is None or node.type != NodeType.MULTI:
-            raise EngineError("Текущий шаг не поддерживает множественный выбор")
+            raise EngineError("The current step does not support multiple selection")
 
         if node.option(option_id) is None:
-            raise EngineError(f"Неизвестный вариант {option_id!r}")
+            raise EngineError(f"Unknown option {option_id!r}")
 
         if option_id in self.draft:
             self.draft.remove(option_id)
@@ -286,10 +286,10 @@ class Session:
         node = self.current_node()
 
         if node is None or node.type != NodeType.MULTI:
-            raise EngineError("Текущий шаг не является множественным выбором")
+            raise EngineError("The current step is not a multiple selection")
 
         if not self.draft:
-            raise EngineError("Не выбрано ни одного варианта")
+            raise EngineError("No option selected")
 
         # Порядок значений — как в дереве, а не как нажимал сотрудник:
         # иначе одинаковый выбор давал бы разные записи.
@@ -321,12 +321,12 @@ class Session:
         node = self.current_node()
 
         if node is None:
-            raise EngineError("Текущий шаг не принимает текстовый ввод")
+            raise EngineError("The current step does not accept text input")
 
         text = (raw or "").strip()
 
         if not text:
-            raise EngineError("Пустой ввод")
+            raise EngineError("Empty input")
 
         if node.is_stub and not node.options:
             # Черновая ветка: текст и есть ответ, дальше — сразу итог.
@@ -342,7 +342,7 @@ class Session:
             return
 
         if node.type not in TEXT_NODE_TYPES:
-            raise EngineError("Текущий шаг не принимает текстовый ввод")
+            raise EngineError("The current step does not accept text input")
 
         if node.type == NodeType.NUMBER:
             value = self._parse_number(node, text)
@@ -365,18 +365,18 @@ class Session:
         match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", cleaned)
 
         if match is None:
-            raise EngineError("Введите число")
+            raise EngineError("Enter a number")
 
         try:
             value = float(match.group(0))
         except ValueError:
-            raise EngineError("Введите число")
+            raise EngineError("Enter a number")
 
         if node.min_value is not None and value < node.min_value:
-            raise EngineError(f"Минимум: {_num(node.min_value)}")
+            raise EngineError(f"Minimum: {_num(node.min_value)}")
 
         if node.max_value is not None and value > node.max_value:
-            raise EngineError(f"Максимум: {_num(node.max_value)}")
+            raise EngineError(f"Maximum: {_num(node.max_value)}")
 
         return int(value) if value.is_integer() else value
 

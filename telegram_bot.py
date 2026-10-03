@@ -157,7 +157,11 @@ TELEGRAM_TOPIC_ID = _env_int_opt("TELEGRAM_TOPIC_ID")
 TELEGRAM_TOPIC_NAME = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
 
 # Отвечать ли в чужом топике подсказкой (один раз на топик).
-WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", True)
+#
+# По умолчанию ВЫКЛЮЧЕНО: подсказка сама по себе является ответом в топике,
+# который бот не мониторит. Владелец требует, чтобы бот вообще ничего не
+# писал в чужих топиках, поэтому включать это можно только осознанно.
+WRONG_TOPIC_HINT = _env_bool("TELEGRAM_WRONG_TOPIC_HINT", False)
 
 # ============================================================
 # БЕЛЫЙ СПИСОК ТОПИКОВ (для тестового бота)
@@ -353,7 +357,7 @@ ERROR_MENU_RAW = os.environ.get("TELEGRAM_ERROR_MENU", "").strip()
 MENU_ACTIONS = {
     "!bug": ("Bug", "🐞 Bug"),
     "!other": ("Other", "• Other"),
-    "!custom": ("", "✏️ Описать самому"),
+    "!custom": ("", "✏️ Describe manually"),
 }
 
 # Срок, в течение которого ждём описание ошибки текстом.
@@ -420,6 +424,18 @@ ROBOT_FIX_TTL_SECONDS = _env_int("ROBOT_FIX_TTL", 180)
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
 BOOTSTRAP_COMMANDS = ("id", "help", "start")
+
+# Команды, которые разрешено выполнять в НЕотслеживаемом топике.
+#
+# Раньше в чужом топике отвечала любая команда (`/stats`, `/robot`, `/top`…):
+# сообщение из топика, который бот не мониторит, всё равно получало ответ.
+# Владелец требует, чтобы бот молчал в чужих топиках, поэтому наружу оставлен
+# только минимум для настройки: /id, /help, /start и /reg (регистрация нужна
+# до того, как сотрудник узнает свой рабочий топик).
+#
+# Расширять список = снова разрешить ответы не в своём топике — только
+# осознанно и с обновлением теста «чужой топик молчит».
+OUTSIDE_TOPIC_COMMANDS = ("id", "help", "start", "reg")
 
 # Все поддерживаемые команды (для подсказок «может, вы имели в виду…»).
 KNOWN_COMMANDS = (
@@ -863,9 +879,9 @@ def topic_configuration_problems(chat_id=None) -> list:
 
         if thread_id in seen:
             problems.append(
-                f"Топики ошибок {seen[thread_id]} и {title} совпадают "
-                f"(id {thread_id}): ошибки {title} будут записаны как "
-                f"{seen[thread_id]}. Задайте разные топики."
+                f"Error topics for {seen[thread_id]} and {title} are the "
+                f"same (id {thread_id}): {title} issues would be recorded "
+                f"as {seen[thread_id]}. Set different topics."
             )
         else:
             seen[thread_id] = title
@@ -879,9 +895,9 @@ def topic_configuration_problems(chat_id=None) -> list:
         for title, thread_id in error_topics.items():
             if thread_id is not None and int(thread_id) == int(shared_id):
                 problems.append(
-                    f"Топик ошибок {title} совпадает со служебным топиком "
+                    f"Error topic for {title} equals the shared topic "
                     f"{TOPIC_TITLES.get(topic_kind, topic_kind)} (id {shared_id}): "
-                    f"фото ошибок оттуда будут отклоняться."
+                    f"error photos from there will be rejected."
                 )
 
     # Топик может быть задан ИМЕНЕМ: тогда он не разрешается, пока бот не
@@ -907,9 +923,10 @@ def topic_configuration_problems(chat_id=None) -> list:
         if error_topic(title, chat_id) is None:
             reported.add(name)
             problems.append(
-                f"Топик ошибок {title} задан именем {name!r}, но бот ещё его не "
-                f"видел: приём ошибок отклоняется, пока имя не выучено. "
-                f"Надёжнее указать id (команда /id в этом топике)."
+                f"Error topic for {title} is set by name {name!r}, but the "
+                f"bot has not seen it yet: error intake is rejected until "
+                f"the name is learned. It is safer to set the id "
+                f"(send /id in that topic)."
             )
 
     return problems
@@ -1269,6 +1286,7 @@ def _send(
 
         if (
             fallback is not None
+            and _fallback_thread_allowed(chat_id, fallback)
             and (is_group or _chat_key(chat_id) in ALLOWED_CHAT_IDS)
             and (thread_id is None or int(thread_id) != int(fallback))
         ):
@@ -1305,6 +1323,24 @@ def _send_action(chat_id, action="typing"):
         action,
         message_thread_id=_route_thread(chat_id),
     )
+
+
+def _fallback_thread_allowed(chat_id, thread_id) -> bool:
+    """
+    Можно ли повторять доставку в этот топик.
+
+    Фолбэк существует только для случая «в топике-источнике отправить
+    нельзя» (например, General закрыт). Но сам фолбэк — тоже отправка в
+    Telegram, поэтому он разрешён лишь в топик, который бот мониторит.
+    Иначе бот снова писал бы в чужой топик — ровно то, что запрещено.
+    """
+    if thread_id is None:
+        return False
+
+    allowed, _reason = topic_allowed(chat_id, thread_id)
+
+    return bool(allowed)
+
 
 
 # ------------------------------------------------------------
@@ -2356,10 +2392,10 @@ def _show_error_menu(
         path = ()
         keyboard = error_menu_keyboard(())
 
-    caption = "📷 Выберите тип ошибки:"
+    caption = "📷 Choose the issue type:"
 
     if path:
-        caption = f"📷 {error_menu_label(path)}\nВыберите подробнее:"
+        caption = f"📷 {error_menu_label(path)}\nChoose a sub-type:"
 
     sent = tg.send_photo(
         chat_id,
@@ -2372,7 +2408,7 @@ def _show_error_menu(
     if not sent:
         _send(
             chat_id,
-            "⚠️ Не удалось отправить фото с кнопками. Отправьте фото ещё раз.",
+            "⚠️ Could not send the photo with buttons. Please send the photo again.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
@@ -2602,12 +2638,12 @@ def _sender_title(sender: dict) -> str:
 def _show_console_message(chat, sender, message_type: str, extra_rows=None):
     table = Table(show_header=False)
 
-    table.add_row("👤 Отправитель", _sender_title(sender))
+    table.add_row("👤 Sender", _sender_title(sender))
     table.add_row("🆔 ID", str(sender.get("id")))
-    table.add_row("💬 Чат", str(chat.get("id")))
-    table.add_row("📝 Тип", message_type)
+    table.add_row("💬 Chat", str(chat.get("id")))
+    table.add_row("📝 Type", message_type)
     table.add_row(
-        "🧵 Топик",
+        "🧵 Topic",
         str(_route_thread(chat.get("id"))) if chat.get("id") is not None else "-",
     )
 
@@ -2879,7 +2915,10 @@ def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -
         return True
 
     if command == "id":
-        thread_id = _route_thread(chat_id)
+        # Топик берём из текущего сообщения (origin), а не из «последнего
+        # маршрута»: в чужом топике маршрут теперь намеренно не обновляется,
+        # и /id показал бы чужой id вместо того, в котором его вызвали.
+        thread_id = _reply_thread(chat_id)
         name = topic_name(chat_id, thread_id)
         allowed, reason = topic_allowed(chat_id, thread_id)
 
@@ -3184,7 +3223,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
 
     if action == "x":
         if callback_id:
-            tg.answer_callback_query(callback_id, "Отменено")
+            tg.answer_callback_query(callback_id, "Cancelled")
 
         take_error_menu(chat_id, sender.get("id"))
         _delete_quiet(chat_id, message_id)
@@ -3197,7 +3236,10 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
 
         if not choice:
             if callback_id:
-                tg.answer_callback_query(callback_id, "\u041c\u0435\u043d\u044e \u0443\u0441\u0442\u0430\u0440\u0435\u043b\u043e")
+                tg.answer_callback_query(
+                    callback_id,
+                    "This menu is outdated — send the photo again",
+                )
 
             _delete_quiet(chat_id, message_id)
             return
@@ -3218,7 +3260,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
         if callback_id:
             tg.answer_callback_query(
                 callback_id,
-                "Меню устарело — отправьте фото заново",
+                "This menu is outdated — send the photo again",
             )
 
         _delete_quiet(chat_id, message_id)
@@ -3235,7 +3277,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
             tg.edit_message_caption(
                 chat_id,
                 message_id,
-                f"📷 {error_menu_label(path)}\nВыберите подробнее:",
+                f"📷 {error_menu_label(path)}\nChoose a sub-type:",
                 reply_markup=error_menu_keyboard(path),
                 message_thread_id=_reply_thread(chat_id, pending.get("thread_id")),
             )
@@ -3255,7 +3297,7 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
         tg.edit_message_caption(
             chat_id,
             message_id,
-            "📷 Выберите тип ошибки:",
+            "📷 Choose the issue type:",
             reply_markup=error_menu_keyboard(()),
             message_thread_id=_reply_thread(chat_id, pending.get("thread_id")),
         )
@@ -3289,12 +3331,12 @@ def _handle_menu_action(chat_id, sender, pending, code, message_id, callback_id)
 
     if code == "custom":
         if callback_id:
-            tg.answer_callback_query(callback_id, "Опишите ошибку")
+            tg.answer_callback_query(callback_id, "Describe the issue")
 
         sent = _send(
             chat_id,
-            "✏️ Опишите ошибку одним сообщением.\n"
-            "Например: «не поднимает полку, мигает красный индикатор»",
+            "✏️ Describe the issue in one message.\n"
+            "For example: \"does not lift the shelf, red light is blinking\"",
             reply_to_message_id=message_id,
         )
 
@@ -3320,7 +3362,7 @@ def _handle_menu_action(chat_id, sender, pending, code, message_id, callback_id)
         label = MENU_ACTIONS["!other"][0]
     else:
         if callback_id:
-            tg.answer_callback_query(callback_id, "Не понял выбор")
+            tg.answer_callback_query(callback_id, "Could not understand the choice")
 
         return
 
@@ -3382,8 +3424,8 @@ def _ask_robot_number(chat_id, sender, pending, label, message_id):
     """
     sent = _send(
         chat_id,
-        f"✅ Тип: {label}\n\n"
-        "Отправьте номер робота (только цифры), например:\n3780",
+        f"✅ Type: {label}\n\n"
+        "Send the robot number (digits only), for example:\n3780",
         reply_to_message_id=message_id,
         reply_markup=robot_number_keyboard(chat_id),
     )
@@ -3435,7 +3477,7 @@ def robot_number_keyboard(chat_id) -> dict:
     if row:
         rows.append(row)
 
-    rows.append([{"text": "✖️ Отмена", "callback_data": "em:x"}])
+    rows.append([{"text": "✖️ Cancel", "callback_data": "em:x"}])
 
     return {"inline_keyboard": rows}
 
@@ -3446,7 +3488,7 @@ def _finish_error_menu(chat_id, sender, pending, path, message_id, callback_id):
 
     if not label:
         if callback_id:
-            tg.answer_callback_query(callback_id, "Не понял выбор")
+            tg.answer_callback_query(callback_id, "Could not understand the choice")
 
         return
 
@@ -3457,8 +3499,8 @@ def _finish_error_menu(chat_id, sender, pending, path, message_id, callback_id):
 
     sent = _send(
         chat_id,
-        f"✅ Тип: {label}\n\n"
-        "Отправьте номер робота (только цифры), например:\n3780",
+        f"✅ Type: {label}\n\n"
+        "Send the robot number (digits only), for example:\n3780",
         reply_to_message_id=message_id,
     )
 
@@ -3623,7 +3665,7 @@ def _handle_top(chat_id, args, reply_to):
     if not analytics.period_days(period):
         _send(
             chat_id,
-            "Usage: /top [склад] [day|week|month]\n"
+            "Usage: /top [warehouse] [day|week|month]\n"
             f"Example: /top {list(WAREHOUSES)[0]} week",
             reply_to_message_id=reply_to,
         )
@@ -3658,7 +3700,7 @@ def _handle_downtime(chat_id, args, reply_to):
     if not days.isdigit() or not (1 <= int(days) <= 90):
         _send(
             chat_id,
-            "Usage: /downtime [склад] [days 1..90]\n"
+            "Usage: /downtime [warehouse] [days 1..90]\n"
             f"Example: /downtime {list(WAREHOUSES)[0]} 7",
             reply_to_message_id=reply_to,
         )
@@ -4385,28 +4427,25 @@ def _handle_update_inner(update: dict, bot_username: str = None):
 
     _learn_topic_from_message(chat_id, message)
 
-    # Все ответы бота уходят в тот же топик.
-    _set_route(chat_id, thread_id, chat.get("type"))
-
-    # Склад сообщения: топик ошибок GLP-C -> GLP-C, топик ошибок SP3 -> SMALL-P3.
-    # В общих топиках — склад по умолчанию (его можно переопределить в команде).
-    set_current_warehouse(warehouse_for_thread(chat_id, thread_id))
-
-    # Ответ уходит только в этот топик — никуда больше.
-    set_origin_thread(chat_id, thread_id)
-
     text = message.get("text")
     caption = message.get("caption")
 
-    # Команды (/id, /reg, /help) работают в любом топике, чтобы можно было
-    # настроиться; содержимое (ошибки, фото) — только в нужном топике.
+    # Команды (/id, /help, /start, /reg) работают в любом топике, чтобы можно
+    # было настроиться; содержимое (ошибки, фото) — только в нужном топике.
     is_command = bool(text) and text.startswith("/")
 
     command = None
+    normalized_command = None
 
     if is_command:
         command, _args = parse_command(text, BOT_USERNAME)
 
+        if command is not None:
+            normalized_command = normalize_command(command)
+
+    # Чат не из белого списка: молчим, кроме команд настройки (/id и т.п.) —
+    # иначе после включения TELEGRAM_ALLOWED_CHAT_IDS нельзя узнать chat_id.
+    # Проверка идёт раньше топиков, чтобы в запрещённый чат ничего не ушло.
     if not _chat_allowed(chat_id) and command not in BOOTSTRAP_COMMANDS:
         logger.warning(
             "Message from chat %s ignored (not in allow-list)", chat_id
@@ -4416,9 +4455,30 @@ def _handle_update_inner(update: dict, bot_username: str = None):
     allowed, reason = topic_allowed(chat_id, thread_id)
     shared = is_shared_topic(chat_id, thread_id)
 
-    if not allowed and not is_command and not shared:
+    # Отвечать в топике, который бот не мониторит, нельзя: исключение —
+    # только команды настройки из OUTSIDE_TOPIC_COMMANDS. Проверяем ДО записи
+    # маршрута, иначе чужой топик стал бы «последним известным» и в него
+    # ушли бы ответы уже из отслеживаемого топика.
+    outside_commands = normalized_command in OUTSIDE_TOPIC_COMMANDS
+
+    if not allowed and not shared and not outside_commands:
+        # Маршрут не трогаем: он должен указывать только на мониторенные топики.
         _handle_wrong_topic(chat_id, thread_id, reason)
         return
+
+    # «Последний маршрут чата» запоминаем ТОЛЬКО для мониторенных топиков:
+    # он нужен фоновым досылкам, которые работают вне апдейта. Если писать
+    # туда чужой топик, фоновая досылка (например, истёкшее ожидание текста)
+    # ответит именно в него — а это ровно тот баг, который чиним.
+    if allowed or shared:
+        _set_route(chat_id, thread_id, chat.get("type"))
+
+    # Склад сообщения: топик ошибок GLP-C -> GLP-C, топик ошибок SP3 -> SMALL-P3.
+    # В общих топиках — склад по умолчанию (его можно переопределить в команде).
+    set_current_warehouse(warehouse_for_thread(chat_id, thread_id))
+
+    # Ответ уходит только в этот топик — никуда больше.
+    set_origin_thread(chat_id, thread_id)
 
     if text:
         if not allowed and not is_command:
@@ -4510,7 +4570,7 @@ def _finish_error_choice(chat_id, sender, choice, number, message_id):
     if not employee_name:
         _send(
             chat_id,
-            "⚠️ Сначала зарегистрируйтесь: /reg <Фамилия Имя>",
+            "⚠️ Please register first: /reg <Last First>",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
@@ -4594,8 +4654,8 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
             sender,
             "command",
             extra_rows=[
-                ("⚙️ Команда", text),
-                ("🔤 Распознано", f"/{normalized}"),
+                ("⚙️ Command", text),
+                ("🔤 Normalized", f"/{normalized}"),
             ],
         )
 
@@ -4698,7 +4758,7 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         sender,
         "text",
         extra_rows=[
-            ("💭 Текст", text),
+            ("💭 Text", text),
             ("🤖 Robot", parsed["robot"] if parsed else "-"),
             ("⚠️ Issue Type", parsed["error_type"] if parsed else "-"),
         ],
@@ -5134,7 +5194,7 @@ def main():
     if not supabase_key_configured():
         raise SystemExit(
             "SUPABASE_SERVICE_KEY is not set. "
-            "Add it to .env — иначе записи об ошибках не сохраняются."
+            "Add it to .env — otherwise error reports are silently lost."
         )
 
     me = tg.get_me()

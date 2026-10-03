@@ -852,7 +852,7 @@ class TopicDiagnosticsChecks(unittest.TestCase):
         problems = self.problems(**{"error:GLP-C": "2", "error:SMALL-P3": "2"})
 
         self.assertTrue(problems)
-        self.assertIn("совпадают", " ".join(problems))
+        self.assertIn("are the same", " ".join(problems))
 
     def test_error_topic_colliding_with_a_shared_topic_is_reported(self):
         """
@@ -862,13 +862,13 @@ class TopicDiagnosticsChecks(unittest.TestCase):
         problems = self.problems(topic_id=319, **{"status": "319"})
 
         self.assertTrue(problems)
-        self.assertIn("служебным", " ".join(problems))
+        self.assertIn("shared topic", " ".join(problems))
 
     def test_unlearned_topic_name_is_reported(self):
         problems = self.problems(topic_id=None, topic_name="Ex GLPC")
 
         self.assertTrue(problems)
-        self.assertIn("не выучено", " ".join(problems))
+        self.assertIn("has not seen it yet", " ".join(problems))
 
     def test_per_warehouse_unlearned_name_is_reported(self):
         problems = self.problems(**{"error": "2", "error:SMALL-P3": "Ex SP3"})

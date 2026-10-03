@@ -763,18 +763,18 @@ def start_shift_scheduler() -> threading.Thread:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Превью отчёта за смену")
-    parser.add_argument("--date", help="дата смены YYYY-MM-DD (по умолчанию — текущая)")
-    parser.add_argument("--shift", choices=("day", "night"), help="смена")
+    parser = argparse.ArgumentParser(description="Shift report preview")
+    parser.add_argument("--date", help="shift date YYYY-MM-DD (default: current)")
+    parser.add_argument("--shift", choices=("day", "night"), help="shift")
     parser.add_argument(
         "--send",
         action="store_true",
-        help="отправить карточку в целевой Lark-чат (превью в группе)",
+        help="send the card to the target Lark chat (preview in the group)",
     )
     parser.add_argument(
         "--json",
         action="store_true",
-        help="показать JSON карточки вместо текста",
+        help="print the card JSON instead of the text",
     )
 
     args = parser.parse_args()
@@ -796,7 +796,7 @@ def main():
 
     if args.send:
         result = send_shift_report(shift_date, shift_name, force=True)
-        print("\n--- отправлено в Lark ---")
+        print("\n--- sent to Lark ---")
         print(json.dumps(result, ensure_ascii=False))
 
 

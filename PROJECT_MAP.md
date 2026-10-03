@@ -29,7 +29,7 @@ Telegram-бот приёма ошибок роботов на складах (GL
 
 | Файл | Строк | Роль |
 | --- | --- | --- |
-| `telegram_bot.py` | 5203 | Точка входа. Long polling, маршрутизация топиков, команды, флоу фото/ошибки/статуса, Flask-роуты, лиз, фоновые потоки. |
+| `telegram_bot.py` | ~5330 | Точка входа. Long polling, маршрутизация топиков, команды, флоу фото/ошибки/статуса, Flask-роуты, лиз, фоновые потоки. |
 | `telegram_api.py` | 559 | Тонкая обёртка Bot API: `call`, dry-run, flood-limit, send/edit/delete, файлы. |
 | `sendToDataBase.py` | 1121 | PostgREST-доступ и главный писатель `send_to_data_base`, сменная статистика. |
 | `supabase_storage.py` | 459 | Storage: бакеты, загрузка фото, подписанные ссылки, JSON-объекты. |
@@ -122,7 +122,7 @@ QR Code          → Shelf | Floor
 
 | Файл | Чеков | Роль |
 | --- | --- | --- |
-| `tests/test_telegram_offline.py` | 605 | Полный offline-набор бота, без сети (121 функция). |
+| `tests/test_telegram_offline.py` | 631 | Полный offline-набор бота, без сети. |
 | `tests/test_equipment_intake_production.py` | 27 | Offline-проверки производственного приёма оборудования. |
 | `tests/test_report_writer.py` | 127 | Offline-проверки записи отчётов. |
 | `tests/test_live_test_harness.py` | 25 | Проверки живого стенда и запускателя (без сети наружу). |
@@ -185,6 +185,14 @@ update → handle_update → _handle_update_inner
 - белый список `TELEGRAM_LISTEN_TOPICS` ограничивает monitored topics;
 - если ничего не настроено — принимается всё (в логе громкое предупреждение);
 - иначе совпадение по `TELEGRAM_TOPIC_ID` / ошибкам по складам / имени топика.
+
+**В чужом топике бот молчит** (`_handle_update_inner`): ответить там
+разрешено только командам настройки из `OUTSIDE_TOPIC_COMMANDS`
+(`/id`, `/help`, `/start`, `/reg`). Маршрут чата (`_routes`) обновляется
+только для мониторенных топиков, иначе фоновая досылка ответила бы в чужой
+топик. Фолбэк `_send` тоже проверяет топик через `_fallback_thread_allowed`.
+Подсказка «здесь не отслеживается» (`TELEGRAM_WRONG_TOPIC_HINT`) по умолчанию
+выключена.
 
 **Чёрный список** `TELEGRAM_IGNORE_TOPICS` — полное игнорирование, включая
 команды. Полностью исключает выбранные топики из обработки.
@@ -357,6 +365,24 @@ Photo → category → model/type → module (robot/workstation only) → device
    запись через `_remember_bounded`, оба словаря ограничены `_CACHE_LIMIT`.
 7. ~~`handle_incoming_photo` импортируется, но не вызывается.~~
    **Исправлено:** мёртвый импорт убран из `telegram_bot.py`.
+
+**Исправлено (текущая сессия):**
+
+18. В чужом топике бот больше не отвечает: рабочие команды (`/stats`, `/robot`,
+    `/top` и т.п.) и текст/фото в неотслеживаемом топике игнорируются молча.
+    Отвечают только `/id`, `/help`, `/start`, `/reg`; `_routes` обновляется
+    только для мониторенных топиков; фолбэк `_send` проверяет топик; подсказка
+    `TELEGRAM_WRONG_TOPIC_HINT` по умолчанию выключена (была включена и сама
+    являлась ответом в чужом топике). Регрессии:
+    `test_wrong_topic_silent_by_default`,
+    `test_wrong_topic_only_setup_commands_answer`,
+    `test_wrong_topic_does_not_hijack_route`,
+    `test_send_fallback_skips_unmonitored_topic`.
+19. Все пользовательские тексты бота переведены на английский (логи и
+    комментарии остались русскими). Регрессия:
+    `test_user_facing_texts_are_english` (разбор строк через AST).
+20. `TELEGRAM_MOVED_HINT` и `TELEGRAM_ERROR_TOPIC_STRICT` в коде не читаются —
+    помечено в `.env.example` и README.
 
 **Остаются в силе:**
 

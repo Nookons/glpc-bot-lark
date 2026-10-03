@@ -156,7 +156,7 @@ class DecisionTree:
     def require(self, node_id: str) -> Node:
         node = self.nodes.get(node_id)
         if node is None:
-            raise KeyError(f"Узел {node_id!r} не найден в дереве")
+            raise KeyError(f"Node {node_id!r} not found in the tree")
         return node
 
     # ------------------------------------------------------------------
@@ -269,7 +269,7 @@ class DecisionTree:
 
     def validate(self) -> None:
         if self.root_id not in self.nodes:
-            raise ValueError(f"root_id {self.root_id!r} отсутствует в nodes")
+            raise ValueError(f"root_id {self.root_id!r} is missing from nodes")
 
         for node in self.nodes.values():
             if node.type in (NodeType.CHOICE, NodeType.MULTI, NodeType.YESNO):
@@ -277,7 +277,7 @@ class DecisionTree:
                 # наполняется позже. В работе он попросит описать текстом.
                 if not node.options and not node.is_stub:
                     raise ValueError(
-                        f"Узел {node.id!r} типа {node.type.value} без вариантов"
+                        f"Node {node.id!r} of type {node.type.value} has no options"
                     )
 
             if node.type == NodeType.FINAL:
@@ -291,8 +291,8 @@ class DecisionTree:
             for target in targets:
                 if target is not None and target not in self.nodes:
                     raise ValueError(
-                        f"Узел {node.id!r} ссылается на несуществующий "
-                        f"узел {target!r}"
+                        f"Node {node.id!r} references a non-existent "
+                        f"node {target!r}"
                     )
 
             seen: set = set()
@@ -300,7 +300,7 @@ class DecisionTree:
             for option in node.options:
                 if option.id in seen:
                     raise ValueError(
-                        f"Узел {node.id!r}: дублирующийся вариант {option.id!r}"
+                        f"Node {node.id!r}: duplicate option {option.id!r}"
                     )
                 seen.add(option.id)
 
@@ -331,7 +331,7 @@ class DecisionTree:
 
         if unreachable:
             raise ValueError(
-                "Недостижимые узлы дерева: " + ", ".join(sorted(unreachable))
+                "Unreachable tree nodes: " + ", ".join(sorted(unreachable))
             )
 
 

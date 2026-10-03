@@ -12,6 +12,6 @@ APP_SECRET = os.getenv("LARK_APP_SECRET")
 
 if not APP_ID or not APP_SECRET:
     print(
-        "LARK_APP_ID/LARK_APP_SECRET не заданы — фото будут уходить "
-        "ссылкой (загрузка картинок в Lark недоступна)"
+        "LARK_APP_ID/LARK_APP_SECRET are not set — photos will be sent "
+        "as a link (image upload to Lark is unavailable)"
     )

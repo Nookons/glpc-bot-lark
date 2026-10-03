@@ -187,7 +187,7 @@ def step_caption(session: Session) -> str:
         return "\n".join(lines)
 
     if node.type == NodeType.MULTI:
-        lines.append(f"Выбрано: {len(session.draft)}")
+        lines.append(f"Selected: {len(session.draft)}")
 
     return "\n".join(lines)
 
@@ -205,27 +205,27 @@ def _waiting_hint(session: Session) -> str:
         return ""
 
     if node.is_stub and not node.options:
-        example = node.stub_hint or "Опишите проблему словами"
+        example = node.stub_hint or "Describe the problem in words"
 
         return (
-            "Напишите ответ одним сообщением.\n"
+            "Send your answer in one message.\n"
             f"{example}"
         )
 
     if node.type == NodeType.NUMBER:
-        example = node.placeholder or "Введите число"
+        example = node.placeholder or "Enter a number"
 
         if node.min_value is not None or node.max_value is not None:
             low = "−∞" if node.min_value is None else node.min_value
             high = "∞" if node.max_value is None else node.max_value
             example += f" ({low}…{high})"
 
-        return "Напишите ответ одним сообщением.\n" + example
+        return "Send your answer in one message.\n" + example
 
     if node.type == NodeType.INPUT:
-        example = node.placeholder or "Опишите проблему словами"
+        example = node.placeholder or "Describe the problem in words"
 
-        return "Напишите ответ одним сообщением.\n" + example
+        return "Send your answer in one message.\n" + example
 
     return ""
 
@@ -238,7 +238,7 @@ def summary_caption(session: Session) -> str:
         lines.append(f"{row['field']}: {row['value']}")
 
     lines.append("")
-    lines.append("Проверьте и подтвердите.")
+    lines.append("Check and confirm.")
 
     return "\n".join(lines)
 
@@ -388,7 +388,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         if callback_id:
             tg.answer_callback_query(
                 callback_id,
-                "Меню устарело — отправьте фото заново",
+                "This menu is outdated — send the photo again",
             )
         _bot()._delete_quiet(chat_id, message_id)
         return True
@@ -422,7 +422,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         return True
     except ValueError:
         if callback_id:
-            tg.answer_callback_query(callback_id, "Некорректное действие")
+            tg.answer_callback_query(callback_id, "Invalid action")
         return True
 
     _redraw(chat_id, session, message_id)
@@ -450,7 +450,7 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     except EngineError as error:
         _bot()._send(
             chat_id,
-            f"⚠️ {error}. Попробуйте ещё раз.",
+            f"⚠️ {error}. Please try again.",
             reply_to_message_id=message_id,
             delete_after=10,
         )

@@ -39,6 +39,15 @@ for _warehouse_key in ("GLPC", "SP3"):
 for _shared_key in ("STATUS", "STATS", "SERVICE"):
     os.environ[f"TELEGRAM_TOPIC_{_shared_key}"] = ""
 
+# Подсказка «здесь не отслеживается» читается из окружения на импорте, и в
+# боевом .env она может быть включена. Пустая строка для env_bool означает
+# «не задано» -> берётся значение по умолчанию из кода. Так тесты проверяют
+# именно то, что бот делает «из коробки» (подсказка выключена), а не то, что
+# лежит в .env оператора. load_dotenv() не перезаписывает уже заданную
+# переменную (даже пустую), поэтому .env значения не подставит.
+# Тесты, которым подсказка нужна, включают её сами и возвращают значение.
+os.environ["TELEGRAM_WRONG_TOPIC_HINT"] = ""
+
 # load_dotenv() не перезаписывает уже заданные переменные, поэтому здесь
 # подставляем заведомо нерабочие значения: если какой-то вызов забудут
 # заглушить, тест упадёт, а не постучится в боевую базу из .env.
@@ -53,6 +62,10 @@ REAL_SEND_MESSAGE = tg.send_message
 REAL_EDIT_MESSAGE_TEXT = tg.edit_message_text
 
 import telegram_bot as bot  # noqa: E402
+
+# Значение подсказки «чужой топик» на момент импорта (из окружения/кода):
+# тесты его меняют, поэтому фиксируем исходное здесь и проверяем отдельно.
+DEFAULT_WRONG_TOPIC_HINT = bot.WRONG_TOPIC_HINT
 import equipment_intake.flow as intake_flow  # noqa: E402
 import bot_lease  # noqa: E402
 import robot_status  # noqa: E402
@@ -1429,12 +1442,21 @@ def reset_topics(topic_id=None, topic_name=""):
     bot._routes.clear()
     bot._hinted_threads.clear()
     bot._chat_types.clear()
+    # origin-топик переживает тест (thread-local): без сброса следующий тест
+    # получил бы топик предыдущего и проверял бы не то, что заявлено.
+    bot._origin_thread.value = None
 
 
 def test_topic_filter_by_id():
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
     reset_topics(topic_id=555)
+
+    # Подсказка выключена по умолчанию: включаем её здесь осознанно, чтобы
+    # проверить и сам текст подсказки. Тест «чужой топик молчит по умолчанию»
+    # живёт отдельно (test_wrong_topic_silent_by_default).
+    original_hint = bot.WRONG_TOPIC_HINT
+    bot.WRONG_TOPIC_HINT = True
 
     sent = run(make_update(
         text="Unable to drive: Security module failure. 3780",
@@ -1471,6 +1493,8 @@ def test_topic_filter_by_id():
         (DB_CALLS, sent),
     )
 
+    bot.WRONG_TOPIC_HINT = original_hint
+    bot._hinted_threads.clear()
     reset_topics()
 
 
@@ -1478,6 +1502,9 @@ def test_topic_filter_by_name():
     LINKS[100] = "Ivan Petrenko"
     COUNTS["3780"] = 1
     reset_topics(topic_name="Ex GLPC")
+
+    original_hint = bot.WRONG_TOPIC_HINT
+    bot.WRONG_TOPIC_HINT = True
 
     # Имя топика бот узнаёт из сервисного сообщения о создании топика.
     run(make_update(thread_id=42, topic_created="Ex GLPC"))
@@ -1511,6 +1538,8 @@ def test_topic_filter_by_name():
     ))
     check("topic name: подсказка не дублируется", sent == [], sent)
 
+    bot.WRONG_TOPIC_HINT = original_hint
+    bot._hinted_threads.clear()
     reset_topics()
 
 
@@ -1721,6 +1750,366 @@ def test_send_fallback_scoped_to_groups():
         unknown_calls == [(777, 2)],
         unknown_calls,
     )
+
+
+def test_user_facing_texts_are_english():
+    """
+    Тексты для сотрудника — только на английском.
+
+    Проверяем не глазами, а разбором: берём строковые литералы модулей,
+    которые пишут в Telegram, и ищем русские буквы. Осознанно исключены:
+    docstring'и (документация по-русски по конвенции), аргументы логгеров и
+    консольного вывода для разработчика, а также таблица русской раскладки
+    RU_LAYOUT (это данные распознавания команд, а не текст пользователю).
+    """
+    import ast
+    import re
+
+    cyrillic = re.compile(r"[\u0400-\u04ff]")
+
+    module_files = [
+        os.path.join(PROJECT_ROOT, name)
+        for name in (
+            "telegram_bot.py",
+            "robot_card.py",
+            "robot_status.py",
+            "shift_report.py",
+            "analytics.py",
+            "digests.py",
+            "sendToDataBase.py",
+            "telegram_store.py",
+        )
+    ] + sorted(
+        os.path.join(PROJECT_ROOT, "equipment_intake", name)
+        for name in os.listdir(os.path.join(PROJECT_ROOT, "equipment_intake"))
+        if name.endswith(".py")
+    )
+
+    def _call_name(node):
+        """'logger.info', 'console.print' — читаемое имя вызываемого."""
+        func = node.func if isinstance(node, ast.Call) else None
+        parts = []
+        while isinstance(func, ast.Attribute):
+            parts.append(func.attr)
+            func = func.value
+        if isinstance(func, ast.Name):
+            parts.append(func.id)
+        return ".".join(reversed(parts))
+
+    offenders = []
+
+    for module_file in module_files:
+        source = open(module_file, encoding="utf-8").read()
+        tree = ast.parse(source)
+        lines = source.splitlines()
+
+        # Строки, которые заведомо не для пользователя.
+        allowed_lines = set()
+        work = list(tree.body)
+
+        while work:
+            node = work.pop()
+            work.extend(ast.iter_child_nodes(node))
+
+            # Docstring: первый оператор-строка модуля/класса/функции.
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                pass
+
+            if isinstance(node, ast.Call):
+                name = _call_name(node)
+
+                if name.startswith("logger.") or name in ("print", "console.print"):
+                    for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                        for sub in ast.walk(arg):
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                allowed_lines.add(sub.lineno)
+                            elif isinstance(sub, ast.JoinedStr):
+                                allowed_lines.add(sub.lineno)
+
+        # Строка-документация: узел Expr с константой в начале блока.
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                body = getattr(node, "body", [])
+                first = body[0] if body else None
+                if (isinstance(first, ast.Expr)
+                        and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    allowed_lines.add(first.value.lineno)
+
+        ru_lines = ru_layout_lines(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if not cyrillic.search(node.value):
+                continue
+            if node.lineno in allowed_lines or node.lineno in ru_lines:
+                continue
+
+            text = lines[node.lineno - 1].strip()
+            offenders.append(
+                f"{os.path.basename(module_file)}:{node.lineno}: {text[:80]}"
+            )
+
+    check(
+        "english: пользовательские строки без русских букв",
+        offenders == [],
+        offenders[:12],
+    )
+
+
+def ru_layout_lines(source):
+    """Номера строк таблицы RU_LAYOUT — она не текст для человека."""
+    start = source.find("RU_LAYOUT = str.maketrans(")
+    if start < 0:
+        return set()
+    end = source.find("})", start)
+    if end < 0:
+        return set()
+    first = source[:start].count("\n") + 1
+    last = source[:end].count("\n") + 1
+    return set(range(first, last + 1))
+
+
+RU_LAYOUT_KEYS = {
+    "й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "о", "з", "п", "х", "ъ",
+    "ф", "ы", "в", "а", "п", "р", "о", "л", "д", "ж", "э", "я", "ч", "с",
+    "м", "и", "т", "ь", "б", "ю",
+}
+
+
+def test_wrong_topic_silent_by_default():
+    """
+    Чужой топик молчит по умолчанию.
+
+    Владелец: «не должен отвечать в топиках, которые он не мониторит».
+    Раньше бот писал туда подсказку «здесь не отслеживается» — это тоже
+    ответ в чужом топике. Теперь подсказка выключена, и в чужом топике не
+    должно уйти НИ ОДНОГО сообщения.
+    """
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+    reset_topics(topic_id=555)
+
+    original_hint = bot.WRONG_TOPIC_HINT
+    bot.WRONG_TOPIC_HINT = False
+
+    try:
+        # Значение по умолчанию (в окружении переменной нет) обязано быть
+        # False: иначе на чистой установке бот снова пишет в чужой топик.
+        check(
+            "silent: подсказка выключена по умолчанию",
+            DEFAULT_WRONG_TOPIC_HINT is False,
+            DEFAULT_WRONG_TOPIC_HINT,
+        )
+
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=777,
+        ))
+
+        check(
+            "silent: текст в чужом топике не обработан",
+            DB_CALLS == [] and FORWARDED == [],
+            (DB_CALLS, FORWARDED),
+        )
+        check(
+            "silent: в чужом топике не отправлено ни одного сообщения",
+            sent == [] and DELETED == [] and ANSWERED == [],
+            (sent, DELETED, ANSWERED),
+        )
+        check(
+            "silent: in-process hinted threads не пополняются",
+            (-500, 777) not in bot._hinted_threads,
+            bot._hinted_threads,
+        )
+
+        # General (без thread_id) — тоже чужой топик, тоже молчание.
+        sent = run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+        ))
+        check(
+            "silent: General тоже молчит",
+            sent == [] and DB_CALLS == [],
+            (sent, DB_CALLS),
+        )
+
+        # Фото в чужом топике — молчание, без скачивания и записи.
+        sent = run(make_update(photo=True, thread_id=777))
+        check(
+            "silent: фото в чужом топике молчит",
+            sent == [] and FORWARDED == [],
+            (sent, FORWARDED),
+        )
+    finally:
+        bot.WRONG_TOPIC_HINT = original_hint
+        bot._hinted_threads.clear()
+        reset_topics()
+
+
+def test_wrong_topic_only_setup_commands_answer():
+    """
+    В чужом топике отвечают только команды настройки.
+
+    /id, /help, /start, /reg — намеренное исключение (нужно, чтобы
+    зарегистрироваться и узнать id). Любая другая команда (/stats, /robot,
+    /top, /offline…) в неотслеживаемом топике должна молчать.
+    """
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+    reset_topics(topic_id=555)
+
+    original_hint = bot.WRONG_TOPIC_HINT
+    bot.WRONG_TOPIC_HINT = False
+
+    try:
+        # Разрешённые команды отвечают и уходят ровно в топик запроса.
+        for command, marker in (
+            ("/id", "message_thread_id"),
+            ("/help", "Robot exception bot"),
+        ):
+            sent = run(make_update(text=command, thread_id=777))
+            check(
+                f"outside-cmd: {command} отвечает в чужом топике",
+                len(sent) == 1 and marker in sent[0]["text"],
+                sent,
+            )
+            check(
+                f"outside-cmd: {command} отвечает именно в топике запроса",
+                sent and sent[0]["thread_id"] == 777,
+                sent,
+            )
+
+        # Рабочие команды в чужом топике молчат.
+        for command in ("/stats", "/robot 3780", "/top week", "/downtime 7",
+                        "/offline 3780", "/topics", "/digest", "/week"):
+            sent = run(make_update(text=command, thread_id=777))
+            check(
+                f"outside-cmd: {command} в чужом топике молчит",
+                sent == [],
+                sent,
+            )
+    finally:
+        bot.WRONG_TOPIC_HINT = original_hint
+        bot._hinted_threads.clear()
+        reset_topics()
+
+
+def test_wrong_topic_does_not_hijack_route():
+    """
+    Сообщение из чужого топика не становится «последним маршрутом».
+
+    Иначе фоновая досылка (например, истёкшее ожидание текста ошибки)
+    подхватила бы чужой топик и ответила туда.
+    """
+    LINKS[100] = "Ivan Petrenko"
+    COUNTS["3780"] = 1
+    reset_topics(topic_id=555)
+
+    original_hint = bot.WRONG_TOPIC_HINT
+    bot.WRONG_TOPIC_HINT = False
+
+    try:
+        # 1) Сообщение в отслеживаемом топике — маршрут на него.
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=555,
+        ))
+
+        check(
+            "route: маршрут указывает на отслеживаемый топик",
+            bot._route_thread(-500) == 555,
+            bot._route_thread(-500),
+        )
+
+        # 2) Сообщение в чужом топике — маршрут НЕ должен сместиться.
+        run(make_update(
+            text="Unable to drive: Security module failure. 3780",
+            thread_id=777,
+        ))
+
+        check(
+            "route: чужой топик не перебил маршрут",
+            bot._route_thread(-500) == 555,
+            bot._route_thread(-500),
+        )
+
+        # 3) Неизвестная команда в чужом топике тоже не должна ничего менять.
+        run(make_update(text="/zzzzzz", thread_id=777))
+        check(
+            "route: неизвестная команда не перебила маршрут",
+            bot._route_thread(-500) == 555,
+            bot._route_thread(-500),
+        )
+
+        # 4) Настройка в чужом топике /id — тоже не перебивает маршрут.
+        run(make_update(text="/id", thread_id=777))
+        check(
+            "route: /id в чужом топике не перебил маршрут",
+            bot._route_thread(-500) == 555,
+            bot._route_thread(-500),
+        )
+    finally:
+        bot.WRONG_TOPIC_HINT = original_hint
+        bot._hinted_threads.clear()
+        reset_topics()
+
+
+def test_send_fallback_skips_unmonitored_topic():
+    """
+    Откат доставки не должен уводить ответ в неотслеживаемый топик.
+
+    TELEGRAM_TOPIC_ID — обычно топик ошибок, и он мониторится, поэтому
+    откат работает (см. test_send_fallback_to_monitored_topic). Но если
+    отслеживаемый топик задан белым списком и НЕ совпадает с
+    TELEGRAM_TOPIC_ID, откат в него запрещён: иначе бот снова ответит не там.
+    """
+    reset_topics(topic_id=555)
+
+    original_listen_ids = bot.LISTEN_TOPIC_IDS
+    original_listen_names = bot.LISTEN_TOPIC_NAMES
+    original_allowed = bot.ALLOWED_CHAT_IDS
+    original_send = tg.send_message
+
+    bot.LISTEN_TOPIC_IDS = {4242}
+    bot.LISTEN_TOPIC_NAMES = set()
+    bot.ALLOWED_CHAT_IDS = {-500}
+    # Маршрут чата не должен достаться от предыдущего теста: _send с
+    # thread_id=None обязан начать с General, иначе проверка «откат не в
+    # чужой топик» ничего не проверит.
+    bot._routes.clear()
+    bot._chat_types.clear()
+
+    calls = []
+
+    def flaky(chat_id, text, reply_to_message_id=None, disable_notification=False,
+              message_thread_id=None, reply_markup=None):
+        calls.append(message_thread_id)
+        return None  # и первая попытка, и откат «не удались»
+
+    tg.send_message = flaky
+
+    try:
+        result = bot._send(-500, "hello", thread_id=None)
+
+        check(
+            "fallback-guard: первая попытка была в General",
+            calls and calls[0] is None,
+            calls,
+        )
+        check(
+            "fallback-guard: откат в неотслеживаемый топик не делается",
+            calls == [None],
+            calls,
+        )
+        check("fallback-guard: результата нет", result is None, result)
+    finally:
+        tg.send_message = original_send
+        bot.LISTEN_TOPIC_IDS = original_listen_ids
+        bot.LISTEN_TOPIC_NAMES = original_listen_names
+        bot.ALLOWED_CHAT_IDS = original_allowed
+        reset_topics()
 
 
 def test_allow_list_bootstrap_commands():
@@ -6847,7 +7236,7 @@ def test_error_menu_bug_other_and_custom_text():
 
         check(
             "bug: сразу просит номер робота",
-            any("номер робота" in item["text"] for item in sent),
+            any("Send the robot number" in item["text"] for item in sent),
             sent,
         )
         check(
@@ -6869,7 +7258,7 @@ def test_error_menu_bug_other_and_custom_text():
 
         check(
             "custom: просят описать ошибку",
-            any("Опишите ошибку" in item["text"] for item in sent),
+            any("Describe the issue" in item["text"] for item in sent),
             sent,
         )
         check(
@@ -6887,7 +7276,7 @@ def test_error_menu_bug_other_and_custom_text():
         )
         check(
             "custom: после текста просят номер",
-            any("номер робота" in item["text"] for item in sent),
+            any("Send the robot number" in item["text"] for item in sent),
             sent,
         )
         check(
@@ -7172,7 +7561,7 @@ def test_error_menu_photo_flow():
         check(
             "меню-фото: подпись предлагает выбрать тип",
             sent_photos
-            and "Выберите тип ошибки" in (sent_photos[0].get("caption") or ""),
+            and "Choose the issue type" in (sent_photos[0].get("caption") or ""),
             sent_photos,
         )
         check(
@@ -7186,7 +7575,7 @@ def test_error_menu_photo_flow():
 
         check(
             "меню-фото: нажатие категории меняет подпись",
-            len(edited) == 1 and "Выберите подробнее" in edited[0][1],
+            len(edited) == 1 and "Choose a sub-type" in edited[0][1],
             edited,
         )
         labels = [
@@ -7204,7 +7593,7 @@ def test_error_menu_photo_flow():
 
         check(
             "меню-фото: после выбора типа просят номер",
-            any("номер робота" in item["text"] for item in sent),
+            any("Send the robot number" in item["text"] for item in sent),
             sent,
         )
         check(
@@ -7299,6 +7688,11 @@ def main():
         test_cyrillic_layout_command_works,
         test_send_fallback_to_monitored_topic,
         test_send_fallback_scoped_to_groups,
+        test_user_facing_texts_are_english,
+        test_wrong_topic_silent_by_default,
+        test_wrong_topic_only_setup_commands_answer,
+        test_wrong_topic_does_not_hijack_route,
+        test_send_fallback_skips_unmonitored_topic,
         test_stats_command_matches_report,
         test_self_deleting_confirmations,
         test_text_truncation_helpers,

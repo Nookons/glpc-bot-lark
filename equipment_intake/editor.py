@@ -309,7 +309,7 @@ def _node_caption(tree: DecisionTree, node: Node, notice: str = "") -> str:
     base = DEFAULT_TREE.node(node.id)
     builtin_ids = {option.id for option in base.options} if base else set()
 
-    lines: List[str] = ["Редактор дерева", ""]
+    lines: List[str] = ["Decision tree editor", ""]
 
     # Notice живёт в самом экране узла, а не отдельным сообщением: экран
     # перерисовывается на том же message_id и затёр бы подтверждение.
@@ -324,26 +324,26 @@ def _node_caption(tree: DecisionTree, node: Node, notice: str = "") -> str:
         lines.append(f"_{node.description}_")
 
     lines.append("")
-    lines.append(f"Варианты ({len(node.options)}):")
+    lines.append(f"Options ({len(node.options)}):")
 
     if not node.options:
-        lines.append("— пока пусто —")
+        lines.append("— still empty —")
 
     for option in node.options:
         if option.id in builtin_ids:
-            mark = "встроенный"
+            mark = "built-in"
         else:
-            mark = "добавленный"
+            mark = "added"
 
-        target = option.next_node or "конец ветки"
+        target = option.next_node or "end of branch"
         icon = f"{option.icon} " if option.icon else ""
         lines.append(f"{mark}: {icon}{option.label}  →  {target}")
         lines.append(f"    id: {option.id}")
 
     lines.append("")
     lines.append(
-        "Доступно только добавление нового варианта. "
-        "Переименование и удаление — через разработчика."
+        "Only adding a new option is available. "
+        "Renaming and deletion are done by the developer."
     )
 
     return "\n".join(lines)
@@ -490,8 +490,8 @@ def handle_command(chat_id, sender, args, message_id) -> bool:
         )
         _send(
             chat_id,
-            "Это редактор дерева решений: доступен только сопровождающим.\n"
-            "Обратитесь к ответственному за бота.",
+            "This is the decision tree editor: available to maintainers only.\n"
+            "Please contact the person responsible for the bot.",
             message_id=message_id,
         )
         return True
@@ -521,17 +521,17 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         node = tree.node(arg)
 
         if node is None or node.type not in _OPTION_NODE_TYPES:
-            _answer(callback_id, "Сюда нельзя добавить вариант")
+            _answer(callback_id, "Options cannot be added here")
             return True
 
         put_pending(chat_id, sender.get("id"), node.id, message_id)
 
         text = (
-            f"Новый вариант для «{node.title}»\n\n"
-            "Пришлите название ответа одним сообщением "
-            f"(до {storage.MAX_LABEL_LENGTH} символов).\n"
-            "Например: «Disconnected».\n\n"
-            "Отмена — кнопкой ниже."
+            f"New option for \"{node.title}\"\n\n"
+            "Send the answer name in one message "
+            f"(up to {storage.MAX_LABEL_LENGTH} characters).\n"
+            "For example: \"Disconnected\".\n\n"
+            "Cancel with the button below."
         )
         keyboard = {"inline_keyboard": [[{
             "text": "Cancel",
@@ -548,7 +548,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         _delete_quiet(chat_id, message_id)
         return True
 
-    _answer(callback_id, "Неизвестное действие")
+    _answer(callback_id, "Unknown action")
     return True
 
 
@@ -576,7 +576,7 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     if not label:
         _show_node(
             chat_id, sender, node_id, menu_message_id, edit=True,
-            notice="⚠️ Пустое название — вариант не добавлен.",
+            notice="⚠️ Empty name — the option was not added.",
         )
         return True
 
@@ -586,9 +586,9 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
         _show_node(
             chat_id, sender, node_id, menu_message_id, edit=True,
             notice=(
-                "⚠️ Не удалось добавить вариант: название пустое или "
-                f"длиннее {storage.MAX_LABEL_LENGTH} символов, либо узел "
-                "недоступен. Попробуйте другое название."
+                "⚠️ Could not add the option: the name is empty or "
+                f"longer than {storage.MAX_LABEL_LENGTH} characters, or the node "
+                "is unavailable. Try a different name."
             ),
         )
         return True
@@ -599,8 +599,8 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     _show_node(
         chat_id, sender, node_id, menu_message_id, edit=True,
         notice=(
-            f"✅ Вариант добавлен: {label} (id: {option_id}).\n"
-            "Он уже доступен сотрудникам на этом шаге."
+            f"✅ Option added: {label} (id: {option_id}).\n"
+            "It is already available to employees at this step."
         ),
     )
 
