@@ -1,0 +1,1324 @@
+"""
+Adversarial coverage for the guided-intake journal writer.
+
+This file exists to attack `equipment_intake/report_writer.py` and the dispatch
+guards around it, not to demonstrate that they work on the happy path. It covers
+the ordering rules that decide the warehouse, the timestamp handling that decides
+the shift, identifier shapes, and the regressions that were actually found while
+writing the module:
+
+* `str.isdecimal()` accepting Arabic-Indic digits and inventing a robot number;
+* `flow` stamping `created_at` while the writer read `received_at`, so the
+  report time silently became "server now".
+
+Every test is offline: the database URL points at an unreachable host and the
+Telegram client is stubbed.
+
+Run:
+
+    python3 tests/test_report_writer.py
+"""
+
+import json
+import os
+import sys
+import types
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+os.environ["SUPABASE_URL"] = "http://supabase.invalid"
+os.environ["SUPABASE_SERVICE_KEY"] = "offline-test-key"
+os.environ["TELEGRAM_DRY_RUN"] = "1"
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "000000:TEST-TOKEN")
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from equipment_intake import report_writer as rw  # noqa: E402
+from shift import WARSAW_TZ  # noqa: E402
+
+WARSAW = WARSAW_TZ
+
+
+def answers(**overrides):
+    data = {
+        "object": "Robot",
+        "device_type": "A42T C2",
+        "module": "Lifting",
+        "device_number": "3490",
+        "description": "Lift reports an error",
+    }
+    data.update(overrides)
+    return data
+
+
+def result(warehouse="GLP-C", **overrides):
+    data = {
+        "answers": answers(),
+        "warehouse": warehouse,
+        "employee": "Smoke User",
+        "user_id": 12345,
+        "username": "smoke-user",
+        "chat_id": -100123,
+        "message_id": 777,
+        "image": "/tmp/photo-1.jpg",
+    }
+    data.update(overrides)
+    return data
+
+
+def row_for(warehouse="GLP-C", resolved=None, **overrides):
+    """Build a row with the type lookup stubbed to a known answer."""
+    with mock.patch.object(rw, "canonical_type", return_value=resolved):
+        return rw.build_row(result(warehouse, **overrides), warehouse)
+
+
+class WarehouseGuardChecks(unittest.TestCase):
+    """The warehouse decides which site a fault is filed under."""
+
+    def test_accepts_only_configured_titles(self):
+        self.assertEqual(rw.validate_warehouse("GLP-C"), "GLP-C")
+        self.assertEqual(rw.validate_warehouse("SMALL-P3"), "SMALL-P3")
+
+    def test_trims_surrounding_whitespace(self):
+        self.assertEqual(rw.validate_warehouse("  SMALL-P3\n"), "SMALL-P3")
+
+    def test_rejects_empty_values(self):
+        for value in ("", "   ", "\t", None):
+            with self.subTest(value=value):
+                with self.assertRaises(rw.WarehouseError):
+                    rw.validate_warehouse(value)
+
+    def test_rejects_unconfigured_warehouses(self):
+        # These exist in the `warehouses` table but the bot does not serve them.
+        for value in ("PNT-A", "P3-DC-1", "P3-DC-3"):
+            with self.subTest(value=value):
+                with self.assertRaises(rw.WarehouseError):
+                    rw.validate_warehouse(value)
+
+    def test_rejects_case_and_separator_variants(self):
+        """A near-miss must not be coerced into a real warehouse."""
+        for value in ("glp-c", "glpc", "GLP_C", "Small-P3", "SMALL P3"):
+            with self.subTest(value=value):
+                with self.assertRaises(rw.WarehouseError):
+                    rw.validate_warehouse(value)
+
+    def test_rejects_non_string_values(self):
+        for value in (123, 0, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(rw.WarehouseError):
+                    rw.validate_warehouse(value)
+
+    def test_write_refuses_before_touching_the_database(self):
+        """A refusal must not reach PostgREST at all."""
+        for warehouse in ("", None, "PNT-A"):
+            with self.subTest(warehouse=warehouse):
+                with mock.patch("sendToDataBase.rest_post") as post:
+                    with self.assertRaises(rw.WarehouseError):
+                        rw.write_exception(result(warehouse=warehouse), warehouse)
+                post.assert_not_called()
+
+    def test_write_uses_explicit_argument_over_payload(self):
+        """The caller's warehouse wins, so a stale payload cannot redirect it."""
+        with mock.patch.object(rw, "write_exception", wraps=rw.write_exception):
+            with mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]) as post, \
+                 mock.patch.object(rw, "canonical_type", return_value=None):
+                self.assertTrue(rw.write_exception(result("GLP-C"), "SMALL-P3"))
+
+        self.assertEqual(post.call_args.args[1]["warehouse"], "SMALL-P3")
+
+    def test_write_falls_back_to_payload_warehouse(self):
+        with mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]) as post, \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result("SMALL-P3")))
+
+        self.assertEqual(post.call_args.args[1]["warehouse"], "SMALL-P3")
+
+    def test_write_reports_failure_when_insert_fails(self):
+        with mock.patch("sendToDataBase.rest_post", return_value=None), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertFalse(rw.write_exception(result()))
+
+    def test_write_never_raises_on_conflict(self):
+        """A repeated delivery is success, not an error."""
+        with mock.patch("sendToDataBase.rest_post", return_value=[]), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result()))
+
+
+class CanonicalTypeChecks(unittest.TestCase):
+    """`device_type` must describe the fleet, not the tapped button."""
+
+    def test_lookup_is_scoped_to_warehouse_and_category(self):
+        """SMALL-P3 code 13 is both a robot and a charging station."""
+        calls = []
+
+        def fake_rest_get(table, params):
+            calls.append((table, params))
+            return [{"equipment_type_id": 13}] if table == "equipment" else [{"type": "RT_KUBOT"}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_rest_get):
+            self.assertEqual(rw.canonical_type("SMALL-P3", "robot", "13"), "RT_KUBOT")
+
+        equipment = calls[0][1]
+        self.assertEqual(equipment["warehouse"], "eq.SMALL-P3")
+        self.assertEqual(equipment["category"], "eq.robot")
+        self.assertEqual(equipment["equipment_code"], "eq.13")
+
+    def test_qr_categories_skip_the_inventory(self):
+        """QR codes are not inventory units; no lookup should happen."""
+        with mock.patch("sendToDataBase.rest_get") as get:
+            self.assertIsNone(rw.canonical_type("GLP-C", "qr", "1"))
+        get.assert_not_called()
+
+    def test_empty_code_skips_the_inventory(self):
+        with mock.patch("sendToDataBase.rest_get") as get:
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", ""))
+        get.assert_not_called()
+
+    def test_unknown_device_resolves_to_none(self):
+        with mock.patch("sendToDataBase.rest_get", return_value=[]):
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", "999999"))
+
+    def test_failed_lookup_is_not_treated_as_known(self):
+        """A read failure must not be mistaken for 'device absent'."""
+        with mock.patch("sendToDataBase.rest_get", return_value=None):
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", "3490"))
+
+    def test_missing_type_row_resolves_to_none(self):
+        def fake(table, params):
+            return [{"equipment_type_id": 999}] if table == "equipment" else []
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", "3490"))
+
+    def test_null_type_id_resolves_to_none(self):
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"equipment_type_id": None}]):
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", "3490"))
+
+    def test_blank_type_name_resolves_to_none(self):
+        def fake(table, params):
+            return [{"equipment_type_id": 2}] if table == "equipment" else [{"type": "  "}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            self.assertIsNone(rw.canonical_type("GLP-C", "robot", "3490"))
+
+
+class IdentifierChecks(unittest.TestCase):
+    def test_plain_device_number(self):
+        self.assertEqual(rw.identifier({"device_number": "3490"}), "3490")
+
+    def test_shelf_number_wins_over_device_number(self):
+        """Shelf identity is the shelf number, not the printed QR code."""
+        self.assertEqual(
+            rw.identifier({"shelf_number": "A-12", "device_number": "should-not-win"}),
+            "A-12",
+        )
+
+    def test_qr_floor_combines_x_y_zone(self):
+        self.assertEqual(
+            rw.identifier({"qr_x": "162", "qr_y": "382", "qr_zone": "30"}),
+            "X=162; Y=382; Zone=30",
+        )
+
+    def test_missing_identity_is_empty(self):
+        self.assertEqual(rw.identifier({}), "")
+        self.assertEqual(rw.identifier({"device_number": "   "}), "")
+
+    def test_whitespace_is_trimmed(self):
+        self.assertEqual(rw.identifier({"device_number": "  3490  "}), "3490")
+
+
+class RobotNumberChecks(unittest.TestCase):
+    def test_ascii_digits_become_an_integer(self):
+        self.assertEqual(rw._robot_number("3490"), 3490)
+        self.assertEqual(rw._robot_number("0"), 0)
+
+    def test_non_ascii_digits_are_refused(self):
+        """
+        Regression: `str.isdecimal()` accepts Arabic-Indic digits.
+
+        Without the ASCII guard, '١٢٣' silently became robot 123 — a fault
+        attributed to a robot that was never reported.
+        """
+        for value in ("١٢٣", "٣٤٩٠", "１２３"):
+            with self.subTest(value=value):
+                self.assertIsNone(rw._robot_number(value))
+
+    def test_non_numeric_identifiers_are_refused(self):
+        for value in ("Shelf-3938", "X=1; Y=2; Zone=3", "12.5", "12a", "-5", "", None):
+            with self.subTest(value=value):
+                self.assertIsNone(rw._robot_number(value))
+
+    def test_bigint_bounds(self):
+        self.assertEqual(rw._robot_number("9223372036854775807"), 9_223_372_036_854_775_807)
+        self.assertIsNone(rw._robot_number("9223372036854775808"))
+
+
+class AsciiDigitChecks(unittest.TestCase):
+    """
+    `str.isdigit()`/`int()` accept non-ASCII digits.
+
+    '٣٧٨٠' passes an `isdigit()` guard and `int()` turns it into 3780 — a
+    *different* robot. An operator typing digits in a local numeral system would
+    have the fault filed against an unrelated robot. The shared helpers must
+    reject those values instead.
+    """
+
+    def test_ascii_digits_accepted(self):
+        from text_utils import ascii_digits
+
+        for value in ("0", "3780", "9223372036854775807"):
+            with self.subTest(value=value):
+                self.assertTrue(ascii_digits(value))
+
+    def test_non_ascii_digits_rejected(self):
+        from text_utils import ascii_digits
+
+        for value in ("٣", "٣٧٨٠", "１２３", "١٢٣"):
+            with self.subTest(value=value):
+                self.assertFalse(ascii_digits(value))
+
+    def test_garbage_rejected(self):
+        from text_utils import ascii_digits
+
+        for value in ("", "   ", None, "12.5", "abc", "1 2", "１２"):
+            with self.subTest(value=value):
+                self.assertFalse(ascii_digits(value))
+
+    def test_ascii_digits_trims_whitespace(self):
+        from text_utils import ascii_digits
+
+        self.assertTrue(ascii_digits("  3780  "))
+
+    def test_to_int_parses_only_ascii(self):
+        from text_utils import to_int
+
+        self.assertEqual(to_int("3780"), 3780)
+        self.assertEqual(to_int("  42 "), 42)
+        self.assertEqual(to_int("-5"), -5)
+        self.assertEqual(to_int("+7"), 7)
+
+    def test_to_int_refuses_non_ascii_digits(self):
+        """The value that used to become a different robot number."""
+        from text_utils import to_int
+
+        for value in ("٣٧٨٠", "١٢٣", "１２３"):
+            with self.subTest(value=value):
+                self.assertIsNone(to_int(value))
+
+    def test_to_int_never_raises(self):
+        from text_utils import to_int
+
+        for value in ("", "   ", None, "abc", "12.5", "1e3", [], {}):
+            with self.subTest(value=value):
+                self.assertIsNone(to_int(value))
+
+    def test_robot_parser_path_rejects_local_digits(self):
+        """
+        End-to-end: the parsed robot survives the ASCII gate, so the message is
+        refused with a hint instead of being filed against robot 3780.
+        """
+        from error_parser import parse_error_message
+        from text_utils import ascii_digits
+
+        parsed = parse_error_message("Unable to drive: safety. ٣٧٨٠")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["robot"], "٣٧٨٠")
+        self.assertFalse(ascii_digits(parsed["robot"]))
+
+        normal = parse_error_message("Unable to drive: safety. 3780")
+        self.assertTrue(ascii_digits(normal["robot"]))
+
+    def test_number_node_rejects_local_digits(self):
+        """
+        `\\d` in a regex and `float()` both accept Arabic-Indic digits, so a
+        NUMBER node would read '٣٧٨' as 378. No NUMBER node exists in the active
+        tree today, so this path is dormant — the test keeps it correct for when
+        one is added (the generated tree has them).
+        """
+        from equipment_intake.engine import EngineError, Session
+        from equipment_intake.types import Node, NodeType
+
+        node = Node(id="n", title="N", type=NodeType.NUMBER)
+
+        for value in ("٣٧٨", "٣.٥", "１２３"):
+            with self.subTest(value=value):
+                with self.assertRaises(EngineError):
+                    Session._parse_number(node, value)
+
+    def test_number_node_still_accepts_normal_values(self):
+        from equipment_intake.engine import Session
+        from equipment_intake.types import Node, NodeType
+
+        node = Node(id="n", title="N", type=NodeType.NUMBER)
+
+        self.assertEqual(Session._parse_number(node, "378"), 378)
+        self.assertEqual(Session._parse_number(node, "3.5"), 3.5)
+        self.assertEqual(Session._parse_number(node, "3,5"), 3.5)
+        self.assertEqual(Session._parse_number(node, "3 шт"), 3)
+        self.assertEqual(Session._parse_number(node, "-12"), -12)
+
+    def test_number_node_respects_bounds(self):
+        from equipment_intake.engine import EngineError, Session
+        from equipment_intake.types import Node, NodeType
+
+        node = Node(id="n", title="N", type=NodeType.NUMBER,
+                    min_value=1, max_value=10)
+
+        self.assertEqual(Session._parse_number(node, "5"), 5)
+        for value in ("0", "11"):
+            with self.subTest(value=value):
+                with self.assertRaises(EngineError):
+                    Session._parse_number(node, value)
+
+
+class TruncateChecks(unittest.TestCase):
+    """
+    Telegram and Lark measure text in UTF-16 code units, not Python characters.
+
+    A character outside the BMP (an emoji, some CJK) costs two units. The old
+    implementation truncated by `len()`, so a description of 3000 emoji became
+    "3000 characters" — 6000 UTF-16 units — and the API rejected the message
+    instead of showing a shortened one.
+    """
+
+    def test_utf16_length_counts_astral_chars_twice(self):
+        from text_utils import utf16_length
+
+        self.assertEqual(utf16_length("abc"), 3)
+        self.assertEqual(utf16_length("😀"), 2)
+        self.assertEqual(utf16_length("a😀b"), 4)
+        self.assertEqual(utf16_length(""), 0)
+        self.assertEqual(utf16_length(None), 0)
+
+    def test_astral_text_is_truncated_to_the_real_limit(self):
+        from text_utils import TELEGRAM_TEXT_LIMIT, truncate, utf16_length
+
+        kept = truncate("😀" * 3000, TELEGRAM_TEXT_LIMIT)
+
+        self.assertLessEqual(utf16_length(kept), TELEGRAM_TEXT_LIMIT)
+        # The old behaviour would have produced 6000 units.
+        self.assertGreater(len(kept), 0)
+
+    def test_every_limit_is_respected(self):
+        from text_utils import truncate, utf16_length
+
+        for text in ("😀" * 3000, "a" * 5000, "😀a" * 2000):
+            for limit in (10, 100, 500, 4000):
+                with self.subTest(limit=limit, text=text[:4]):
+                    self.assertLessEqual(utf16_length(truncate(text, limit)), limit)
+
+    def test_short_text_is_returned_unchanged(self):
+        from text_utils import truncate
+
+        self.assertEqual(truncate("short", 500), "short")
+        self.assertEqual(truncate("", 500), "")
+        self.assertEqual(truncate(None, 500), "")
+
+    def test_suffix_is_appended_when_truncated(self):
+        from text_utils import truncate
+
+        self.assertTrue(truncate("x" * 100, 10).endswith("…"))
+
+    def test_zero_or_negative_limit_is_a_no_op(self):
+        from text_utils import truncate
+
+        self.assertEqual(truncate("abc", 0), "abc")
+        self.assertEqual(truncate("abc", -5), "abc")
+
+    def test_ascii_behaviour_is_unchanged(self):
+        from text_utils import truncate
+
+        self.assertEqual(len(truncate("a" * 5000, 4000)), 4000)
+        self.assertEqual(truncate("a" * 4000, 4000), "a" * 4000)
+
+
+class RowMappingChecks(unittest.TestCase):
+    def test_canonical_type_replaces_the_label(self):
+        row = row_for(resolved="RT_KUBOT_MINI_HAIFLEX")
+
+        self.assertEqual(row["device_type"], "RT_KUBOT_MINI_HAIFLEX")
+        self.assertIn("Reported type: A42T C2", row["issue_description"])
+
+    def test_label_is_kept_when_type_is_unknown(self):
+        row = row_for(resolved=None)
+
+        self.assertEqual(row["device_type"], "A42T C2")
+        self.assertNotIn("Reported type", row["issue_description"])
+
+    def test_label_is_not_repeated_when_it_equals_the_type(self):
+        row = row_for(resolved="A42T C2")
+
+        self.assertEqual(row["device_type"], "A42T C2")
+        self.assertNotIn("Reported type", row["issue_description"])
+
+    def test_numeric_identity_fills_error_robot(self):
+        self.assertEqual(row_for()["error_robot"], 3490)
+
+    def test_textual_identity_keeps_the_number_column_null(self):
+        data = result()
+        data["answers"]["device_number"] = "Shelf-3938-3002-20"
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(data, "GLP-C")
+
+        self.assertIsNone(row["error_robot"])
+        self.assertIn("Shelf-3938-3002-20", row["issue_description"])
+
+    def test_module_is_preserved_in_second_column_and_details(self):
+        row = row_for(resolved=None)
+
+        self.assertEqual(row["second_column"], "Lifting")
+        self.assertIn("Module: Lifting", row["issue_description"])
+
+    def test_missing_module_falls_back_to_device_type(self):
+        data = result()
+        data["answers"].pop("module")
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(data, "GLP-C")
+
+        self.assertEqual(row["second_column"], "A42T C2")
+        self.assertNotIn("Module:", row["issue_description"])
+
+    def test_serial_timestamps_and_no_end_time(self):
+        row = row_for(resolved=None)
+
+        self.assertIsNone(row["error_end_time"])
+        self.assertEqual(row["solving_time"], 0)
+        self.assertTrue(row["error_start_time"])
+
+    def test_warehouse_column_matches_the_argument(self):
+        for warehouse in ("GLP-C", "SMALL-P3"):
+            with self.subTest(warehouse=warehouse):
+                self.assertEqual(row_for(warehouse=warehouse)["warehouse"], warehouse)
+
+    def test_legacy_issue_warehouse_constant_is_unchanged(self):
+        """Kept for parity with existing rows; changing it is a separate call."""
+        self.assertEqual(row_for()["issue_warehouse"], "C2")
+
+    def test_employee_prefers_the_linked_name(self):
+        self.assertEqual(row_for()["employee"], "Smoke User")
+
+    def test_employee_falls_back_to_username_then_id(self):
+        without_employee = row_for(employee="")
+        self.assertEqual(without_employee["employee"], "smoke-user")
+
+        without_both = row_for(employee="", username="")
+        self.assertEqual(without_both["employee"], "Telegram 12345")
+
+    def test_missing_answers_do_not_raise(self):
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row({"warehouse": "GLP-C", "user_id": 1}, "GLP-C")
+
+        self.assertEqual(row["device_type"], "")
+        self.assertIsNone(row["error_robot"])
+
+
+class UniqKeyChecks(unittest.TestCase):
+    """The unique index must not merge two genuinely different reports."""
+
+    def test_key_uses_telegram_coordinates(self):
+        """One message is exactly one report, and the pair survives redelivery."""
+        self.assertEqual(row_for()["uniq_key"], "telegram-photo-bot:-100123:777")
+
+    def test_key_is_stable_for_the_same_input(self):
+        """Idempotency depends on this being deterministic."""
+        self.assertEqual(row_for()["uniq_key"], row_for()["uniq_key"])
+
+    def test_redelivered_update_keeps_one_key(self):
+        self.assertEqual(
+            row_for(message_id=777)["uniq_key"],
+            row_for(message_id=777)["uniq_key"],
+        )
+
+    def test_different_messages_get_different_keys(self):
+        self.assertNotEqual(
+            row_for(message_id=777)["uniq_key"],
+            row_for(message_id=778)["uniq_key"],
+        )
+
+    def test_two_reports_without_a_photo_do_not_collide(self):
+        """
+        Regression: the key fell back to the device number, so two faults on the
+        same robot by the same sender collapsed into one row and the second was
+        dropped by the unique index as a duplicate.
+        """
+        first = row_for(image="", message_id=1)
+        second = row_for(image="", message_id=2)
+
+        self.assertNotEqual(first["uniq_key"], second["uniq_key"])
+
+    def test_key_differs_per_chat(self):
+        self.assertNotEqual(
+            row_for(chat_id=-100)["uniq_key"],
+            row_for(chat_id=-200)["uniq_key"],
+        )
+
+    def test_key_falls_back_to_sender_and_photo(self):
+        """Without Telegram coordinates the older shape is still usable."""
+        row = row_for(chat_id=None, message_id=None)
+        self.assertEqual(row["uniq_key"], "telegram-photo-bot:12345:photo-1.jpg")
+
+    def test_key_uses_report_id_when_the_photo_path_is_blank(self):
+        """A blank photo path falls back to the device number."""
+        row = row_for(chat_id=None, message_id=None, image="   ")
+        self.assertEqual(row["uniq_key"], "telegram-photo-bot:12345:3490")
+
+    def test_key_shape_cannot_collide_with_the_legacy_format(self):
+        """Legacy keys look like `<user>.<robot>.<timestamp>`."""
+        key = row_for()["uniq_key"]
+        self.assertTrue(key.startswith("telegram-photo-bot:"))
+        self.assertNotRegex(key.split(":", 2)[2], r"^\d{4}-\d{2}-\d{2}T")
+
+
+class ShiftTimestampChecks(unittest.TestCase):
+    """Shift assignment is decided in Europe/Warsaw, from the report time."""
+
+    def shift_of(self, **overrides):
+        return row_for(resolved=None, **overrides)
+
+    def test_day_shift_starts_at_0600_warsaw(self):
+        # 04:00 UTC == 06:00 Warsaw (summer).
+        row = self.shift_of(received_at="2026-10-02T04:00:00+00:00")
+        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "day"))
+
+    def test_just_before_0600_is_night_of_the_previous_day(self):
+        row = self.shift_of(received_at="2026-10-02T03:59:00+00:00")
+        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-01", "night"))
+
+    def test_night_shift_starts_at_1800_warsaw(self):
+        row = self.shift_of(received_at="2026-10-02T16:00:00+00:00")
+        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "night"))
+
+    def test_just_before_1800_is_still_day(self):
+        row = self.shift_of(received_at="2026-10-02T15:59:00+00:00")
+        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "day"))
+
+    def test_after_midnight_utc_belongs_to_the_previous_shift_date(self):
+        # 00:30 UTC on the 2nd == 02:30 Warsaw on the 2nd, night of the 1st.
+        row = self.shift_of(received_at="2026-10-02T00:30:00+00:00")
+        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-01", "night"))
+
+    def test_z_suffix_is_parsed(self):
+        row = self.shift_of(received_at="2026-10-02T04:00:00Z")
+        self.assertEqual(row["shift_type"], "day")
+
+    def test_result_timestamp_is_preserved_exactly(self):
+        row = self.shift_of(received_at="2026-10-02T04:00:00+00:00")
+        self.assertEqual(
+            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
+        )
+
+    def test_naive_timestamp_is_read_as_host_local_time(self):
+        """
+        `flow` stamps `created_at` with `time.strftime`, which is host-local.
+
+        Reading that as UTC would move the shift on a non-UTC host, so it is
+        interpreted as local time instead.
+        """
+        naive = "2026-10-02T08:00:00"
+        expected = datetime.fromisoformat(naive).astimezone()
+
+        row = self.shift_of(created_at=naive)
+        self.assertEqual(
+            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            expected.astimezone(timezone.utc),
+        )
+
+    def test_created_at_is_used_when_received_at_is_absent(self):
+        """
+        Regression: `flow` writes `created_at`, the writer used to read only
+        `received_at`, and the report time silently became 'server now'.
+        """
+        row = self.shift_of(created_at="2026-10-02T04:00:00+00:00")
+        self.assertEqual(
+            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
+        )
+
+    def test_received_at_wins_over_created_at(self):
+        row = self.shift_of(
+            received_at="2026-10-02T04:00:00+00:00",
+            created_at="2020-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(row["issue_data"], "2026-10-02")
+
+    def test_unparseable_timestamp_falls_back_to_now(self):
+        before = datetime.now(timezone.utc) - timedelta(seconds=5)
+        row = self.shift_of(received_at="not-a-timestamp")
+        after = datetime.now(timezone.utc) + timedelta(seconds=5)
+
+        stamp = datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc)
+        self.assertLessEqual(before, stamp)
+        self.assertLessEqual(stamp, after)
+
+    def test_aware_datetime_object_is_accepted(self):
+        row = self.shift_of(
+            received_at=datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc)
+        )
+        self.assertEqual(row["shift_type"], "day")
+
+    def test_shift_boundary_uses_warsaw_not_utc(self):
+        """A UTC-only implementation would call 17:00 UTC 'night' wrongly."""
+        # 16:30 UTC == 18:30 Warsaw (summer) -> night. 15:30 UTC == 17:30 -> day.
+        self.assertEqual(
+            self.shift_of(received_at="2026-07-01T16:30:00+00:00")["shift_type"], "night"
+        )
+        self.assertEqual(
+            self.shift_of(received_at="2026-07-01T15:30:00+00:00")["shift_type"], "day"
+        )
+
+
+class CategoryChecks(unittest.TestCase):
+    def test_operator_labels_map_to_canonical_categories(self):
+        cases = {
+            "Robot": "robot",
+            "Workstation": "workstation",
+            "Charging station": "charging",
+            "Charger": "charging",
+            "QR Code": "qr",
+            "QR": "qr",
+        }
+
+        for label, expected in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(rw.intake_category(label), expected)
+
+    def test_category_matching_is_case_insensitive(self):
+        self.assertEqual(rw.intake_category("  robot "), "robot")
+        self.assertEqual(rw.intake_category("CHARGING STATION"), "charging")
+
+    def test_unknown_category_passes_through(self):
+        self.assertEqual(rw.intake_category("Conveyor"), "conveyor")
+
+    def test_category_reaches_first_and_second_column(self):
+        for label, expected in (("Robot", "robot"), ("QR Code", "qr")):
+            with self.subTest(label=label):
+                data = result()
+                data["answers"]["object"] = label
+                with mock.patch.object(rw, "canonical_type", return_value=None):
+                    row = rw.build_row(data, "GLP-C")
+                self.assertEqual(row["first_column"], expected)
+                self.assertEqual(row["issue_type"], expected)
+
+
+class SessionHygieneChecks(unittest.TestCase):
+    """
+    Abandoned intake sessions must not accumulate in memory.
+
+    Sessions live in a process-local dict. `get_session` only evicts the key it
+    is asked about, so without a periodic sweep every abandoned report stayed
+    until the next restart — the bot handles months of uptime.
+    """
+
+    def setUp(self):
+        from equipment_intake import flow
+
+        self.flow = flow
+        flow.reset_state()
+
+    def tearDown(self):
+        self.flow.reset_state()
+
+    def _seed(self, count=5):
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        for uid in range(count):
+            self.flow.put_session(-100, uid, Session(tree=DEFAULT_TREE))
+
+    def test_sweep_removes_expired_sessions(self):
+        import time
+
+        self._seed(5)
+
+        with self.flow._LOCK:
+            for entry in self.flow._SESSIONS.values():
+                entry["expires"] = time.time() - 1
+
+        self.assertEqual(self.flow.sweep_sessions(), 5)
+        self.assertEqual(len(self.flow._SESSIONS), 0)
+
+    def test_sweep_keeps_live_sessions(self):
+        self._seed(3)
+
+        self.assertEqual(self.flow.sweep_sessions(), 0)
+        self.assertEqual(len(self.flow._SESSIONS), 3)
+
+    def test_janitor_wires_the_sweep(self):
+        """
+        Regression: `sweep_sessions` existed but nothing called it, so the dict
+        grew for the whole process lifetime.
+        """
+        import threading
+        import time
+
+        import telegram_bot
+
+        self._seed(2)
+
+        with self.flow._LOCK:
+            for entry in self.flow._SESSIONS.values():
+                entry["expires"] = time.time() - 1
+
+        original_sleep = time.sleep
+        time.sleep = lambda _seconds: (_ for _ in ()).throw(SystemExit)
+
+        try:
+            with self.assertRaises(SystemExit):
+                telegram_bot.images_janitor_loop(interval_seconds=1)
+        finally:
+            time.sleep = original_sleep
+
+        self.assertEqual(len(self.flow._SESSIONS), 0)
+
+    def test_janitor_sweeps_custom_text_waits(self):
+        """
+        Regression: `sweep_custom_texts` was defined but never called.
+
+        A report abandoned at the "describe it yourself" step left its entry in
+        `_pending_custom_text` for the whole process lifetime.
+        """
+        import time
+
+        import telegram_bot
+
+        with telegram_bot._choice_lock:
+            telegram_bot._pending_custom_text[(-100, 1)] = {
+                "x": 1, "expires": time.time() - 1,
+            }
+
+        original_sleep = time.sleep
+        time.sleep = lambda _seconds: (_ for _ in ()).throw(SystemExit)
+
+        try:
+            with self.assertRaises(SystemExit):
+                telegram_bot.images_janitor_loop(interval_seconds=1)
+        finally:
+            time.sleep = original_sleep
+            with telegram_bot._choice_lock:
+                telegram_bot._pending_custom_text.pop((-100, 1), None)
+
+        self.assertEqual(len(telegram_bot._pending_custom_text), 0)
+
+
+class TopicDiagnosticsChecks(unittest.TestCase):
+    """
+    Misconfiguration must be reported, not discovered as silent data loss.
+
+    A topic configured by *name* does not resolve until the bot sees the forum
+    service message that announces it. Until then every error photo is refused,
+    which looks like the bot ignoring the group.
+    """
+
+    def setUp(self):
+        import telegram_bot
+
+        self.bot = telegram_bot
+        self.saved = (dict(telegram_bot.TOPIC_RAW),
+                      telegram_bot.TELEGRAM_TOPIC_ID,
+                      telegram_bot.TELEGRAM_TOPIC_NAME,
+                      dict(telegram_bot._topic_names))
+        telegram_bot.TOPIC_RAW.clear()
+
+    def tearDown(self):
+        topics, topic_id, topic_name, names = self.saved
+        self.bot.TOPIC_RAW.clear()
+        self.bot.TOPIC_RAW.update(topics)
+        self.bot.TELEGRAM_TOPIC_ID = topic_id
+        self.bot.TELEGRAM_TOPIC_NAME = topic_name
+        self.bot._topic_names.clear()
+        self.bot._topic_names.update(names)
+
+    def problems(self, **config):
+        import telegram_bot
+
+        for key, value in config.items():
+            if key == "topic_id":
+                telegram_bot.TELEGRAM_TOPIC_ID = value
+            elif key == "topic_name":
+                telegram_bot.TELEGRAM_TOPIC_NAME = value
+            else:
+                telegram_bot.TOPIC_RAW[key] = value
+
+        return telegram_bot.topic_configuration_problems(-100)
+
+    def test_two_warehouses_sharing_a_topic_is_reported(self):
+        problems = self.problems(**{"error:GLP-C": "2", "error:SMALL-P3": "2"})
+
+        self.assertTrue(problems)
+        self.assertIn("совпадают", " ".join(problems))
+
+    def test_error_topic_colliding_with_a_shared_topic_is_reported(self):
+        """
+        The default warehouse's error topic comes from TELEGRAM_TOPIC_ID, so a
+        collision with a shared topic is expressed through that variable.
+        """
+        problems = self.problems(topic_id=319, **{"status": "319"})
+
+        self.assertTrue(problems)
+        self.assertIn("служебным", " ".join(problems))
+
+    def test_unlearned_topic_name_is_reported(self):
+        problems = self.problems(topic_id=None, topic_name="Ex GLPC")
+
+        self.assertTrue(problems)
+        self.assertIn("не выучено", " ".join(problems))
+
+    def test_per_warehouse_unlearned_name_is_reported(self):
+        problems = self.problems(**{"error": "2", "error:SMALL-P3": "Ex SP3"})
+
+        self.assertTrue(problems)
+        self.assertIn("SMALL-P3", " ".join(problems))
+
+    def test_learned_topic_name_is_not_reported(self):
+        self.bot.remember_topic(-100, 42, "Ex GLPC")
+
+        problems = self.problems(topic_id=None, topic_name="Ex GLPC")
+
+        self.assertEqual(problems, [])
+
+    def test_numeric_ids_produce_no_warnings(self):
+        """The production shape: ids for both warehouses and shared topics."""
+        problems = self.problems(**{
+            "error": "2", "error:SMALL-P3": "318",
+            "status": "319", "stats": "320", "service": "321",
+        })
+
+        self.assertEqual(problems, [])
+
+
+class DispatchGuardChecks(unittest.TestCase):
+    """Photos must only be accepted where the warehouse is knowable."""
+
+    def setUp(self):
+        import telegram_bot
+
+        self.bot = telegram_bot
+        self.original_topics = dict(telegram_bot.TOPIC_RAW)
+        self.original_hints = set(telegram_bot._hinted_threads)
+        self.allowed_chat = (
+            next(iter(telegram_bot.ALLOWED_CHAT_IDS))
+            if telegram_bot.ALLOWED_CHAT_IDS
+            else -100123
+        )
+
+    def tearDown(self):
+        self.bot.TOPIC_RAW.clear()
+        self.bot.TOPIC_RAW.update(self.original_topics)
+        self.bot._hinted_threads.clear()
+        self.bot._hinted_threads.update(self.original_hints)
+
+    def set_topics(self, **topics):
+        self.bot.TOPIC_RAW.clear()
+        self.bot.TOPIC_RAW.update(topics)
+
+    def dispatch_photo(self, thread_id):
+        self.bot._hinted_threads.clear()
+        update = {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": 1_800_000_000,
+                "chat": {"id": self.allowed_chat, "type": "supergroup"},
+                "from": {"id": 5, "username": "u"},
+                "photo": [{"file_id": "f", "file_unique_id": "u"}],
+            },
+        }
+        if thread_id is not None:
+            update["message"]["message_thread_id"] = thread_id
+
+        with mock.patch.object(self.bot, "handle_photo") as photo, \
+             mock.patch.object(self.bot, "_handle_wrong_topic") as wrong:
+            self.bot._handle_update_inner(update)
+
+        return photo, wrong
+
+    def test_error_topic_is_accepted_and_mapped(self):
+        self.set_topics(error="2", **{"error:SMALL-P3": "318"})
+
+        photo, _ = self.dispatch_photo(318)
+        photo.assert_called_once()
+
+    def test_status_topic_photo_is_rejected(self):
+        self.set_topics(error="2", **{"error:SMALL-P3": "318", "status": "319"})
+
+        photo, wrong = self.dispatch_photo(319)
+        photo.assert_not_called()
+        wrong.assert_called_once()
+
+    def test_stats_topic_photo_is_rejected(self):
+        self.set_topics(error="2", **{"error:SMALL-P3": "318", "stats": "320"})
+
+        photo, _ = self.dispatch_photo(320)
+        photo.assert_not_called()
+
+    def test_unknown_topic_photo_is_rejected(self):
+        self.set_topics(error="2", **{"error:SMALL-P3": "318"})
+
+        photo, _ = self.dispatch_photo(9999)
+        photo.assert_not_called()
+
+    def test_private_chat_photo_is_rejected_when_routing_is_configured(self):
+        self.set_topics(error="2")
+
+        photo, _ = self.dispatch_photo(None)
+        photo.assert_not_called()
+
+    def test_legacy_mode_still_accepts_photos(self):
+        """
+        With nothing configured the bot cannot know better, so it keeps working.
+
+        A topic id is used because a message without `message_thread_id` counts
+        as a general-topic message and is rejected by the pre-existing filter,
+        before any warehouse logic runs.
+        """
+        self.set_topics()
+
+        photo, _ = self.dispatch_photo(2)
+        photo.assert_called_once()
+
+    def test_glpc_and_sp3_map_to_different_warehouses(self):
+        chat = self.allowed_chat
+        self.set_topics(error="2", **{"error:SMALL-P3": "318"})
+
+        self.assertEqual(self.bot.error_warehouse_for_thread(chat, 2), "GLP-C")
+        self.assertEqual(self.bot.error_warehouse_for_thread(chat, 318), "SMALL-P3")
+
+    def test_dispatch_never_files_a_status_topic_photo_as_glpc(self):
+        """
+        The regression this guard exists for: a photo in a shared topic used to
+        reach the flow, and `current_warehouse()` then reported GLP-C.
+        """
+        self.set_topics(error="2", **{"error:SMALL-P3": "318", "status": "319"})
+
+        with mock.patch.object(self.bot, "handle_photo") as photo, \
+             mock.patch.object(self.bot, "current_warehouse", return_value="GLP-C"), \
+             mock.patch.object(self.bot, "_handle_wrong_topic"):
+            self.bot._handle_update_inner({
+                "update_id": 1,
+                "message": {
+                    "message_id": 11,
+                    "date": 1_800_000_000,
+                    "chat": {"id": self.allowed_chat, "type": "supergroup"},
+                    "from": {"id": 5, "username": "u"},
+                    "message_thread_id": 319,
+                    "photo": [{"file_id": "f", "file_unique_id": "u"}],
+                },
+            })
+
+        photo.assert_not_called()
+
+
+class LarkCardChecks(unittest.TestCase):
+    """The card must carry the same identity the journal stores."""
+
+    def fields(self, **answers_over):
+        from equipment_intake import integrations
+
+        answers = {"object": "Robot", "device_type": "K50H",
+                   "device_number": "3490", "description": "broken"}
+        answers.update(answers_over)
+
+        card = integrations._card(
+            {"answers": answers, "warehouse": "GLP-C", "employee": "Ivan"},
+            None, True, False,
+        )
+
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+        return rows
+
+    def test_plain_robot_keeps_the_device_number_label(self):
+        rows = self.fields()
+
+        self.assertEqual(rows["Device number"], "3490")
+        self.assertNotIn("QR code", " ".join(rows))
+
+    def test_qr_floor_card_carries_the_coordinates(self):
+        """
+        Regression: the card showed "Device number: —" and the X/Y/zone values
+        never reached the Lark group, although the journal stored them.
+        """
+        rows = self.fields(object="QR Code", device_type="Floor",
+                           device_number="", qr_x="162", qr_y="382", qr_zone="30")
+
+        self.assertIn("QR code X / Y / zone", rows)
+        self.assertEqual(rows["QR code X / Y / zone"], "X=162; Y=382; Zone=30")
+        self.assertNotIn("—", rows["QR code X / Y / zone"])
+
+    def test_qr_shelf_card_names_the_shelf_number(self):
+        rows = self.fields(object="QR Code", device_type="Shelf",
+                           device_number="", shelf_number="A-12")
+
+        self.assertIn("Shelf number (not its QR code)", rows)
+        self.assertEqual(rows["Shelf number (not its QR code)"], "A-12")
+
+    def test_shelf_number_wins_over_device_number_on_the_card(self):
+        rows = self.fields(object="QR Code", device_type="Shelf",
+                           device_number="999", shelf_number="A-12")
+
+        self.assertEqual(rows["Shelf number (not its QR code)"], "A-12")
+
+    def test_module_is_only_shown_when_present(self):
+        self.assertIn("Module", self.fields(module="Lifting"))
+        self.assertNotIn("Module", self.fields())
+
+    def test_missing_identity_shows_a_dash(self):
+        rows = self.fields(device_number="")
+
+        self.assertEqual(rows["Device number"], "—")
+
+    def test_supabase_field_reflects_the_save_result(self):
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {"answers": {"object": "Robot", "device_number": "1"}, "warehouse": "GLP-C"},
+            None, False, False,
+        )
+        text = json.dumps(card, ensure_ascii=False)
+
+        self.assertIn("Save failed", text)
+
+    def test_card_reports_the_shift_journal_separately(self):
+        """
+        Regression: the card claimed "Supabase: Saved" even when the shift
+        journal (`exceptions_glpc`) failed. Shift reports and /top read that
+        journal, so the group was told a fault was recorded when it was not.
+        """
+        rows = self.fields_glpc(db_saved=True, glpc_saved=False)
+
+        self.assertEqual(rows["Intake details"], "Saved")
+        self.assertEqual(rows["Shift journal"], "Save failed")
+
+    def test_card_shows_both_stores_when_both_succeed(self):
+        rows = self.fields_glpc(db_saved=True, glpc_saved=True)
+
+        self.assertEqual(rows["Intake details"], "Saved")
+        self.assertEqual(rows["Shift journal"], "Saved")
+
+    def test_card_omits_the_journal_field_when_the_caller_does_not_know(self):
+        """Legacy callers that pass no journal outcome still get a valid card."""
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {"answers": {"object": "Robot", "device_number": "1"}, "warehouse": "GLP-C"},
+            None, True, False,
+        )
+        text = json.dumps(card, ensure_ascii=False)
+
+        self.assertNotIn("Shift journal", text)
+
+    def fields_glpc(self, db_saved, glpc_saved):
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {"answers": {"object": "Robot", "device_number": "1"}, "warehouse": "GLP-C"},
+            None, db_saved, False, glpc_saved,
+        )
+
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+        return rows
+
+
+class IntegrationOutcomeChecks(unittest.TestCase):
+    """The three destinations stay independent, including a warehouse refusal."""
+
+    def persist(self, warehouse="GLP-C", save=None, send=None, write=None):
+        from equipment_intake import integrations
+
+        default_write = lambda *a, **k: True  # noqa: E731
+
+        with mock.patch.object(integrations, "_save", side_effect=save or (lambda *a: (True, False, None))), \
+             mock.patch.object(integrations, "_send", side_effect=send or (lambda *a: True)), \
+             mock.patch.object(rw, "write_exception", side_effect=write or default_write):
+            return integrations.persist_and_send(result(warehouse), "/tmp/photo-1.jpg")
+
+    def test_all_three_succeed(self):
+        outcome = self.persist()
+
+        self.assertTrue(outcome["database_saved"])
+        self.assertTrue(outcome["glpc_saved"])
+        self.assertTrue(outcome["lark_delivered"])
+        self.assertIsNone(outcome["glpc_error"])
+
+    def test_invalid_warehouse_refuses_every_destination(self):
+        """
+        An unknown warehouse is a precondition, not an independent failure.
+
+        Filing a detail row with `warehouse=""` and posting the card to the
+        default GLP-C group would announce a fault in the wrong chat, so nothing
+        is written and nothing is sent.
+        """
+        outcome = self.persist(warehouse="PNT-A")
+
+        self.assertFalse(outcome["glpc_saved"])
+        self.assertFalse(outcome["database_saved"])
+        self.assertFalse(outcome["lark_delivered"])
+        self.assertIn("PNT-A", outcome["glpc_error"])
+
+    def test_missing_warehouse_refuses_before_any_write(self):
+        from equipment_intake import integrations
+
+        with mock.patch.object(integrations, "_save") as save, \
+             mock.patch.object(integrations, "_send") as send:
+            outcome = integrations.persist_and_send(result(warehouse=""), "/tmp/p.jpg")
+
+        save.assert_not_called()
+        send.assert_not_called()
+        self.assertFalse(outcome["glpc_saved"])
+        self.assertIsNotNone(outcome["glpc_error"])
+
+    def test_journal_failure_does_not_block_the_others(self):
+        """A genuine write error is independent, unlike a warehouse refusal."""
+        outcome = self.persist(write=lambda *a, **k: False)
+
+        self.assertFalse(outcome["glpc_saved"])
+        self.assertIsNone(outcome["glpc_error"])
+        self.assertTrue(outcome["database_saved"])
+        self.assertTrue(outcome["lark_delivered"])
+
+    def test_detail_save_failure_does_not_block_the_journal(self):
+        outcome = self.persist(save=mock.Mock(side_effect=RuntimeError("db down")))
+
+        self.assertFalse(outcome["database_saved"])
+        self.assertTrue(outcome["glpc_saved"])
+        self.assertTrue(outcome["lark_delivered"])
+
+    def test_lark_failure_does_not_block_the_journal(self):
+        outcome = self.persist(send=mock.Mock(side_effect=RuntimeError("hook down")))
+
+        self.assertTrue(outcome["glpc_saved"])
+        self.assertFalse(outcome["lark_delivered"])
+
+    def test_journal_is_written_once_per_report(self):
+        from equipment_intake import integrations
+
+        with mock.patch.object(integrations, "_save", return_value=(True, False, None)), \
+             mock.patch.object(integrations, "_send", return_value=True), \
+             mock.patch.object(rw, "write_exception", return_value=True) as write:
+            integrations.persist_and_send(result(), "/tmp/photo-1.jpg")
+
+        write.assert_called_once()
+
+    def test_warehouse_reaches_the_writer_unchanged(self):
+        from equipment_intake import integrations
+
+        seen = []
+
+        with mock.patch.object(integrations, "_save", return_value=(True, False, None)), \
+             mock.patch.object(integrations, "_send", return_value=True), \
+             mock.patch.object(rw, "write_exception",
+                               side_effect=lambda res, wh=None: seen.append(wh) or True):
+            integrations.persist_and_send(result("GLP-C"), "/tmp/p.jpg")
+            integrations.persist_and_send(result("SMALL-P3"), "/tmp/p.jpg")
+
+        self.assertEqual(seen, ["GLP-C", "SMALL-P3"])
+
+    def test_unexpected_writer_error_is_swallowed(self):
+        """A writer crash must not take down the intake."""
+        outcome = self.persist(write=mock.Mock(side_effect=ValueError("boom")))
+
+        self.assertFalse(outcome["glpc_saved"])
+        self.assertIsNone(outcome["glpc_error"])
+        self.assertTrue(outcome["lark_delivered"])
+
+
+class ConfirmationTextChecks(unittest.TestCase):
+    """The operator is told exactly what happened to the journal entry."""
+
+    @classmethod
+    def setUpClass(cls):
+        """
+        Stub the employee lookup once, not per test.
+
+        `mock.patch.dict(sys.modules, ...)` inside a `with` block leaves the
+        patch machinery in a state where the *next* `mock.patch` in the same
+        process does not take effect — the second call here silently reached the
+        real integrations module. Installing the stub once avoids that entirely.
+        """
+        cls._saved_telegram_store = sys.modules.get("telegram_store")
+        sys.modules["telegram_store"] = types.SimpleNamespace(
+            get_employee_name=lambda _: "U"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._saved_telegram_store is not None:
+            sys.modules["telegram_store"] = cls._saved_telegram_store
+        else:
+            sys.modules.pop("telegram_store", None)
+
+    def confirm(self, delivery, warehouse="GLP-C"):
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        session.data.update(
+            {"warehouse": warehouse, "image": "/tmp/p.jpg", "message_id": 5}
+        )
+        captions = []
+        sender = {"id": 1, "username": "u"}
+        delivery_mock = mock.Mock(return_value=delivery)
+
+        with mock.patch.object(flow, "edit_caption",
+                               side_effect=lambda *a, **k: captions.append(a[2])), \
+             mock.patch("equipment_intake.integrations.persist_and_send", delivery_mock):
+            flow._confirm(-100, sender, session, 5)
+
+        return captions[0] if captions else ""
+
+    def test_success_is_reported(self):
+        text = self.confirm({
+            "database_saved": True, "device_queued": False,
+            "lark_delivered": True, "glpc_saved": True, "glpc_error": None,
+        })
+
+        self.assertIn("Journal entry saved", text)
+        self.assertIn("Lark card sent", text)
+
+    def test_warehouse_refusal_is_reported_with_reason(self):
+        text = self.confirm({
+            "database_saved": False, "device_queued": False,
+            "lark_delivered": False, "glpc_saved": False,
+            "glpc_error": "Warehouse is not set for this report.",
+        })
+
+        self.assertIn("Not filed in the journal", text)
+        self.assertIn("Warehouse is not set", text)
+
+    def test_journal_failure_without_a_reason_is_reported(self):
+        text = self.confirm({
+            "database_saved": False, "device_queued": False,
+            "lark_delivered": False, "glpc_saved": False, "glpc_error": None,
+        })
+
+        self.assertIn("Journal entry not saved", text)
+
+    def test_queued_device_is_mentioned(self):
+        text = self.confirm({
+            "database_saved": True, "device_queued": True,
+            "lark_delivered": True, "glpc_saved": True, "glpc_error": None,
+        })
+
+        self.assertIn("add queue", text)
+
+    def test_missing_keys_do_not_raise(self):
+        text = self.confirm({})
+
+        self.assertIn("Journal entry not saved", text)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

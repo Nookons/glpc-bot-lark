@@ -645,3 +645,26 @@ python3 tests/test_telegram_offline.py
 Старая Lark-версия входа (`webhookApp.py`, `getUserName.py`,
 `donwloadImage.py`) удалена — при необходимости её можно достать из истории
 git.
+
+## Пошаговый приём ошибок оборудования
+
+В monitored warehouse topics фотография запускает production-анкету: тип
+оборудования и модель, модуль для робота/рабочей станции, уникальный номер,
+описание ошибки и подтверждение. Зарядные станции проходят без шага модуля.
+Встроенные варианты модулей: robot — Lifting, Rotation, Tray, Chassis;
+workstation — Offline, Wrong task.
+
+Любой сотрудник может вызвать `/tree` и добавить вариант в меню. Варианты
+сохраняются общими для всех реплик в Supabase. Новые отчёты записываются в
+`telegram_equipment_reports`; устройства, отсутствующие в каноническом реестре,
+добавляются в `telegram_devices_to_add` на проверку. Ошибка записи в Supabase
+не отменяет попытку отправить карточку в складской Lark webhook.
+
+Перед релизом этого кода примените аддитивную миграцию
+`sql/equipment_intake.sql` к production Supabase. Она создаёт таблицы отчётов,
+очереди и пользовательских вариантов меню; код бота миграцию автоматически не
+выполняет.
+
+### Проверка доставки Lark
+
+Внешние проверки изолированы в отдельной папке `../LarkBot-Test`. Тестовые Telegram и Supabase credentials хранятся там в `.env.testbot`, а Lark webhook — в `.env.test`; эти файлы исключены из Git. Все тестовые карточки направляются только на `TEST_LARK_HOOK_URL`. Инструкции и fail-closed запускатель: `../LarkBot-Test/README_TEST_SETUP.md` и `../LarkBot-Test/run_test_bot.py`. Не запускайте тестовый бот без отдельного TEST Supabase проекта.
