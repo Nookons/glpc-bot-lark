@@ -25,6 +25,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Окружение стенда обязано применяться к модулям бота, даже если они уже
+# импортированы другим набором (discover импортирует все модули заранее).
+# Подробности и обоснование — в tests/bot_config_isolation.py.
+from bot_config_isolation import BotEnvIsolation  # noqa: E402
 
 
 def _load(name: str, path: Path):
@@ -102,6 +108,21 @@ def _request(method, path, payload=None, headers=None):
         return error.code, parsed
 
 
+def _start_isolation():
+    """
+    Ставит окружение стенда и перечитывает им конфигурацию модулей бота.
+
+    Вызывается из `setUpClass` каждого класса: `discover` импортирует модули
+    бота заранее (и `test_equipment_intake_production` делает это с боевым
+    `.env`), поэтому одного `os.environ.update` недостаточно — надо ещё
+    перезагрузить модули (см. `tests/bot_config_isolation.py`).
+    """
+    isolation = BotEnvIsolation(TEST_ENV)
+    isolation.start()
+
+    return isolation
+
+
 class HarnessTestCase(unittest.TestCase):
     """Один стенд на весь класс: поднимается в setUpClass, гасится в конце."""
 
@@ -116,20 +137,17 @@ class HarnessTestCase(unittest.TestCase):
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
-        # Окружение ставится до импорта бота: модули читают конфиг на импорте.
-        cls.saved_env = {name: os.environ.get(name) for name in TEST_ENV}
-        os.environ.update(TEST_ENV)
+        # Окружение стенда применяется к уже импортированным модулям бота.
+        cls.isolation = _start_isolation()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
 
-        for name, value in cls.saved_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        # Возвращаем окружение и конфигурацию модулей как было: следующий
+        # набор должен увидеть то же, что и до нас (независимость от порядка).
+        cls.isolation.stop()
 
     def setUp(self):
         _request("POST", "/__fault", {"action": "fault_off"})
@@ -407,8 +425,8 @@ class BotFlowTestCase(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", PORT), handler)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
 
-        cls.saved_env = {name: os.environ.get(name) for name in TEST_ENV}
-        os.environ.update(TEST_ENV)
+        # Окружение стенда применяется к уже импортированным модулям бота.
+        cls.isolation = _start_isolation()
 
         import telegram_api as tg
         import telegram_bot as bot
@@ -441,11 +459,9 @@ class BotFlowTestCase(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-        for name, value in cls.saved_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        # Возвращаем окружение и конфигурацию модулей как было: следующий
+        # набор должен увидеть то же, что и до нас (независимость от порядка).
+        cls.isolation.stop()
 
     def setUp(self):
         self.server.RequestHandlerClass.store.reset_logs()

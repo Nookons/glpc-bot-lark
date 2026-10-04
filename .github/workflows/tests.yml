@@ -1,0 +1,52 @@
+name: tests
+
+# 800+ офлайн-проверок бота: полный прогон на каждый push и pull request.
+#
+# Сеть к Telegram, Supabase и Lark здесь не нужна и не используется:
+# наборы подменяют внешние вызовы заглушками, а `test_live_test_harness`
+# поднимает локальный стенд на 127.0.0.1:8877 (PostgREST + Storage + Lark
+# в памяти). Секреты в CI не передаются — их отсутствие проверено.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: offline suites (Python 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # unittest-наборы: 5 файлов, 214 проверок.
+      # Порядок специально алфавитный (как у `discover` по умолчанию) —
+      # он исторически и ломал изоляцию конфигурации, поэтому пусть будет
+      # зафиксирован явно. Дополнительно прогоняем сам discover: именно так
+      # наборы и запускаются вместе.
+      - name: unittest-наборы (discover)
+        working-directory: tests
+        run: python -m unittest discover -p "test_*.py" -v
+
+      # `test_telegram_offline` — скрипт, а не unittest: печатает итог
+      # «ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ» и возвращает 0/1. Отдельный шаг, потому что
+      # `discover` его не собирает (внутри нет `unittest.TestCase`).
+      - name: Офлайн-набор бота (скрипт, 631 проверка)
+        run: python tests/test_telegram_offline.py

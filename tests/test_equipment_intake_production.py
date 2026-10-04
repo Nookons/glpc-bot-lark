@@ -106,10 +106,19 @@ class WarehouseRoutingChecks(unittest.TestCase):
         import telegram_bot as bot
 
         original = dict(bot.TOPIC_RAW)
+        # Топик ошибок склада по умолчанию хранится отдельной константой
+        # (`TELEGRAM_TOPIC_ID`), прочитанной из окружения при импорте. Без
+        # `.env` (например, в CI) она пуста, и `error_topic("GLP-C")` не
+        # находит топик — проверка падала бы на конфигурации оператора, а не
+        # на поведении кода. Задаём значение явно и возвращаем как было.
+        original_topic_id = bot.TELEGRAM_TOPIC_ID
+        original_topic_name = bot.TELEGRAM_TOPIC_NAME
 
         try:
             bot.TOPIC_RAW.clear()
             bot.TOPIC_RAW.update({"error": "2", "error:SMALL-P3": "77"})
+            bot.TELEGRAM_TOPIC_ID = 2
+            bot.TELEGRAM_TOPIC_NAME = ""
 
             self.assertEqual(bot.error_warehouse_for_thread(-100, 2), "GLP-C")
             self.assertEqual(bot.error_warehouse_for_thread(-100, 77), "SMALL-P3")
@@ -119,6 +128,8 @@ class WarehouseRoutingChecks(unittest.TestCase):
         finally:
             bot.TOPIC_RAW.clear()
             bot.TOPIC_RAW.update(original)
+            bot.TELEGRAM_TOPIC_ID = original_topic_id
+            bot.TELEGRAM_TOPIC_NAME = original_topic_name
 
     def test_strict_resolver_keeps_legacy_mode_when_nothing_configured(self):
         """With no error topic configured the bot has no way to know better."""

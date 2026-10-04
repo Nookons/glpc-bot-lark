@@ -901,6 +901,14 @@ class DispatchGuardChecks(unittest.TestCase):
 
         self.bot = telegram_bot
         self.original_topics = dict(telegram_bot.TOPIC_RAW)
+        # Топик ошибок склада по умолчанию живёт не в `TOPIC_RAW`, а в двух
+        # отдельных константах, прочитанных из окружения при импорте:
+        # `TELEGRAM_TOPIC_ID` и `TELEGRAM_TOPIC_NAME`. Их тоже надо сохранить и
+        # вернуть — иначе `set_topics` управляет только половиной состояния, и
+        # результат начинает зависеть от `.env` оператора и от порядка запуска
+        # наборов.
+        self.original_topic_id = telegram_bot.TELEGRAM_TOPIC_ID
+        self.original_topic_name = telegram_bot.TELEGRAM_TOPIC_NAME
         self.original_hints = set(telegram_bot._hinted_threads)
         self.allowed_chat = (
             next(iter(telegram_bot.ALLOWED_CHAT_IDS))
@@ -911,12 +919,24 @@ class DispatchGuardChecks(unittest.TestCase):
     def tearDown(self):
         self.bot.TOPIC_RAW.clear()
         self.bot.TOPIC_RAW.update(self.original_topics)
+        self.bot.TELEGRAM_TOPIC_ID = self.original_topic_id
+        self.bot.TELEGRAM_TOPIC_NAME = self.original_topic_name
         self.bot._hinted_threads.clear()
         self.bot._hinted_threads.update(self.original_hints)
 
     def set_topics(self, **topics):
         self.bot.TOPIC_RAW.clear()
         self.bot.TOPIC_RAW.update(topics)
+
+        # Приводим «топик по умолчанию» в соответствие с заданными топиками.
+        # `set_topics()` (пустой вызов) обязан означать «маршрутизация не
+        # настроена вовсе» — тогда срабатывает исторический режим без фильтра.
+        # Без сброса имени проверка `test_legacy_mode_still_accepts_photos`
+        # проходила лишь потому, что в `.env` оператора стоял
+        # `TELEGRAM_TOPIC_NAME=Exceptions` и `TELEGRAM_TOPIC_ID=2`.
+        raw_error = str(topics.get("error", "")).strip()
+        self.bot.TELEGRAM_TOPIC_ID = int(raw_error) if raw_error.isdigit() else None
+        self.bot.TELEGRAM_TOPIC_NAME = ""
 
     def dispatch_photo(self, thread_id):
         self.bot._hinted_threads.clear()
