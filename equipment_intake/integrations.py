@@ -14,6 +14,50 @@ def _category(value):
     return intake_category(value)
 
 
+def looks_like_device_number(value: str) -> bool:
+    """
+    Похоже ли значение на номер устройства, а не на свободный текст.
+
+    **Зачем.** Очередь «неизвестных устройств» (`telegram_devices_to_add`)
+    наполнялась по условию «лукап по справочнику ничего не нашёл». Для значения
+    вида `EX: 驱动组件异常 Driver component exception. 3545` лукап **всегда**
+    пуст — не потому, что устройства нет, а потому что строка не может совпасть
+    с кодом. В результате очередь заполнялась текстом: на 04.10.2026 из 93
+    заявок **71** были такими, и человек разбирал бы не «неизвестное
+    устройство», а текст, который номером не являлся.
+
+    **Почему не вытаскиваем номер из текста.** Проверял на ��анных: из 36
+    текстовых хвостов только **16** совпали с реальным оборудованием. Угаданный
+    номер связал бы ошибку не с тем устройством — это хуже, чем не поставить
+    заявку. Текст оператора при этом не теряется: он сохраняется в отчёте
+    (`telegram_equipment_reports.answers`, `report_description`) и в журнале.
+
+    **Признак текста — пробел или не-ASCII символ.** Проверено по справочнику:
+    ни один настоящий номер не содержит пробела и не выходит за ASCII —
+    `equipment_code` с пробелом или не-ASCII: **0 из 3261**; `robot_number`:
+    **0 из 3054**. У мусорных записей пробел был в 67 из 71, ещё 2 содержали
+    иероглифы (`EX: 取放箱位置错误 …`).
+
+    **Почему не «только цифры и разделители».** Первая версия проверки
+    перечисляла разрешённые символы (`0-9 / - _`) и **отсекала `H108/1834`** —
+    составной номер, который сам же проект документирует как штатный формат
+    ввода (`tree_config.py`), и `ROBOT-SMOKE-9182` из собственных тестов. Тест
+    это поймал. Поэтому запрещаем только очевидный текст, а не сужаем формат.
+    """
+    text = str(value or "")
+
+    if not text.strip():
+        return False
+
+    # Пробел внутри — это описание, а не номер («3685 tray problem»).
+    if any(character.isspace() for character in text):
+        return False
+
+    # Иероглифы, кириллица и прочий не-ASCII — свободный текст
+    # («EX: 取放箱位置错误 …»). Ни один код справочника не выходит за ASCII.
+    return text.isascii()
+
+
 def _warehouse_error(result):
     """
     Validate the warehouse once, for every destination.
@@ -58,7 +102,17 @@ def _save(result, image_path):
     # Idempotency on Telegram source coordinates.
     saved = rest_post(REPORTS, payload, ignore_conflict=True) is not None
     queued = False
-    if category in {"robot", "workstation", "charging"} and device_number:
+    # В очередь ставим только то, что МОЖЕТ быть номером устройства.
+    # Иначе туда попадал свободный текст: лукап по справочнику для него всегда
+    # пуст, и заявка создавалась даже когда устройство известно (проверено:
+    # 71 из 93 заявок на 04.10.2026 — текст, 7 из них указывали на устройства,
+    # которые в справочнике есть). Текст оператора не теряется: он остаётся в
+    # отчёте и в журнале, а очередь — вспомогательная.
+    if (
+        category in {"robot", "workstation", "charging"}
+        and device_number
+        and looks_like_device_number(device_number)
+    ):
         # Only enqueue when the canonical inventory lookup succeeded and found no match.
         # The queue is auxiliary: a failure here must not erase the fact that
         # the report row itself was written.

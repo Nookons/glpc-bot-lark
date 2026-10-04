@@ -463,5 +463,165 @@ class IntegrationChecks(unittest.TestCase):
         self.assertIn("Lark card sent", captions[0])
 
 
+class DeviceNumberShapeChecks(unittest.TestCase):
+    """В очередь «неизвестных устройств» должно попадать только то, что может
+    быть номером устройства.
+
+    Найдено по живой базе: из 93 заявок **71** содержали свободный текст
+    (`EX: 驱动组件异常 … 3545`, `3685 tray problem`). Причина: очередь
+    заполнялась по условию «лукап по справочнику пуст», а для текста он пуст
+    **всегда** — не потому, что устройства нет, а потому что строка не может
+    совпасть с кодом. Из 12 текстовых заявок, начинавшихся с числа, **7**
+    указывали на устройства, которые в справочнике **есть**.
+    """
+
+    def test_plain_numbers_pass(self):
+        """Настоящие номера обязаны проходить: все коды справочника числовые."""
+        for value in ("3490", "3747", "13", "2520"):
+            self.assertTrue(
+                integrations.looks_like_device_number(value), value
+            )
+
+    def test_composite_numbers_pass(self):
+        """Составной номер — документированный формат ввода, а не мусор.
+
+        В `tree_config.py` он приведён как пример («H108/1834»), и в журнале
+        такие записи есть. Отсекать его значило бы ломать поддержанный ввод.
+        """
+        for value in ("H108/1834", "3647/3636", "3829/3570"):
+            self.assertTrue(
+                integrations.looks_like_device_number(value), value
+            )
+
+    def test_free_text_is_refused(self):
+        """Текст описания в поле номера не должен создавать заявку.
+
+        Значения — реальные из очереди на 04.10.2026.
+        """
+        for value in (
+            "EX: 驱动组件异常 Driver component exception. 3545",
+            "EX: 取放箱位置错误 Wrong pick and place box position. 48",
+            "3685 tray problem",
+            "3683 unable to drive",
+            "3699 ,rotation",
+        ):
+            self.assertFalse(
+                integrations.looks_like_device_number(value), value
+            )
+
+    def test_ambiguous_value_is_left_to_a_human(self):
+        """Неоднозначное значение НЕ отсекаем — границу проводим по доказанному.
+
+        `3452/3707/H156` — реальная заявка из очереди. Пробела нет, все символы
+        ASCII, вид составного номера. Отличить её от настоящего составного
+        номера (`H108/1834`) по форме **нельзя**, а придумывать правило «три
+        части через слэш — это текст» значило бы гадать. Такая заявка остаётся
+        человеку: показать её в очереди дешевле, чем молча потерять настоящий
+        номер.
+        """
+        self.assertTrue(integrations.looks_like_device_number("3452/3707/H156"))
+
+    def test_documented_composite_and_ascii_codes_still_pass(self):
+        """Проверка не должна сужать задокументированные форматы.
+
+        Первая версия перечисляла разрешённые символы (`0-9 / - _`) и отсекала
+        `H108/1834` — составной номер, который сам проект приводит как штатный
+        пример ввода (`tree_config.py`), и `ROBOT-SMOKE-9182` из собственных
+        тестов. Тест это поймал.
+        """
+        for value in ("H108/1834", "ROBOT-SMOKE-9182", "Shelf-3938-3002-20"):
+            self.assertTrue(
+                integrations.looks_like_device_number(value), value
+            )
+
+    def test_empty_values_are_refused(self):
+        for value in (None, "", "   ", "\t"):
+            self.assertFalse(integrations.looks_like_device_number(value), repr(value))
+
+    def test_queue_is_not_written_for_free_text(self):
+        """Сквозная проверка: текст в номере не создаёт строку в очереди.
+
+        Проверяется именно отсутствие вызова записи в очередь, а не только
+        форма помощника: иначе можно поправить помощник и забыть подключить его.
+        """
+        posted = []
+
+        def fake_rest_post(table, payload, ignore_conflict=False):
+            posted.append(table)
+            return [{"id": 1}]
+
+        def fake_rest_get(table, params=None, optional=False):
+            if table == "equipment":
+                return []  # устройство «не найдено»
+            return []
+
+        import sendToDataBase
+
+        with patch.object(sendToDataBase, "rest_post", fake_rest_post), patch.object(
+            sendToDataBase, "rest_get", fake_rest_get
+        ):
+            integrations._save(
+                {
+                    "answers": {
+                        "object": "Robot",
+                        "device_type": "K50H",
+                        "device_number": "3685 tray problem",
+                        "description": "3685 tray problem",
+                    },
+                    "warehouse": "GLP-C",
+                    "employee": "Operator",
+                    "user_id": 1,
+                    "chat_id": -100,
+                    "message_id": 5,
+                    "path": [],
+                },
+                "",
+            )
+
+        self.assertNotIn(
+            integrations.QUEUE,
+            posted,
+            "текст в поле номера создал заявку в очереди",
+        )
+
+    def test_queue_is_written_for_a_real_unknown_number(self):
+        """А настоящий неизвестный номер заявку создаёт — смысл очереди цел."""
+        posted = []
+
+        def fake_rest_post(table, payload, ignore_conflict=False):
+            posted.append(table)
+            return [{"id": 1}]
+
+        def fake_rest_get(table, params=None, optional=False):
+            if table == "equipment":
+                return []  # устройства нет — это и есть повод для заявки
+            return []
+
+        import sendToDataBase
+
+        with patch.object(sendToDataBase, "rest_post", fake_rest_post), patch.object(
+            sendToDataBase, "rest_get", fake_rest_get
+        ):
+            integrations._save(
+                {
+                    "answers": {
+                        "object": "Robot",
+                        "device_type": "K50H",
+                        "device_number": "99999",
+                        "description": "lift failure",
+                    },
+                    "warehouse": "GLP-C",
+                    "employee": "Operator",
+                    "user_id": 1,
+                    "chat_id": -100,
+                    "message_id": 6,
+                    "path": [],
+                },
+                "",
+            )
+
+        self.assertIn(integrations.QUEUE, posted, "заявка не создана")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
