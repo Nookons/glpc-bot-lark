@@ -152,9 +152,34 @@ class Store:
         "bot_leases": ("name",),
     }
 
+    # Колонки таблиц, у которых нет ни одной строки-заготовки в `_defaults`.
+    # Нужны, чтобы отличать «колонки нет в схеме» от «колонка есть, но пуста»:
+    # настоящий PostgREST на неизвестную колонку отвечает 400 (42703), и без
+    # этого стенд был мягче реальности (см. `_unknown_columns`).
+    SCHEMA = {
+        "telegram_intake_options": (
+            "id", "node_id", "option_id", "label", "next_node", "description",
+            "icon", "only_for", "created_by", "created_at",
+        ),
+        "telegram_intake_nodes": (
+            "id", "node_id", "title", "description", "placeholder", "stub_hint",
+            "next_node", "hidden", "updated_by", "created_at", "updated_at",
+        ),
+    }
+
+    # Колонки, которые добавляет sql/intake_editor_v2.sql. Пока правка не
+    # включена, их в схеме НЕТ — и стенд обязан на них ругаться, как живой
+    # PostgREST. Иначе живой прогон показывал бы полное редактирование, которого
+    # в проде нет (миграция не применена), то есть обманывал бы в самую
+    # опасную сторону.
+    V2_COLUMNS = ("is_builtin", "hidden", "sort_order", "updated_by", "updated_at")
+
     def __init__(self, seed: dict = None):
         self.lock = threading.Lock()
         self.tables = _defaults()
+        # Схема — на инстанс: включение v2 не должно течь между прогонами.
+        self.schema = {name: list(cols) for name, cols in self.SCHEMA.items()}
+        self.v2_applied = False
 
         if seed:
             for name, rows in seed.items():
@@ -166,6 +191,40 @@ class Store:
         self.buckets = set()
         self.fault = {"read_only": False, "status": None}
         self._ids = {}
+
+    # ---------- схема ----------
+
+    def known_columns(self, table: str):
+        """Известные колонки таблицы или None, если таблица нам неизвестна.
+
+        None — «не проверяем»: стенд не описывает все таблицы, и выдумывать
+        отказ там, где схема просто не заведена, значило бы ломать живые
+        прогоны на ровном месте. Проверяем только те таблицы, чью схему
+        реально знаем (см. `SCHEMA`).
+        """
+        if table in self.schema:
+            return set(self.schema[table])
+
+        rows = self.tables.get(table) or []
+        if rows:
+            return {key for row in rows if isinstance(row, dict) for key in row}
+
+        return None
+
+    def unknown_columns(self, table: str, names):
+        """Колонки из запроса, которых нет в схеме (как 42703 у PostgREST)."""
+        known = self.known_columns(table)
+        if known is None:
+            return []
+        return [name for name in names if name and name != "*" and name not in known]
+
+    def apply_v2(self) -> None:
+        """Включить схему v2 — как после применения sql/intake_editor_v2.sql."""
+        self.v2_applied = True
+        cols = self.schema.setdefault("telegram_intake_options", [])
+        for name in self.V2_COLUMNS:
+            if name not in cols:
+                cols.append(name)
 
     # ---------- журнал ----------
 
@@ -319,7 +378,7 @@ def _project(row: dict, select: str) -> dict:
 # HTTP
 # ============================================================
 
-CONTROL_ACTIONS = {"read_only", "status", "clear", "seed", "fault_off"}
+CONTROL_ACTIONS = {"read_only", "status", "clear", "seed", "fault_off", "apply_v2"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -468,6 +527,28 @@ class Handler(BaseHTTPRequestHandler):
 
         with store.lock:
             rows = list(store.tables.setdefault(table, []))
+
+        # Колонки в select/order/filters обязаны быть в схеме: живой PostgREST
+        # отвечает 400 (42703) на неизвестную колонку. Без этой проверки стенд
+        # молча возвращал 200, и прогон «до миграции» выглядел как «после».
+        requested = []
+        if select and select.strip() != "*":
+            requested += [part.strip().split(":")[0] for part in select.split(",")]
+        requested += [key for key in filters if key not in ("select", "order", "limit", "offset")]
+        requested += [part.strip().split(".")[0] for part in order.split(",") if part.strip()]
+        unknown = store.unknown_columns(table, requested)
+        if unknown:
+            return self._send(
+                400,
+                {
+                    "code": "42703",
+                    "details": None,
+                    "hint": None,
+                    "message": (
+                        f"column {table}.{unknown[0]} does not exist"
+                    ),
+                },
+            )
 
         if method in ("GET", "HEAD"):
             matched = [row for row in rows if _row_matches(row, filters)]
@@ -717,6 +798,12 @@ class Handler(BaseHTTPRequestHandler):
             self.store.fault = {"read_only": False, "status": None}
         elif action == "clear":
             self.store.reset_logs()
+        elif action == "apply_v2":
+            # Имитация применения sql/intake_editor_v2.sql: включает колонки
+            # v2 и таблицу правок узлов. Нужно, чтобы живьём проверялся и
+            # полный режим редактора, а не только мягкая деградация.
+            self.store.apply_v2()
+            self.store.tables.setdefault("telegram_intake_nodes", [])
         else:
             return self._send(400, {"error": f"unknown action {action!r}"})
 

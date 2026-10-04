@@ -551,6 +551,58 @@ class BotFlowTestCase(unittest.TestCase):
 
         self.assertTrue(self.sent, "нет ответа на /tree")
 
+    # ---------- точность стенда ----------
+
+    def test_stub_rejects_unknown_column_like_postgrest(self):
+        """Стенд обязан ругаться на неизвестную колонку, как живой PostgREST.
+
+        Проверено на живой базе: `select=is_builtin` до применения
+        `sql/intake_editor_v2.sql` даёт **400 / 42703**. Стенд раньше отвечал
+        200, то есть был мягче реальности — и живой прогон показывал бы полное
+        редактирование дерева, которого в проде нет. Молчаливое расхождение в
+        опасную сторону.
+        """
+        status, body = _request(
+            "GET", "/rest/v1/telegram_intake_options?select=is_builtin&limit=1"
+        )
+
+        self.assertEqual(status, 400, "стенд принял колонку, которой нет в схеме")
+        self.assertEqual(body.get("code"), "42703")
+        self.assertIn("is_builtin", body.get("message", ""))
+
+    def test_stub_accepts_known_column(self):
+        """Известная колонка проходит: мягкость не должна стать отказом везде."""
+        status, _ = _request(
+            "GET", "/rest/v1/telegram_intake_options?select=node_id&limit=1"
+        )
+
+        self.assertEqual(status, 200)
+
+    def test_stub_apply_v2_enables_columns(self):
+        """`apply_v2` включает схему миграции — как после её применения."""
+        store = self.server.RequestHandlerClass.store
+        saved = {k: list(v) for k, v in store.schema.items()}
+
+        def restore():
+            store.schema = saved
+            store.v2_applied = False
+
+        self.addCleanup(restore)
+
+        status, _ = _request(
+            "GET", "/rest/v1/telegram_intake_options?select=sort_order&limit=1"
+        )
+        self.assertEqual(status, 400, "до apply_v2 колонки быть не должно")
+
+        _request("POST", "/__fault", {"action": "apply_v2"})
+
+        status, _ = _request(
+            "GET", "/rest/v1/telegram_intake_options?select=sort_order&limit=1"
+        )
+        self.assertEqual(status, 200, "после apply_v2 колонка обязана появиться")
+
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
