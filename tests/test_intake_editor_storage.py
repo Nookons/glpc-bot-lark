@@ -354,5 +354,122 @@ class EditorStorageTestCase(unittest.TestCase):
         self.assertEqual(self.db.rows.get("telegram_intake_options", []), [])
 
 
+class MissingMigrationNoiseTests(unittest.TestCase):
+    """Отсутствие миграции v2 — ожидаемое состояние, а не сбой.
+
+    Проверка колонок спрашивает `is_builtin`, которого до миграции нет, и
+    PostgREST отвечает 400. Раньше этот запрос шёл **без** флага `optional`, и
+    `rest_get` писал ERROR на каждую проверку — то есть пока админ открыт
+    редактор, ошибка появлялась регулярно (раз в TTL), и настоящие проблемы
+    тонули в шуме. Сообщение о состоянии остаётся, но на уровне WARNING.
+    """
+
+    def test_probe_does_not_log_an_error(self):
+        import logging
+
+        records = []
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                records.append((record.levelname, record.getMessage()))
+
+        handler = Handler()
+        handler.setLevel(logging.DEBUG)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.removeHandler, handler)
+
+        module = types.ModuleType("sendToDataBase")
+        seen = {}
+
+        def rest_get(table, params=None, optional=False):
+            seen["optional"] = optional
+            return None  # колонок v2 нет
+
+        module.rest_get = rest_get
+        module.rest_upsert = lambda *a, **k: [{}]
+        module.rest_delete = lambda *a, **k: False
+        module.rest_post = lambda *a, **k: [{}]
+        sys.modules["sendToDataBase"] = module
+        storage.reset_capability_cache()
+
+        self.assertFalse(storage.overlay_supported())
+        self.assertTrue(
+            seen.get("optional"),
+            "проверка колонок идёт без optional — в лог уйдёт ERROR",
+        )
+
+    def test_state_is_still_reported_as_warning(self):
+        """Состояние не замалчивается: причина остаётся видимой."""
+        import logging
+
+        records = []
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = Handler()
+        handler.setLevel(logging.DEBUG)
+        storage.logger.addHandler(handler)
+        storage.logger.setLevel(logging.DEBUG)
+        self.addCleanup(storage.logger.removeHandler, handler)
+
+        module = types.ModuleType("sendToDataBase")
+        module.rest_get = lambda *a, **k: None
+        module.rest_upsert = lambda *a, **k: [{}]
+        module.rest_delete = lambda *a, **k: False
+        module.rest_post = lambda *a, **k: [{}]
+        sys.modules["sendToDataBase"] = module
+        storage.reset_capability_cache()
+
+        storage.overlay_supported()
+
+        self.assertTrue(
+            any("intake_editor_v2" in m for m in records),
+            "исчезло сообщение о том, что нужно применить миграцию",
+        )
+
+
+class FailureNoticeTests(unittest.TestCase):
+    """Отказ правки обязан называть причину, а не «не изменилось».
+
+    Раньше при неприменённой миграции админ видел «⚠️ Option not changed.» —
+    выглядело как сбой бота, а не как неприменённая миграция.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(storage.reset_capability_cache)
+
+    def test_success_is_shown_as_is(self):
+        from equipment_intake import editor
+
+        self.assertEqual(editor._failure_notice(True, "✅ Done."), "✅ Done.")
+
+    def test_missing_migration_is_named_as_the_reason(self):
+        from equipment_intake import editor
+
+        storage.reset_capability_cache()
+        storage._remember_v2(False)
+
+        notice = editor._failure_notice(False, "✅ Done.")
+
+        self.assertIn("intake_editor_v2", notice, "причина не названа")
+        self.assertIn("is_builtin", notice, "не сказано, чего не хватает")
+
+    def test_other_rejection_stays_generic(self):
+        """Когда схема готова, причина другая — выдумывать её нельзя."""
+        from equipment_intake import editor
+
+        storage.reset_capability_cache()
+        storage._remember_v2(True)
+
+        notice = editor._failure_notice(False, "✅ Done.")
+
+        self.assertNotIn("intake_editor_v2", notice)
+        self.assertIn("rejected", notice)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

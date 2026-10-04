@@ -202,6 +202,34 @@ def reset_access_cache() -> None:
         _LEADER_CACHE.clear()
 
 
+#: Что сказать, когда правка не удалась из-за неприменённой миграции.
+#:
+#: Раньше в этом случае показывалось «⚠️ Option not changed.» — админ видел, что
+#: ничего не произошло, но **не понимал, почему**: выглядело как сбой бота, а не
+#: как неприменённая миграция. Теперь причина названа и указано, что делать.
+SCHEMA_NOT_READY_MESSAGE = (
+    "⚠️ Not saved: the database is not ready for full editing "
+    "(missing column is_builtin). Apply sql/intake_editor_v2.sql. "
+    "Adding options works even now."
+)
+
+
+def _failure_notice(done: bool, success: str) -> str:
+    """
+    Текст о результате правки: успех — как есть, отказ — с настоящей причиной.
+
+    Если база не готова (нет колонок v2), отказ почти всегда именно из-за этого,
+    поэтому причину назвать честнее, чем показать «не изменилось».
+    """
+    if done:
+        return success
+
+    if not storage.overlay_supported():
+        return SCHEMA_NOT_READY_MESSAGE
+
+    return "⚠️ Not saved. The change was rejected."
+
+
 # ============================================================
 # СОСТОЯНИЕ РЕДАКТОРА
 # ============================================================
@@ -1441,7 +1469,9 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
                 notice=f"✅ Target updated to {_node_name(_tree(), target)}.",
             )
         else:
-            _show_option(chat_id, sender, role, message_id, notice="⚠️ Target not changed.")
+            _show_option(
+                chat_id, sender, role, message_id, notice=_failure_notice(False, "")
+            )
 
         return True
 
@@ -1470,7 +1500,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
 
         _show_option(
             chat_id, sender, role, message_id,
-            notice="✅ Order updated." if moved else "⚠️ Order not changed.",
+            notice=_failure_notice(moved, "✅ Order updated."),
         )
         return True
 
@@ -1493,7 +1523,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         _answer(callback_id, "Shown" if ok else "Could not show")
         _show_option(
             chat_id, sender, role, message_id,
-            notice="✅ Option is visible again." if ok else "⚠️ Option not changed.",
+            notice=_failure_notice(ok, "✅ Option is visible again."),
         )
         return True
 
@@ -1552,7 +1582,7 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             ok = storage.update_node(node.id, hidden=False, updated_by=sender.get("id"))
             _show_node_edit(
                 chat_id, sender, role, message_id,
-                notice="✅ The step is visible again." if ok else "⚠️ Step not changed.",
+                notice=_failure_notice(ok, "✅ The step is visible again."),
             )
             return True
 
@@ -1606,8 +1636,10 @@ def _run_confirm(chat_id, sender, role: str, view: Dict[str, Any], message_id) -
         _show_option(
             chat_id, sender, role, message_id,
             notice=(
-                f"✅ Option hidden: {item['label']}. It can be shown again." if ok
-                else "⚠️ Option not changed."
+                _failure_notice(
+                    ok,
+                    f"✅ Option hidden: {item['label']}. It can be shown again.",
+                )
             ),
         )
         return
@@ -1617,8 +1649,7 @@ def _run_confirm(chat_id, sender, role: str, view: Dict[str, Any], message_id) -
         _show_node(
             chat_id, sender, role, node_id, message_id,
             notice=(
-                "✅ Step hidden. Links now lead past it." if ok
-                else "⚠️ This step cannot be hidden."
+                _failure_notice(ok, "✅ Step hidden. Links now lead past it.")
             ),
         )
         return

@@ -180,7 +180,13 @@ def overlay_supported() -> bool:
 
     from sendToDataBase import rest_get
 
-    rows = rest_get(OPTION_TABLE, {"select": "is_builtin", "limit": "1"})
+    # `optional=True`: отсутствие колонок v2 — ожидаемое состояние, пока
+    # миграция не применена. Без флага `rest_get` писал ERROR на каждую проверку
+    # (раз в TTL, то есть пока админ открыт редактор — регулярно), и настоящие
+    # проблемы тонули в этом шуме. Уровень сообщения о состоянии — WARNING ниже.
+    rows = rest_get(
+        OPTION_TABLE, {"select": "is_builtin", "limit": "1"}, optional=True
+    )
     supported = rows is not None
     _remember_v2(supported)
 
