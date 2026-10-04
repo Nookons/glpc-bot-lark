@@ -233,6 +233,46 @@ class EditorStorageTestCase(unittest.TestCase):
         row = next(r for r in rows if r["node_id"] == node.id)
         self.assertTrue(row["hidden"], "правка заголовка сбросила hidden — узел снова виден")
 
+    def test_editing_title_keeps_other_text_fields(self):
+        """Правка одного поля не должна стирать соседние.
+
+        Редактор правит по одному полю за раз (`editor.py`), поэтому раньше
+        сохранение заголовка обнуляло описание, placeholder и подсказку — тот
+        же класс дефекта, что и со `hidden`.
+        """
+        node = self._node_with_options()
+        storage.update_node(
+            node.id, title="T1", description="D1", placeholder="P1", stub_hint="S1"
+        )
+
+        storage.update_node(node.id, title="T2")
+
+        row = storage.node_overrides()[node.id]
+        self.assertEqual(row["title"], "T2")
+        self.assertEqual(row["description"], "D1")
+        self.assertEqual(row["placeholder"], "P1")
+        self.assertEqual(row["stub_hint"], "S1")
+
+    def test_explicit_empty_string_clears_the_field(self):
+        """Очистка должна работать: пустая строка — это «стереть», а не «не трогать»."""
+        node = self._node_with_options()
+        storage.update_node(node.id, description="D1")
+
+        storage.update_node(node.id, description="")
+
+        row = storage.node_overrides()[node.id]
+        self.assertFalse(row.get("description"), "описание не очистилось")
+
+    def test_editing_description_keeps_title(self):
+        node = self._node_with_options()
+        storage.update_node(node.id, title="Keep me")
+
+        storage.update_node(node.id, description="D2")
+
+        row = storage.node_overrides()[node.id]
+        self.assertEqual(row["title"], "Keep me")
+        self.assertEqual(row["description"], "D2")
+
     def test_update_node_refuses_to_hide_root(self):
         self.assertFalse(storage.update_node(DEFAULT_TREE.root_id, hidden=True))
 
