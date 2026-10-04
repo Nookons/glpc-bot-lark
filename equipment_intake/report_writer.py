@@ -46,7 +46,7 @@ GLPC_TABLE = "exceptions_glpc"
 # from the live table while the bot is already deployed, so the write must work
 # without them (see `write_exception`). A missing column is an expected state
 # during rollout, not a failure.
-OPTIONAL_COLUMNS = ("module", "device_number", "object_type", "report_id")
+OPTIONAL_COLUMNS = ("module", "device_number", "object_type", "report_id", "unresolved_reason")
 
 # How long the "columns are missing" answer is remembered. Short TTL, same
 # reasoning as the intake editor's schema cache: after the migration is applied
@@ -276,7 +276,11 @@ def _card_id(value):
 
 
 def _optional_fields(
-    answers: Dict[str, Any], category: str, module: str, report_id: str
+    answers: Dict[str, Any],
+    category: str,
+    module: str,
+    report_id: str,
+    unresolved_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Columns added by the intake-analytics migration.
@@ -292,7 +296,34 @@ def _optional_fields(
         "device_number": device_number or None,
         "object_type": category or None,
         "report_id": report_id or None,
+        "unresolved_reason": unresolved_reason,
     }
+
+
+def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
+    """
+    Чего не хватило в записи — одной строкой через запятую.
+
+    Поле `unresolved_reason` заведено миграцией 0067, но до этой правки его
+    никто не заполнял: по нему нельзя было понять, полная запись или нет,
+    хотя именно для этого он и нужен. Считается здесь, а не в
+    `_optional_fields`, потому что фото и карточка работника живут в `result`,
+    а не в ответах дерева.
+
+    Значения `no_employee` и `no_photo` совпадают с теми, что проставляет
+    backfill в 0067, — чтобы разметка старых и новых строк читалась одинаково.
+    """
+    reasons = []
+
+    if not card_id:
+        # Ошибку не с кем связать: в метрики по работнику она не попадёт.
+        reasons.append("no_employee")
+
+    if not str(result.get("photo_url") or "").strip():
+        # Фото к ошибке не привязано (загрузка не удалась).
+        reasons.append("no_photo")
+
+    return ",".join(reasons) or None
 
 
 def build_row(
@@ -374,7 +405,9 @@ def build_row(
     }
 
     if include_optional:
-        row.update(_optional_fields(answers, category, module, report_id))
+        row.update(
+            _optional_fields(answers, category, module, report_id, _unresolved_reason(card_id, result))
+        )
 
     return row
 

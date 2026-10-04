@@ -607,6 +607,52 @@ class AnalyticsColumnChecks(unittest.TestCase):
         with mock.patch.object(rw, "canonical_type", return_value=None):
             return rw.build_row(result(), "GLP-C")
 
+    def test_unresolved_reason_is_filled_for_new_rows(self):
+        """Признак неполноты заполняется, а не остаётся пустым.
+
+        Колонка `unresolved_reason` заведена миграцией 0067, но её никто не
+        заполнял: в живой базе значение было только у строк, которым его
+        проставил разовый backfill, а новые записи приходили пустыми. То есть
+        по полю нельзя было понять, полная запись или нет, хотя оно ровно для
+        этого и нужно.
+        """
+        # Полная запись: карточка работника и загруженное фото на месте.
+        # Это тот случай, который в живом флоу даёт `_save` перед записью.
+        complete_result = result(employee_card_id=60130607, photo_url="https://x/p.jpg")
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            complete = rw.build_row(complete_result, "GLP-C")
+
+        self.assertIsNone(
+            complete["unresolved_reason"], "полная запись помечена как неполная"
+        )
+
+        broken = result()
+        broken["employee_card_id"] = None
+        broken["photo_url"] = None
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(broken, "GLP-C")
+
+        self.assertIn("no_employee", row["unresolved_reason"])
+        self.assertIn("no_photo", row["unresolved_reason"])
+
+    def test_unresolved_reason_names_only_what_is_missing(self):
+        """Признак называет именно то, чего не хватает, а не всё подряд."""
+        no_card = result(employee_card_id=None, photo_url="https://x/p.jpg")
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(no_card, "GLP-C")
+
+        self.assertEqual(row["unresolved_reason"], "no_employee")
+
+        no_photo = result(employee_card_id=60130607, photo_url=None)
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(no_photo, "GLP-C")
+
+        self.assertEqual(row["unresolved_reason"], "no_photo")
+
     def test_full_row_fills_every_analytics_column(self):
         row = self.row()
 
