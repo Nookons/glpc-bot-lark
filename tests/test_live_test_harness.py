@@ -399,6 +399,75 @@ class HarnessTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pending_photos.upload_image("/tmp/whatever.jpg")
 
+    def test_lease_is_renewed_not_on_every_check(self):
+        """Heartbeat лиза продлевается по интервалу, а не на каждый вызов.
+
+        Найдено по логам **живого прода**: `check()` вызывается на каждой
+        итерации опроса, и heartbeat уходил в базу каждые ~7 секунд при TTL 90
+        (91 строка `PATCH bot_leases` за 8 минут). Это и шум в логах, и лишние
+        запросы; продлевать достаточно примерно втрое чаще TTL.
+
+        Проверяется число запросов, а не текст лога.
+        """
+        import time
+
+        import bot_lease
+
+        patches = {"n": 0}
+        saved_get, saved_patch = bot_lease.rest_get, bot_lease.rest_patch
+        saved_ok, saved_renew = bot_lease._table_ok, bot_lease._last_renew_at
+        self.addCleanup(
+            lambda: (
+                setattr(bot_lease, "rest_get", saved_get),
+                setattr(bot_lease, "rest_patch", saved_patch),
+                setattr(bot_lease, "_table_ok", saved_ok),
+                setattr(bot_lease, "_last_renew_at", saved_renew),
+            )
+        )
+
+        bot_lease.rest_get = lambda *a, **k: [
+            {
+                "name": bot_lease.LEASE_NAME,
+                "holder": bot_lease.holder_id(),
+                "heartbeat_at": bot_lease._now_iso(),
+            }
+        ]
+
+        def rest_patch(*args, **kwargs):
+            patches["n"] += 1
+            return [{"ok": True}]
+
+        bot_lease.rest_patch = rest_patch
+        bot_lease._table_ok = True
+        bot_lease._last_renew_at = 0.0
+
+        for _ in range(20):
+            state = bot_lease.check()
+
+        self.assertEqual(state, "ok")
+        self.assertEqual(patches["n"], 1, "heartbeat продлевается на каждый вызов check()")
+
+        # По истечении интервала продление обязано произойти: иначе лиз
+        # просрочится и его заберёт сосед.
+        bot_lease._last_renew_at = time.time() - bot_lease.LEASE_RENEW_INTERVAL_SECONDS - 1
+        bot_lease.check()
+
+        self.assertEqual(patches["n"], 2, "продление не произошло после интервала")
+
+    def test_lease_renew_interval_leaves_margin(self):
+        """Интервал продления обязан быть заметно меньше TTL.
+
+        Иначе при задержке одного продления лиз просрочится, и работу заберёт
+        другой инстанс — то есть появятся дубли сообщений.
+        """
+        import bot_lease
+
+        self.assertLess(
+            bot_lease.LEASE_RENEW_INTERVAL_SECONDS * 2,
+            bot_lease.LEASE_TTL_SECONDS,
+            "интервал продления слишком близок к TTL — нет запаса",
+        )
+
     def test_lease_name_is_not_the_production_one(self):
         import bot_lease
 

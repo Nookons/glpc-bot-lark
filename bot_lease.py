@@ -50,6 +50,15 @@ LEASE_NAME = os.environ.get("BOT_LEASE_NAME", "glpc-bot-telegram")
 # работу, если старый не успел отпустить лиз сам.
 LEASE_TTL_SECONDS = env_int("BOT_LEASE_TTL", 90)
 
+# Как часто продлевать heartbeat. `check()` вызывается на **каждой** итерации
+# опроса, а длинный опрос может возвращаться часто — без ограничения heartbeat
+# уходил в базу каждые ~7 секунд при TTL 90. Это видно в логах прода как поток
+# `PATCH bot_leases` (91 строка за 8 минут) и не нужно: продлевать достаточно
+# примерно втрое чаще TTL, чтобы оставался запас.
+LEASE_RENEW_INTERVAL_SECONDS = env_int("BOT_LEASE_RENEW_INTERVAL_SECONDS", 30)
+
+_last_renew_at = 0.0
+
 _table_ok = None
 _table_checked_at = 0.0
 _warned_no_table = False
@@ -180,6 +189,16 @@ def check(holder: str = None) -> str:
     if str(row.get("holder") or "") != holder:
         return "lost"
 
+    # Продлеваем не чаще, чем нужно: сам `check` вызывается очень часто.
+    # Пропуск продления безопасен — TTL втрое больше интервала, поэтому
+    # владение не потеряется. Признак владения уже проверен выше по строке.
+    global _last_renew_at
+
+    now = time.time()
+
+    if now - _last_renew_at < LEASE_RENEW_INTERVAL_SECONDS:
+        return "ok"
+
     renewed = rest_patch(
         TABLE,
         params={"name": f"eq.{LEASE_NAME}", "holder": f"eq.{holder}"},
@@ -188,6 +207,8 @@ def check(holder: str = None) -> str:
 
     if renewed is None:
         return "error"
+
+    _last_renew_at = now
 
     # Пустой ответ = строку лиза удалили или она уже не наша.
     return "ok" if renewed else "lost"
