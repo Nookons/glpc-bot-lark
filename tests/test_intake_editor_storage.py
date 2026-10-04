@@ -281,6 +281,68 @@ class EditorStorageTestCase(unittest.TestCase):
 
     # ---------- выключенный полный режим ----------
 
+    def test_missing_v2_columns_are_not_probed_on_every_call(self):
+        """Отсутствие колонок v2 запоминается, а не проверяется заново каждый раз.
+
+        Найдено по логам **живого прода**: без применённой миграции каждый
+        вызов `load_option_rows` заново пробовал v2-колонки, получал 400 и
+        `rest_get` писал ERROR. На каждое сообщение — строка ошибки, из-за
+        которой настоящие проблемы не видно. Чтение работало (был откат на v1),
+        но логи были непригодны.
+
+        Проверяется число запросов, а не текст лога: так тест не зависит от
+        формата сообщений.
+        """
+        probes = {"v2": 0, "v1": 0}
+        module = types.ModuleType("sendToDataBase")
+
+        def rest_get(table, params=None):
+            if table == storage.OPTION_TABLE:
+                if "is_builtin" in (params or {}).get("select", ""):
+                    probes["v2"] += 1
+                else:
+                    probes["v1"] += 1
+            return None  # ни v2-колонок, ни v1-строк
+
+        module.rest_get = rest_get
+        module.rest_upsert = lambda *a, **k: [{}]
+        module.rest_delete = lambda *a, **k: False
+        module.rest_post = lambda *a, **k: [{}]
+        sys.modules["sendToDataBase"] = module
+        storage.reset_capability_cache()
+
+        for _ in range(5):
+            storage.load_option_rows()
+
+        self.assertEqual(probes["v2"], 1, "колонки v2 проверяются заново на каждый вызов")
+        self.assertEqual(probes["v1"], 5, "откат к v1 должен происходить каждый раз")
+
+    def test_missing_nodes_table_is_not_queried_on_every_call(self):
+        """Отсутствующая таблица правок узлов тоже запоминается.
+
+        `load_node_rows` при отсутствии таблицы возвращает пустой список — это
+        нормально, но сам запрос даёт 404 в логе. На каждое сообщение.
+        """
+        queries = {"nodes": 0}
+        module = types.ModuleType("sendToDataBase")
+
+        def rest_get(table, params=None):
+            if table == storage.NODE_TABLE:
+                queries["nodes"] += 1
+            return None
+
+        module.rest_get = rest_get
+        module.rest_upsert = lambda *a, **k: [{}]
+        module.rest_delete = lambda *a, **k: False
+        module.rest_post = lambda *a, **k: [{}]
+        sys.modules["sendToDataBase"] = module
+        storage.reset_capability_cache()
+
+        for _ in range(5):
+            storage.load_node_rows()
+
+        self.assertEqual(queries["nodes"], 1, "отсутствующая таблица запрашивается каждый раз")
+
     def test_full_edit_is_refused_when_migration_not_applied(self):
         """Без `sql/intake_editor_v2.sql` правки запрещены, а не «тихо сохранены»."""
         storage._v2_state = False

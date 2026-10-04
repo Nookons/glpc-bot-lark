@@ -80,18 +80,39 @@ def _remember_v2(supported: bool) -> None:
     _v2_checked_at = time.time()
 
 
+def _v2_known_unsupported() -> bool:
+    """Точно ли известно, что колонок v2 нет (и память ещё свежа).
+
+    Нужно, чтобы не пробовать v2-запрос заново на каждое сообщение. Проверка
+    «есть ли колонки» делается запросом, который при отсутствии колонок
+    завершается ошибкой 400 — и `rest_get` пишет об этом в лог. До этой правки
+    живой бот без применённой миграции засорял логи: на каждое сообщение по
+    одной строке ERROR. Само чтение при этом работало (был откат на v1), но по
+    логам нельзя было понять, что происходит на самом деле.
+    """
+    return (
+        _v2_state is False
+        and time.time() - _v2_checked_at < _V2_TTL_SECONDS
+    )
+
+
 def _read_options() -> Optional[List[dict]]:
     """Строки оверлея вариантов. None — база недоступна."""
     from sendToDataBase import rest_get
 
-    rows = rest_get(
-        OPTION_TABLE,
-        {"select": _COLUMNS_V2, "order": "node_id.asc,sort_order.asc,id.asc"},
-    )
+    # Если уже знаем, что v2-колонок нет, идём сразу к v1: иначе каждый вызов
+    # даёт ожидаемую ошибку 400 в логе.
+    if not _v2_known_unsupported():
+        rows = rest_get(
+            OPTION_TABLE,
+            {"select": _COLUMNS_V2, "order": "node_id.asc,sort_order.asc,id.asc"},
+        )
 
-    if rows is not None:
-        _remember_v2(True)
-        return [row for row in rows if isinstance(row, dict)]
+        if rows is not None:
+            _remember_v2(True)
+            return [row for row in rows if isinstance(row, dict)]
+
+        _remember_v2(False)
 
     rows = rest_get(OPTION_TABLE, {"select": _COLUMNS_V1, "order": "created_at.asc"})
 
@@ -112,13 +133,28 @@ def load_node_rows() -> Optional[List[dict]]:
     Строки правок узлов. Пустой список — таблицы нет или она пуста.
 
     Отсутствие таблицы — это не «база упала»: редактор просто покажет
-    встроенные узлы без правок.
+    встроенные узлы без правок. Но спрашивать её на каждое сообщение не нужно:
+    пока миграция не применена, каждый запрос даёт 404 в логе, и настоящие
+    проблемы в нём не видны.
+
+    Пропуск запроса привязан к тому же признаку, что и проверка колонок v2:
+    таблица и колонки создаются **одной** миграцией. Отдельного «помню, что
+    таблицы нет» здесь намеренно нет: если бы этот признак расходился с
+    `_v2_state`, `node_overrides()` вернул бы пусто и правка заголовка
+    показывала бы скрытый узел — ровно тот дефект, который уже исправлялся.
     """
+    if _v2_known_unsupported():
+        return []
+
     from sendToDataBase import rest_get
 
     rows = rest_get(NODE_TABLE, {"select": _NODE_COLUMNS, "order": "id.asc"})
 
     if rows is None:
+        # Таблицы нет — значит и миграции v2 нет: отметить это, чтобы не
+        # спрашивать её снова на каждое сообщение. Признак общий с колонками
+        # намеренно: так не бывает состояния «колонки есть, а таблицы нет».
+        _remember_v2(False)
         return []
 
     return [row for row in rows if isinstance(row, dict)]
