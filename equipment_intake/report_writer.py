@@ -310,8 +310,16 @@ def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
     `_optional_fields`, потому что фото и карточка работника живут в `result`,
     а не в ответах дерева.
 
-    Значения `no_employee` и `no_photo` совпадают с теми, что проставляет
-    backfill в 0067, — чтобы разметка старых и новых строк читалась одинаково.
+    Значения и **разделитель** совпадают с backfill'ом в 0067 (`concat_ws(', ', …)`)
+    — иначе одна колонка имела бы два формата: `no_employee,no_photo` от бота и
+    `no_employee, no_end_time, no_photo` от миграции. Потребитель, разбирающий
+    строку по `", "`, молча не увидел бы причин в записях бота. Проверено на
+    живой базе: в ней уже есть строки обоих видов.
+
+    `no_end_time` здесь намеренно **нет**: приём всегда пишет `error_end_time`
+    (он равен времени отчёта, `solving_time = 0`), поэтому эта причина у новых
+    записей невозможна. Ставить её «на всякий случай» значило бы помечать
+    полные записи неполными.
     """
     reasons = []
 
@@ -323,7 +331,7 @@ def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
         # Фото к ошибке не привязано (загрузка не удалась).
         reasons.append("no_photo")
 
-    return ",".join(reasons) or None
+    return ", ".join(reasons) or None
 
 
 def build_row(

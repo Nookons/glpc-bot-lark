@@ -637,6 +637,30 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertIn("no_employee", row["unresolved_reason"])
         self.assertIn("no_photo", row["unresolved_reason"])
 
+    def test_unresolved_reason_uses_the_same_separator_as_the_migration(self):
+        """Разделитель обязан совпадать с backfill'ом в 0067: `", "`, не `","`.
+
+        Одна колонка с двумя форматами — тихая ловушка: потребитель, который
+        разберёт строку по `", "` (а именно так пишет миграция
+        `concat_ws(', ', …)`), не увидит причин в записях бота. В живой базе уже
+        есть строки обоих видов.
+        """
+        rows = {
+            "both": result(employee_card_id=None, photo_url=None),
+            "card_only": result(employee_card_id=1, photo_url=None),
+        }
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            pair = rw.build_row(rows["both"], "GLP-C")
+            single = rw.build_row(rows["card_only"], "GLP-C")
+
+        self.assertEqual(pair["unresolved_reason"], "no_employee, no_photo")
+        self.assertNotIn(
+            ",",
+            single["unresolved_reason"].replace(", ", ""),
+            "одиночная причина не должна содержать разделитель",
+        )
+
     def test_unresolved_reason_names_only_what_is_missing(self):
         """Признак называет именно то, чего не хватает, а не всё подряд."""
         no_card = result(employee_card_id=None, photo_url="https://x/p.jpg")
