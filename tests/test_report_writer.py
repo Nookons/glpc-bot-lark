@@ -484,12 +484,27 @@ class RowMappingChecks(unittest.TestCase):
         self.assertEqual(row["second_column"], "A42T C2")
         self.assertNotIn("Module:", row["issue_description"])
 
-    def test_serial_timestamps_and_no_end_time(self):
+    def test_end_time_follows_the_table_convention(self):
+        """
+        `error_end_time = error_start_time + solving_time` across the live table
+        (verified on 23393 rows). With no issue template `solving_time` is 0, so
+        the expected end equals the start — NULL would be the odd one out here.
+        """
         row = row_for(resolved=None)
 
-        self.assertIsNone(row["error_end_time"])
         self.assertEqual(row["solving_time"], 0)
         self.assertTrue(row["error_start_time"])
+        self.assertEqual(row["error_end_time"], row["error_start_time"])
+
+    def test_end_time_tracks_the_report_time_not_the_server_clock(self):
+        """The derived value must follow the report's own timestamp."""
+        row = row_for(resolved=None, received_at="2026-10-02T04:00:00+00:00")
+
+        self.assertEqual(row["error_end_time"], row["error_start_time"])
+        self.assertEqual(
+            datetime.fromisoformat(row["error_end_time"]).astimezone(timezone.utc),
+            datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
+        )
 
     def test_warehouse_column_matches_the_argument(self):
         for warehouse in ("GLP-C", "SMALL-P3"):
@@ -516,6 +531,224 @@ class RowMappingChecks(unittest.TestCase):
 
         self.assertEqual(row["device_type"], "")
         self.assertIsNone(row["error_robot"])
+
+
+class EmployeeCardChecks(unittest.TestCase):
+    """`add_by` must carry the employee's card, or stay honestly empty."""
+
+    def test_card_id_from_the_result_reaches_add_by(self):
+        row = row_for(resolved=None, employee_card_id="CARD-1")
+
+        self.assertEqual(row["add_by"], "CARD-1")
+
+    def test_numeric_card_id_is_preserved(self):
+        row = row_for(resolved=None, employee_card_id=60072001)
+
+        self.assertEqual(row["add_by"], 60072001)
+
+    def test_unlinked_employee_leaves_add_by_empty(self):
+        """A missing card must not stop the report — same rule as `employee`."""
+        row = row_for(resolved=None, employee_card_id=None)
+
+        self.assertIsNone(row["add_by"])
+
+    def test_blank_card_id_is_not_written_as_an_empty_string(self):
+        for value in ("", "   ", None):
+            with self.subTest(value=value):
+                self.assertIsNone(row_for(resolved=None, employee_card_id=value)["add_by"])
+
+    def test_missing_key_does_not_raise(self):
+        """Legacy callers that never pass the key still get a valid row."""
+        data = result()
+        data.pop("employee", None)
+
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(data, "GLP-C")
+
+        self.assertIsNone(row["add_by"])
+
+
+class PhotoUrlChecks(unittest.TestCase):
+    """The photo the operator sent must be attached to the journal row."""
+
+    def test_uploaded_url_reaches_photo_url(self):
+        row = row_for(resolved=None, photo_url="https://storage.invalid/p.jpg")
+
+        self.assertEqual(row["photo_url"], "https://storage.invalid/p.jpg")
+
+    def test_failed_upload_leaves_the_column_empty(self):
+        """`_save` returns None when the upload fails; the row is still filed."""
+        row = row_for(resolved=None, photo_url=None)
+
+        self.assertIsNone(row["photo_url"])
+
+    def test_blank_url_is_normalised_to_null(self):
+        row = row_for(resolved=None, photo_url="")
+
+        self.assertIsNone(row["photo_url"])
+
+
+class AnalyticsColumnChecks(unittest.TestCase):
+    """
+    The analytics columns arrive with a migration that may lag the deploy.
+
+    PostgREST rejects the whole insert with 400 when a referenced column does not
+    exist, so the report must be written without those columns until they land —
+    and the expected state must not be logged as an error on every message.
+    """
+
+    def setUp(self):
+        rw.reset_schema_cache()
+
+    def tearDown(self):
+        rw.reset_schema_cache()
+
+    def row(self):
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            return rw.build_row(result(), "GLP-C")
+
+    def test_full_row_fills_every_analytics_column(self):
+        row = self.row()
+
+        self.assertEqual(row["module"], "Lifting")
+        self.assertEqual(row["device_number"], "3490")
+        self.assertEqual(row["object_type"], "robot")
+        self.assertEqual(row["report_id"], "photo-1.jpg")
+
+    def test_optional_columns_can_be_dropped(self):
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(result(), "GLP-C", include_optional=False)
+
+        for column in rw.OPTIONAL_COLUMNS:
+            self.assertNotIn(column, row)
+
+        # Everything else is identical, so no report data is lost.
+        self.assertEqual(row["error_robot"], 3490)
+        self.assertEqual(row["warehouse"], "GLP-C")
+        self.assertEqual(row["uniq_key"], "telegram-photo-bot:-100123:777")
+
+    def test_write_works_before_the_migration(self):
+        """The only successful insert must be the minimal row."""
+        attempts = []
+
+        def fake_get(table, params, optional=False):
+            # The analytics probe fails (unknown column), the plain read works:
+            # exactly the pre-migration state of a healthy database.
+            return None if "module" in str(params.get("select")) else [{"id": 1}]
+
+        def fake_post(table, payload, ignore_conflict=False):
+            attempts.append(payload)
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
+             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertNotIn("module", attempts[0])
+        self.assertEqual(attempts[0]["uniq_key"], "telegram-photo-bot:-100123:777")
+
+    def test_write_uses_the_analytics_columns_once_they_exist(self):
+        attempts = []
+
+        def fake_post(table, payload, ignore_conflict=False):
+            attempts.append(payload)
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["module"], "Lifting")
+
+    def test_missing_columns_are_remembered_not_probed_per_report(self):
+        """Otherwise every report pays for two requests and logs an error."""
+        def fake_get(table, params, optional=False):
+            return None if "module" in str(params.get("select")) else [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get) as get, \
+             mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            rw.write_exception(result(), "GLP-C")
+            rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
+
+        # First call: the column probe + the reachability probe. The second call
+        # must not probe again.
+        self.assertEqual(get.call_count, 2)
+
+    def test_unreachable_database_is_not_mistaken_for_missing_columns(self):
+        """
+        A network failure must not strip the analytics fields — that would drop
+        data silently for the whole cache TTL.
+        """
+        attempts = []
+
+        def fake_post(table, payload, ignore_conflict=False):
+            attempts.append(payload)
+            return [{"id": 1}]
+
+        # `None` for both the column probe and the reachability probe.
+        with mock.patch("sendToDataBase.rest_get", return_value=None), \
+             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["object_type"], "robot")
+
+    def test_unreachable_database_is_not_cached_as_missing_columns(self):
+        """The next report must probe again instead of silently dropping data."""
+        probe_selects = []
+
+        def fake_get(table, params, optional=False):
+            probe_selects.append(str(params.get("select")))
+            return None
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
+             mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            rw.write_exception(result(), "GLP-C")
+            probe_selects.clear()
+            rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
+
+        # The second call probed again instead of trusting a stale "no columns".
+        self.assertTrue(any("module" in select for select in probe_selects))
+
+    def test_write_retries_without_columns_when_an_insert_is_rejected(self):
+        """A rejection over a column still files the report, just leaner."""
+        attempts = []
+        probes = []
+
+        def fake_get(table, params, optional=False):
+            probes.append(params)
+            return [{"id": 1}]  # the probe says the columns exist
+
+        def fake_post(table, payload, ignore_conflict=False):
+            attempts.append(payload)
+            if "module" in payload:
+                return None  # rejected over an unknown column
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
+             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("module", attempts[0])
+        self.assertNotIn("module", attempts[1])
+
+    def test_a_real_duplicate_is_still_success_without_the_columns(self):
+        """`ignore_conflict` semantics must survive the fallback path."""
+        responses = iter([None, []])
+
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_post", side_effect=lambda *a, **k: next(responses)), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
 
 class UniqKeyChecks(unittest.TestCase):
@@ -1253,6 +1486,57 @@ class IntegrationOutcomeChecks(unittest.TestCase):
         self.assertIsNone(outcome["glpc_error"])
         self.assertTrue(outcome["lark_delivered"])
 
+    def test_uploaded_photo_reaches_the_journal(self):
+        """
+        The photo was already uploaded for the Lark card; the same URL is what
+        the journal must store, and it must not be uploaded twice.
+        """
+        from equipment_intake import integrations
+
+        seen = []
+
+        with mock.patch.object(
+                 integrations, "_save",
+                 return_value=(True, False, "https://storage.invalid/p.jpg")), \
+             mock.patch.object(integrations, "_send", return_value=True), \
+             mock.patch.object(rw, "write_exception",
+                               side_effect=lambda res, wh=None: seen.append(res) or True):
+            integrations.persist_and_send(result(), "/tmp/photo-1.jpg")
+
+        self.assertEqual(seen[0]["photo_url"], "https://storage.invalid/p.jpg")
+
+    def test_failed_upload_leaves_the_journal_photo_empty(self):
+        """`_save` returns None when the upload fails; the report is still filed."""
+        from equipment_intake import integrations
+
+        seen = []
+
+        with mock.patch.object(integrations, "_save", return_value=(True, False, None)), \
+             mock.patch.object(integrations, "_send", return_value=True), \
+             mock.patch.object(rw, "write_exception",
+                               side_effect=lambda res, wh=None: seen.append(res) or True):
+            integrations.persist_and_send(result(), "/tmp/photo-1.jpg")
+
+        self.assertNotIn("photo_url", seen[0])
+
+    def test_photo_url_is_not_invented_when_the_detail_save_fails(self):
+        """A failed `_save` must not fabricate a link."""
+        from equipment_intake import integrations
+
+        captured = {}
+
+        def fake_write(res, wh=None):
+            captured["photo_url"] = res.get("photo_url")
+            return True
+
+        with mock.patch.object(integrations, "_save",
+                               side_effect=RuntimeError("db down")), \
+             mock.patch.object(integrations, "_send", return_value=True), \
+             mock.patch.object(rw, "write_exception", side_effect=fake_write):
+            integrations.persist_and_send(result(), "/tmp/photo-1.jpg")
+
+        self.assertIsNone(captured["photo_url"])
+
 
 class ConfirmationTextChecks(unittest.TestCase):
     """The operator is told exactly what happened to the journal entry."""
@@ -1338,6 +1622,140 @@ class ConfirmationTextChecks(unittest.TestCase):
         text = self.confirm({})
 
         self.assertIn("Journal entry not saved", text)
+
+
+class TelegramConfirmationCardChecks(unittest.TestCase):
+    """
+    A brief card must stay in the Telegram topic.
+
+    The employee's own photo message is deleted when the flow starts, so the
+    card left behind is the only trace of the report in the chat. It stays
+    short: the full path goes to the Lark group and to the journal.
+    """
+
+    def confirm(self, delivery, context=None, warehouse="GLP-C"):
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        session.data.update(
+            {
+                "warehouse": warehouse,
+                "image": "/tmp/p.jpg",
+                "message_id": 5,
+                "thread_id": 318,
+            }
+        )
+        for step in ("robot", "a42t_c2", "lifting"):
+            session.select(step)
+
+        session.submit_text("3490")
+        session.submit_text("Lift reports an error")
+
+        calls = []
+        lookup = context or (lambda _: ("Smoke User", {"card_id": 60072001}))
+
+        # `_employee_context` is the module seam for the linked employee: it
+        # avoids `mock.patch.dict(sys.modules, ...)`, which is known to break the
+        # *next* `mock.patch` in the same process (see ConfirmationTextChecks).
+        with mock.patch.object(flow, "_employee_context", side_effect=lookup), \
+             mock.patch.object(
+                 flow, "edit_caption",
+                 side_effect=lambda *a, **k: calls.append((a, k)),
+             ), \
+             mock.patch("equipment_intake.integrations.persist_and_send",
+                        return_value=delivery) as send:
+            flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
+
+        return calls, send
+
+    def saved(self):
+        return {
+            "database_saved": True, "device_queued": False,
+            "lark_delivered": True, "glpc_saved": True, "glpc_error": None,
+        }
+
+    def test_card_says_the_error_was_saved(self):
+        calls, _ = self.confirm(self.saved())
+        caption = calls[0][0][2]
+
+        self.assertIn("Error report saved", caption)
+
+    def test_card_is_brief_and_does_not_repeat_the_lark_card(self):
+        """
+        The whole selected path must not be duplicated in Telegram: only the
+        status and one compact identity line are kept.
+        """
+        calls, _ = self.confirm(self.saved())
+        caption = calls[0][0][2]
+
+        self.assertIn("robot · A42T C2 · 3490", caption)
+        # The verbose path/description still lives in the Lark card and journal.
+        self.assertNotIn("Lift reports an error", caption)
+        self.assertNotIn("Check and confirm", caption)
+        # Compact: a short status plus one identity line.
+        self.assertLessEqual(len(caption.splitlines()), 4)
+
+    def test_card_is_sent_into_the_same_topic(self):
+        calls, _ = self.confirm(self.saved())
+
+        # `edit_caption` receives the session, and it is the session that carries
+        # `thread_id` — the card cannot drift into another topic.
+        self.assertIs(calls[0][0][3].data["thread_id"], 318)
+
+    def test_card_reports_a_failed_save_plainly(self):
+        calls, _ = self.confirm({
+            "database_saved": False, "device_queued": False,
+            "lark_delivered": False, "glpc_saved": False, "glpc_error": None,
+        })
+        caption = calls[0][0][2]
+
+        self.assertIn("Error report not saved", caption)
+        self.assertIn("Journal entry not saved", caption)
+
+    def test_confirmation_does_not_keep_the_whole_path_summary(self):
+        calls, _ = self.confirm(self.saved())
+        caption = calls[0][0][2]
+
+        for label in ("Equipment type", "Component", "Device number"):
+            self.assertNotIn(label, caption)
+
+    def test_card_id_is_handed_to_the_journal_writer(self):
+        """`add_by` needs the card, and the lookup must not run twice."""
+        calls, send = self.confirm(self.saved())
+        report = send.call_args.args[0]
+
+        self.assertEqual(report["employee_card_id"], 60072001)
+        self.assertEqual(report["employee"], "Smoke User")
+
+    def test_unlinked_employee_does_not_block_the_report(self):
+        calls, send = self.confirm(
+            self.saved(), context=lambda _: (None, None)
+        )
+        report = send.call_args.args[0]
+
+        self.assertNotIn("employee_card_id", report)
+        self.assertIn("Error report saved", calls[0][0][2])
+
+    def test_unavailable_database_still_files_the_report(self):
+        def boom(_):
+            raise RuntimeError("db down")
+
+        calls, send = self.confirm(self.saved(), context=boom)
+
+        send.assert_called_once()
+        self.assertNotIn("employee_card_id", send.call_args.args[0])
+        self.assertIn("Error report saved", calls[0][0][2])
+
+    def test_a_card_without_an_identity_still_renders(self):
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        caption = flow.confirmation_card(Session(tree=DEFAULT_TREE), self.saved())
+
+        self.assertIn("Error report saved", caption)
 
 
 if __name__ == "__main__":

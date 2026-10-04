@@ -30,6 +30,7 @@ category as well.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -40,6 +41,19 @@ from warehouses import WAREHOUSES
 logger = logging.getLogger(__name__)
 
 GLPC_TABLE = "exceptions_glpc"
+
+# Columns that arrive with the intake-analytics migration. They may be missing
+# from the live table while the bot is already deployed, so the write must work
+# without them (see `write_exception`). A missing column is an expected state
+# during rollout, not a failure.
+OPTIONAL_COLUMNS = ("module", "device_number", "object_type", "report_id")
+
+# How long the "columns are missing" answer is remembered. Short TTL, same
+# reasoning as the intake editor's schema cache: after the migration is applied
+# the bot picks the columns up without a restart.
+_OPTIONAL_TTL_SECONDS = 120
+_optional_columns_state: Optional[bool] = None
+_optional_columns_checked_at: float = 0.0
 
 # Legacy constant kept for parity with every existing row: the API intake also
 # writes "C2" for both warehouses, and nothing in the bot reads this column.
@@ -244,8 +258,57 @@ def _report_id(result: Dict[str, Any], answers: Dict[str, Any]) -> str:
     return identifier(answers) or "report"
 
 
-def build_row(result: Dict[str, Any], warehouse: str) -> Dict[str, Any]:
-    """Map an intake result onto the legacy journal columns."""
+def _card_id(value):
+    """
+    `add_by` value for the journal, or None.
+
+    A whitespace-only card must not become a value that points nowhere, so the
+    text is trimmed like every other text field here. A numeric card passes
+    through unchanged — `employees.card_id` is not always a string.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        return value.strip() or None
+
+    return value
+
+
+def _optional_fields(
+    answers: Dict[str, Any], category: str, module: str, report_id: str
+) -> Dict[str, Any]:
+    """
+    Columns added by the intake-analytics migration.
+
+    Kept separate so `write_exception` can retry without them: the bot is
+    deployed before the migration is applied, and PostgREST answers 400 for an
+    unknown column. Those four columns must never cost the report itself.
+    """
+    device_number = str(answers.get("device_number") or "").strip()
+
+    return {
+        "module": module or None,
+        "device_number": device_number or None,
+        "object_type": category or None,
+        "report_id": report_id or None,
+    }
+
+
+def build_row(
+    result: Dict[str, Any], warehouse: str, include_optional: bool = True
+) -> Dict[str, Any]:
+    """
+    Map an intake result onto the legacy journal columns.
+
+    `include_optional=False` drops the analytics columns for a table that does
+    not have them yet; every other value stays identical, so a pending
+    migration can never lose a report.
+
+    `add_by`, `photo_url` and the analytics fields are read from `result`,
+    which `flow._confirm` fills while it already has the employee row at hand —
+    so the writer never issues a second lookup for data the caller knows.
+    """
     answers = result.get("answers") or {}
     category = intake_category(answers.get("object"))
     code = identifier(answers)
@@ -278,16 +341,28 @@ def build_row(result: Dict[str, Any], warehouse: str) -> Dict[str, Any]:
     if module:
         details.append(f"Module: {module}")
 
-    return {
+    # `add_by` is the employee's `card_id`, which the caller already resolved
+    # while looking the name up. It stays None when the account is not linked or
+    # the database is unavailable — the report must still be filed, exactly like
+    # `employee` does. A missing card is acceptable; an invented one is not.
+    card_id = _card_id(result.get("employee_card_id"))
+
+    row = {
         "error_robot": _robot_number(code),
-        "add_by": None,
+        "add_by": card_id,
         "device_type": device_type,
         "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",
-        "error_end_time": None,
+        # The table's convention is `error_end_time = error_start_time +
+        # solving_time`, verified against the whole live table. The intake flow
+        # has no issue template, so `solving_time` is 0 and the expected end is
+        # the start. Leaving it NULL would deviate from that convention rather
+        # than being an honest gap: the value is derived, not invented.
+        "error_end_time": received.isoformat(),
         "error_start_time": received.isoformat(),
         "first_column": category,
         "issue_description": "\n".join(details),
         "issue_type": category,
+        "photo_url": result.get("photo_url") or None,
         "recovery_title": None,
         "second_column": module or device_type,
         "solving_time": 0,
@@ -297,6 +372,81 @@ def build_row(result: Dict[str, Any], warehouse: str) -> Dict[str, Any]:
         "issue_data": shift_date,
         "issue_warehouse": ISSUE_WAREHOUSE,
     }
+
+    if include_optional:
+        row.update(_optional_fields(answers, category, module, report_id))
+
+    return row
+
+
+def _analytics_columns_available() -> bool:
+    """
+    Are the intake-analytics columns present yet?
+
+    Asked as a cheap, expected-to-fail single-row read, exactly like the intake
+    editor probes its v2 schema: the bot is deployed before the migration is
+    applied, so a missing column is a normal state and must not reach the logs as
+    ERROR on every report.
+
+    A `None` answer is ambiguous — the column may be missing, or the database may
+    be unreachable. The second case is told apart by one extra plain read, and it
+    is deliberately **not** cached: a network blip must not strip the analytics
+    columns from the next 120 seconds of reports. The happy path costs a single
+    request, and the answer is cached with a short TTL so a migration applied
+    while the bot runs is picked up without a restart.
+    """
+    global _optional_columns_state, _optional_columns_checked_at
+
+    if (
+        _optional_columns_state is not None
+        and time.time() - _optional_columns_checked_at < _OPTIONAL_TTL_SECONDS
+    ):
+        return _optional_columns_state
+
+    from sendToDataBase import rest_get
+
+    # `optional=True`: отсутствие колонок — ожидаемое состояние до миграции.
+    rows = rest_get(
+        GLPC_TABLE,
+        {"select": ",".join(OPTIONAL_COLUMNS), "limit": "1"},
+        optional=True,
+    )
+
+    if rows is None:
+        reachable = rest_get(GLPC_TABLE, {"select": "id", "limit": "1"}) is not None
+
+        if not reachable:
+            # База недоступна: это не «колонок нет», и запоминать это нельзя.
+            logger.warning(
+                "intake journal: could not check analytics columns in %s; "
+                "filing with the full row",
+                GLPC_TABLE,
+            )
+            return True
+
+        logger.warning(
+            "intake journal: %s has no analytics columns yet (%s) — filing "
+            "reports without them",
+            GLPC_TABLE,
+            ", ".join(OPTIONAL_COLUMNS),
+        )
+        _optional_columns_state = False
+        _optional_columns_checked_at = time.time()
+
+        return False
+
+    _optional_columns_state = True
+    _optional_columns_checked_at = time.time()
+
+    return True
+
+
+def reset_schema_cache() -> None:
+    """Сброс памяти о колонках — только для тестов."""
+    global _optional_columns_state, _optional_columns_checked_at
+
+    _optional_columns_state = None
+    _optional_columns_checked_at = 0.0
 
 
 def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> bool:
@@ -308,13 +458,42 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
 
     Raises `WarehouseError` when the warehouse is unknown, so a mis-routed topic
     can never be filed under the default warehouse.
+
+    Rollout safety: the analytics columns (`module`, `device_number`,
+    `object_type`, `report_id`) arrive with a migration that may lag the deploy,
+    and PostgREST rejects a whole insert when one of them is unknown. Their
+    presence is checked up front (see `_analytics_columns_available`), so the
+    report is written once, with whatever columns actually exist, and the
+    expected pre-migration state never reaches the logs as an error.
     """
     title = validate_warehouse(warehouse if warehouse is not None else result.get("warehouse"))
-    row = build_row(result, title)
+    include_optional = _analytics_columns_available()
 
     from sendToDataBase import rest_post
 
-    saved = rest_post(GLPC_TABLE, row, ignore_conflict=True)
+    saved = rest_post(
+        GLPC_TABLE,
+        build_row(result, title, include_optional=include_optional),
+        ignore_conflict=True,
+    )
+
+    if saved is None and include_optional:
+        # The probe just succeeded, so the database is reachable and the insert
+        # was most likely rejected over a column. Retrying without the analytics
+        # fields is cheap insurance against losing the report; the negative
+        # answer is remembered so the next reports skip the probe.
+        logger.warning(
+            "Write to %s failed with the analytics columns; retrying without them",
+            GLPC_TABLE,
+        )
+        _optional_columns_state = False
+        _optional_columns_checked_at = time.time()
+
+        saved = rest_post(
+            GLPC_TABLE,
+            build_row(result, title, include_optional=False),
+            ignore_conflict=True,
+        )
 
     if saved is None:
         logger.error("Could not write report to %s: warehouse=%s", GLPC_TABLE, title)

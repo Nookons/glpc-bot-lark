@@ -468,6 +468,96 @@ def _redraw(chat_id, session: Session, message_id) -> None:
     render(session, chat_id, message_id, edit=True)
 
 
+def _employee_context(telegram_id):
+    """
+    (имя из привязки, строка сотрудника) за один проход.
+
+    `get_employee_context` читает обе таблицы по одному разу. Если модуль
+    подменён (тесты) и такого помощника в нём нет, откатываемся на имя: без
+    card_id отчёт всё равно сохраняется.
+    """
+    import telegram_store
+
+    context = getattr(telegram_store, "get_employee_context", None)
+
+    if context is None:
+        return telegram_store.get_employee_name(telegram_id), None
+
+    return context(telegram_id)
+
+
+def save_status_text(delivery: Dict[str, Any]) -> str:
+    """
+    Status sentences about what happened to the report, in plain words.
+
+    A refused warehouse is reported first and in plain words: the operator has
+    to know the report was not filed, and why. Everything else is status.
+    """
+    if delivery.get("glpc_error"):
+        status = f"⚠️ Not filed in the journal: {delivery['glpc_error']}"
+    elif delivery.get("glpc_saved"):
+        status = "Journal entry saved."
+    else:
+        status = "Journal entry not saved; check bot logs."
+
+    if delivery.get("database_saved"):
+        status += " Details saved to Supabase."
+    else:
+        status += " Details save failed."
+    if delivery.get("lark_delivered"):
+        status += " Lark card sent."
+    else:
+        status += " Lark card was not delivered; check LARK_HOOK_ERROR settings."
+    if delivery.get("device_queued"):
+        status += " Device added to the add queue."
+
+    return status
+
+
+def _card_identity(session: Session) -> str:
+    """
+    One compact line: what was reported, and its number when there is one.
+
+    The Telegram card is deliberately brief — the full path already goes to the
+    Lark group and to the journal. This line keeps the two facts an operator
+    rereads in the chat ("what", "which one") without duplicating the card.
+    """
+    from .report_writer import identifier, intake_category
+
+    answers = session.answers()
+    category = intake_category(answers.get("object"))
+    label = str(answers.get("device_type") or "").strip()
+    number = identifier(answers)
+
+    parts = [part for part in (category, label, number) if part]
+
+    return " · ".join(parts)
+
+
+def confirmation_card(session: Session, delivery: Dict[str, Any]) -> str:
+    """
+    Краткая карточка-подтверждение, остающаяся в Telegram.
+
+    Она заменяет сообщение с деревом (сообщение сотрудника удаляется при
+    старте), поэтому путь целиком здесь не повторяется: сотрудника интересует
+    «сохранилось или нет» и что именно он отправил. Полная сводка уходит в
+    Lark-группу и в журнал.
+    """
+    lines = [
+        "✅ Error report saved" if delivery.get("glpc_saved")
+        else "⚠️ Error report not saved",
+        save_status_text(delivery),
+    ]
+
+    identity = _card_identity(session)
+
+    if identity:
+        lines.append("")
+        lines.append(identity)
+
+    return "\n".join(lines)
+
+
 def _confirm(chat_id, sender, session: Session, message_id) -> None:
     """
     Confirm: сохраняем сырые данные в Supabase и независимо отправляем
@@ -487,13 +577,22 @@ def _confirm(chat_id, sender, session: Session, message_id) -> None:
     result["message_id"] = session.data.get("message_id")
     result["chat_id"] = chat_id
 
-    # Имя сотрудника подтягиваем мягко: база может быть недоступна, и
-    # тогда отчёт всё равно должен сохраниться.
+    # Имя и card_id берём одним проходом: база может быть недоступна, и тогда
+    # отчёт всё равно должен сохраниться — как раньше вёл себя только `employee`.
+    # `get_employee_context` читает каждую таблицу один раз, поэтому `add_by`
+    # не стоит второго запроса в базу.
     try:
-        from telegram_store import get_employee_name
+        employee_name, employee = _employee_context(sender.get("id"))
+        result["employee"] = employee_name or ""
 
-        result["employee"] = get_employee_name(sender.get("id")) or ""
+        card_id = (employee or {}).get("card_id")
+
+        if card_id not in ("", None):
+            result["employee_card_id"] = card_id
     except Exception:
+        logger.exception(
+            "equipment intake: не удалось получить имя/card_id сотрудника"
+        )
         result["employee"] = ""
 
     # Delivery to Lark is attempted independently from Supabase persistence.
@@ -515,29 +614,9 @@ def _confirm(chat_id, sender, session: Session, message_id) -> None:
 
     drop_session(chat_id, sender.get("id"))
 
-    # A refused warehouse is reported first and in plain words: the operator has
-    # to know the report was not filed, and why. Everything else is status.
-    if delivery.get("glpc_error"):
-        status = f"⚠️ Not filed in the journal: {delivery['glpc_error']}"
-    elif delivery.get("glpc_saved"):
-        status = "Journal entry saved."
-    else:
-        status = "Journal entry not saved; check bot logs."
-
-    if delivery.get("database_saved"):
-        status += " Details saved to Supabase."
-    else:
-        status += " Details save failed."
-    if delivery.get("lark_delivered"):
-        status += " Lark card sent."
-    else:
-        status += " Lark card was not delivered; check LARK_HOOK_ERROR settings."
-    if delivery.get("device_queued"):
-        status += " Device added to the add queue."
-
-    text = status + "\n\n"
-    text += summary_caption(session)
-
-    edit_caption(chat_id, message_id, text, session, reply_markup=None)
+    # A short card stays in the topic: the employee's own message was deleted at
+    # the start of the flow, and the status-only text says whether the report was
+    # filed and what it was about.
+    edit_caption(chat_id, message_id, confirmation_card(session, delivery), session, reply_markup=None)
 
     logger.info("Equipment intake confirmed; integration results=%s", json.dumps(delivery, ensure_ascii=False))

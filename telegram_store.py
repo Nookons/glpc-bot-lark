@@ -82,17 +82,22 @@ def get_employee_name(telegram_id: int, strict: bool = False):
     return link.get("employee_name")
 
 
-def get_employee(telegram_id: int, strict: bool = False):
+def get_employee_context(telegram_id: int, strict: bool = False):
     """
-    Строка сотрудника из employees для привязанного Telegram-аккаунта.
+    (имя из привязки, строка сотрудника из employees) за один проход.
 
-    Нужна там, где недостаточно имени: например, для card_id при смене
-    статуса робота (add_by / updated_by).
+    Нужно там, где нужны оба значения сразу — например, приём оборудования
+    пишет в журнал и имя, и card_id (`add_by`). Отдельные `get_employee_name`
+    и `get_employee` сходили бы в telegram_users дважды: `get_employee` сам
+    начинается с `get_employee_name`. Здесь каждая таблица читается один раз.
+
+    Сбой чтения — это НЕ «не привязан»: при strict=True бросает
+    StoreUnavailable. Иначе возвращает (имя | None, None).
     """
     employee_name = get_employee_name(telegram_id, strict=strict)
 
     if not employee_name:
-        return None
+        return employee_name, None
 
     rows = rest_get(
         "employees",
@@ -109,16 +114,26 @@ def get_employee(telegram_id: int, strict: bool = False):
         if strict:
             raise StoreUnavailable("employees read failed")
 
-        return None
+        return employee_name, None
 
     if not rows:
         logger.warning(
             "Сотрудник %r есть в telegram_users, но не найден в employees",
             employee_name,
         )
-        return None
+        return employee_name, None
 
-    return rows[0]
+    return employee_name, rows[0]
+
+
+def get_employee(telegram_id: int, strict: bool = False):
+    """
+    Строка сотрудника из employees для привязанного Telegram-аккаунта.
+
+    Нужна там, где недостаточно имени: например, для card_id при смене
+    статуса робота (add_by / updated_by).
+    """
+    return get_employee_context(telegram_id, strict=strict)[1]
 
 
 def link_user(telegram_id: int, username, employee_name: str) -> bool:

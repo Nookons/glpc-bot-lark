@@ -181,6 +181,12 @@ def persist_and_send(result: Dict[str, Any], image_path: str) -> dict:
     try:
         from .report_writer import write_exception
 
+        # The photo was already uploaded for the Lark card; the same URL is the
+        # journal's `photo_url`. `_save` returns None when the upload failed, and
+        # then the column simply stays empty — the report is still filed.
+        if photo_url:
+            result["photo_url"] = photo_url
+
         glpc_saved = write_exception(result, warehouse)
     except Exception:
         logger.exception("Equipment intake journal write failed")
