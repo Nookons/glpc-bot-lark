@@ -7509,6 +7509,89 @@ def test_menu_on_any_photo_and_caption_kept():
             store.clear()
 
 
+def test_expected_telegram_errors_are_not_logged_as_errors():
+    """Ожидаемые ответы Telegram не пишутся как ERROR.
+
+    Найдено по логам **живого прода**: на повторное нажатие той же кнопки
+    Telegram отвечает `400 message is not modified`, и `_post_call` писал это
+    как ERROR. За 2 минуты набралось 3 «ошибки» при полном отсутствии сбоя —
+    настоящие проблемы в них терялись. Проверяю по уровню записи, а не по
+    тексту: так тест не зависит от формулировок.
+    """
+    import logging
+    import types
+
+    import telegram_api as api
+
+    records = []
+
+    class Handler(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelname, record.getMessage()))
+
+    handler = Handler()
+    handler.setLevel(logging.DEBUG)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    class Response:
+        status_code = 400
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    saved_requests = api.requests
+    saved_token = api.TELEGRAM_BOT_TOKEN
+
+    try:
+        # Токен нужен, иначе `call` выходит раньше проверки ответа.
+        api.TELEGRAM_BOT_TOKEN = "123:TEST"
+
+        def respond(description, code=400, method="editMessageText"):
+            api.requests = types.SimpleNamespace(
+                post=lambda *a, **k: Response(
+                    {"ok": False, "error_code": code, "description": description}
+                )
+            )
+            api._post_call(method, {}, 15)
+
+        records.clear()
+        respond(
+            "Bad Request: message is not modified: specified new message "
+            "content and reply markup are exactly the same"
+        )
+        check(
+            "ожидаемое «message is not modified» не пишется как ERROR",
+            not [r for r in records if r[0] == "ERROR"],
+            records,
+        )
+
+        records.clear()
+        respond("Bad Request: chat not found")
+        check(
+            "настоящая ошибка Telegram по-прежнему ERROR",
+            len([r for r in records if r[0] == "ERROR"]) == 1,
+            records,
+        )
+
+        records.clear()
+        respond("Conflict: terminated by other getUpdates request", 409, "getUpdates")
+        check(
+            "409 при getUpdates — предупреждение, а не ERROR",
+            not [r for r in records if r[0] == "ERROR"]
+            and [r for r in records if r[0] == "WARNING"],
+            records,
+        )
+    finally:
+        api.requests = saved_requests
+        api.TELEGRAM_BOT_TOKEN = saved_token
+        root.removeHandler(handler)
+
+
 def test_error_menu_photo_flow():
     """Фото → меню с кнопками → тип → номер → запись с фото."""
     # These tests cover the legacy fallback when the guided intake cannot start.
@@ -7779,6 +7862,7 @@ def main():
         test_menu_card_includes_module,
         test_menu_on_any_photo_and_caption_kept,
         test_error_menu_photo_flow,
+        test_expected_telegram_errors_are_not_logged_as_errors,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

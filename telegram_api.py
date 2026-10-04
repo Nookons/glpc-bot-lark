@@ -198,20 +198,35 @@ def _post_call(method: str, payload: dict, timeout: int):
 
         retry_after = (data.get("parameters") or {}).get("retry_after")
 
+        description = str(data.get("description") or "")
+
         if data.get("error_code") == 409 and method == "getUpdates":
             # Второй опрашивающий (например, во время выкатки) — это
             # ожидаемая ситуация, а не сбой.
             logger.warning(
                 "Telegram %s: %s",
                 method,
-                data.get("description"),
+                description,
+            )
+        elif "message is not modified" in description:
+            # Telegram отвечает так, когда содержимое и кнопки совпадают с
+            # текущими. Для многоуровневых меню это норма: экран перерисовывается
+            # на каждом нажатии, и повторное нажатие той же кнопки даёт
+            # идентичный экран. Раньше это писалось как ERROR и засоряло логи
+            # (на живом проде дало 3 «ошибки» за 2 минуты, хотя сбоя не было);
+            # настоящие сбои в них терялись. Уровень — DEBUG: перерисовка
+            # ожидаема, а видеть её при разборе всё равно полезно.
+            logger.debug(
+                "Telegram %s: %s",
+                method,
+                description,
             )
         else:
             logger.error(
                 "Telegram %s error: code=%s description=%s",
                 method,
                 data.get("error_code"),
-                data.get("description"),
+                description,
             )
 
         if retry_after and attempt < _MAX_FLOOD_RETRIES:
