@@ -841,6 +841,16 @@ def update_node(
     if target and target not in base.nodes:
         return False
 
+    # Непереданный `hidden` означает «не трогать», а не «показать». Раньше здесь
+    # стояло `False`, и правка заголовка молча возвращала скрытый узел в дерево:
+    # редактор правит заголовок, не передавая `hidden` (`editor.py`). У вариантов
+    # (`update_option`) такое же правило работало с самого начала — здесь оно
+    # было упущено.
+    current_hidden = False
+    override = node_overrides().get(node_id)
+    if override is not None:
+        current_hidden = _row_hidden(override)
+
     row: Dict[str, Any] = {
         "node_id": node_id,
         "title": None if title is _UNSET else (_clean(title, MAX_TITLE_LENGTH) or None),
@@ -848,7 +858,7 @@ def update_node(
         "placeholder": None if placeholder is _UNSET else _clean(placeholder, MAX_DESCRIPTION_LENGTH),
         "stub_hint": None if stub_hint is _UNSET else _clean(stub_hint, MAX_DESCRIPTION_LENGTH),
         "next_node": target,
-        "hidden": False if hidden is _UNSET else bool(hidden),
+        "hidden": current_hidden if hidden is _UNSET else bool(hidden),
     }
 
     if updated_by is not None:

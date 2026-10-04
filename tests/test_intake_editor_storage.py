@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""Тесты слоя хранения редактора дерева (`equipment_intake/storage.py`).
+
+Зачем отдельный файл. Полный режим редактора (`update_option`,
+`set_option_hidden`, `delete_option`, `move_option`, `update_node`) появился в
+коммите `dbba8bc` — это ~2200 строк, — но живого покрытия у него не было:
+`sql/intake_editor_v2.sql` к базе не применялась, поэтому в проде он выключен,
+а тесты задевали только ветку «база не готова». Здесь функции проверяются
+напрямую с базой в памяти.
+
+База подменяется тремя функциями `sendToDataBase`, которые storage импортирует
+лениво внутри вызовов: `rest_get`, `rest_upsert`, `rest_delete`.
+"""
+from __future__ import annotations
+
+import sys
+import types
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import equipment_intake.storage as storage  # noqa: E402
+from equipment_intake.tree_config import DEFAULT_TREE  # noqa: E402
+
+
+class FakeDB:
+    """Таблицы в памяти: строки options и nodes по ключу."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, list[dict]] = {}
+
+    # --- sendToDataBase API, которым пользуется storage ---
+    def rest_get(self, table, params=None):
+        params = params or {}
+        out = list(self.rows.get(table, []))
+        for key, value in params.items():
+            if key in ("select", "order", "limit", "offset"):
+                continue
+            if isinstance(value, str) and value.startswith("eq."):
+                want = value[3:]
+                out = [r for r in out if str(r.get(key)) == want]
+        return out
+
+    def rest_upsert(self, table, payload, on_conflict):
+        rows = self.rows.setdefault(table, [])
+        keys = [k.strip() for k in on_conflict.split(",")]
+        for row in rows:
+            if all(str(row.get(k)) == str(payload.get(k)) for k in keys):
+                row.update(payload)
+                break
+        else:
+            rows.append(dict(payload))
+        return [payload]
+
+    def rest_delete(self, table, params=None):
+        params = params or {}
+        rows = self.rows.setdefault(table, [])
+        keep = []
+        removed = 0
+        for row in rows:
+            match = True
+            for key, value in params.items():
+                if isinstance(value, str) and value.startswith("eq."):
+                    if str(row.get(key)) != value[3:]:
+                        match = False
+                elif row.get(key) != value:
+                    match = False
+            if match:
+                removed += 1
+            else:
+                keep.append(row)
+        self.rows[table] = keep
+        return bool(removed)
+
+
+def _install(db: FakeDB) -> None:
+    module = types.ModuleType("sendToDataBase")
+    module.rest_get = db.rest_get
+    module.rest_upsert = db.rest_upsert
+    module.rest_delete = db.rest_delete
+    def _post(table, payload, **kwargs):
+        # add_option пишет через rest_post: заглушка должна реально сохранять,
+        # иначе тесты «проходят» на пустой базе и ничего не проверяют.
+        db.rows.setdefault(table, []).append(dict(payload))
+        return [payload]
+
+    module.rest_post = _post
+    sys.modules["sendToDataBase"] = module
+    # storage проверяет готовность базы чтением колонки is_builtin
+    storage.reset_capability_cache()
+    storage._v2_state = True
+    storage._v2_checked_at = float("inf")
+
+
+class EditorStorageTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.db = FakeDB()
+        _install(self.db)
+        self.addCleanup(storage.reset_capability_cache)
+
+    def _node_with_options(self):
+        for node in DEFAULT_TREE.nodes.values():
+            if node.options and node.id != DEFAULT_TREE.root_id:
+                return node
+        self.fail("в дереве нет узла с вариантами")
+
+    # ---------- правка ВСТРОЕННОГО варианта ----------
+
+    def test_edit_builtin_creates_override_not_new_row(self):
+        node = self._node_with_options()
+        option = node.options[0]
+
+        ok = storage.update_option(node.id, option.id, label="Renamed", updated_by=7)
+
+        self.assertTrue(ok)
+        rows = self.db.rows["telegram_intake_options"]
+        self.assertEqual(len(rows), 1, "правка встроенного должна дать одну строку-переопределение")
+        self.assertEqual(rows[0]["option_id"], option.id)
+        self.assertTrue(rows[0]["is_builtin"])
+        self.assertEqual(rows[0]["label"], "Renamed")
+
+    def test_effective_options_reflect_the_edit(self):
+        node = self._node_with_options()
+        option = node.options[0]
+        storage.update_option(node.id, option.id, label="Renamed")
+
+        items = storage.effective_options(DEFAULT_TREE, node.id, self.db.rows["telegram_intake_options"])
+
+        got = next(i for i in items if i["id"] == option.id)
+        self.assertEqual(got["label"], "Renamed")
+        self.assertEqual(got["kind"], "edited")
+
+    def test_edit_keeps_hidden_state(self):
+        """Правка подписи не должна показывать скрытый вариант.
+
+        `update_option` сохраняет текущее `hidden`, когда аргумент не передан —
+        проверяем именно это, потому что рядом `update_node` так не делает
+        (см. `test_update_node_does_not_reset_hidden`).
+        """
+        node = self._node_with_options()
+        option = node.options[0]
+        storage.set_option_hidden(node.id, option.id, True)
+
+        storage.update_option(node.id, option.id, label="Renamed")
+
+        rows = self.db.rows["telegram_intake_options"]
+        row = next(r for r in rows if r["option_id"] == option.id)
+        self.assertTrue(row["hidden"], "hidden сброшен правкой подписи")
+
+    def test_edit_rejects_unknown_next_node(self):
+        node = self._node_with_options()
+        option = node.options[0]
+
+        ok = storage.update_option(node.id, option.id, next_node="no_such_node")
+
+        self.assertFalse(ok)
+
+    def test_edit_rejects_empty_label(self):
+        node = self._node_with_options()
+        option = node.options[0]
+
+        self.assertFalse(storage.update_option(node.id, option.id, label="   "))
+
+    def test_edit_unknown_option_is_refused(self):
+        node = self._node_with_options()
+
+        self.assertFalse(storage.update_option(node.id, "no_such_option", label="X"))
+
+    # ---------- порядок ----------
+
+    def test_move_option_swaps_order(self):
+        node = next(
+            (n for n in DEFAULT_TREE.nodes.values() if len(n.options) >= 2),
+            None,
+        )
+        if node is None:
+            self.skipTest("нет узла с двумя вариантами")
+        first, second = node.options[0].id, node.options[1].id
+
+        ok = storage.move_option(node.id, second, "up")
+
+        self.assertTrue(ok)
+        items = storage.effective_options(DEFAULT_TREE, node.id, self.db.rows["telegram_intake_options"])
+        order = [i["id"] for i in items]
+        self.assertLess(order.index(second), order.index(first), "порядок не изменился")
+
+    def test_move_option_beyond_edge_is_refused(self):
+        node = self._node_with_options()
+        self.assertFalse(storage.move_option(node.id, node.options[0].id, "up"))
+
+    def test_move_option_rejects_bad_direction(self):
+        node = self._node_with_options()
+        self.assertFalse(storage.move_option(node.id, node.options[0].id, "sideways"))
+
+    # ---------- удаление ----------
+
+    def test_delete_removes_added_option(self):
+        node = self._node_with_options()
+        option_id = storage.add_option(node.id, "Added by test")
+        self.assertTrue(option_id)
+
+        self.assertTrue(storage.delete_option(node.id, option_id))
+        rows = self.db.rows["telegram_intake_options"]
+        self.assertFalse(any(r["option_id"] == option_id for r in rows))
+
+    # ---------- узлы ----------
+
+    def test_update_node_changes_title(self):
+        node = self._node_with_options()
+
+        ok = storage.update_node(node.id, title="New title", updated_by=1)
+
+        self.assertTrue(ok)
+        rows = self.db.rows["telegram_intake_nodes"]
+        self.assertEqual(rows[0]["title"], "New title")
+
+    def test_update_node_does_not_reset_hidden(self):
+        """Скрытый узел не должен «показаться» от правки заголовка.
+
+        Здесь ловится реальный дефект: `update_node` при непереданном `hidden`
+        писал `false`, тогда как `update_option` в той же ситуации сохраняет
+        текущее значение. Редактор правит заголовок без `hidden`
+        (`editor.py`), поэтому скрытый узел молча становился видимым.
+        """
+        node = self._node_with_options()
+        self.assertTrue(storage.update_node(node.id, hidden=True))
+        rows = self.db.rows["telegram_intake_nodes"]
+        self.assertTrue(next(r for r in rows if r["node_id"] == node.id)["hidden"])
+
+        storage.update_node(node.id, title="Renamed")
+
+        row = next(r for r in rows if r["node_id"] == node.id)
+        self.assertTrue(row["hidden"], "правка заголовка сбросила hidden — узел снова виден")
+
+    def test_update_node_refuses_to_hide_root(self):
+        self.assertFalse(storage.update_node(DEFAULT_TREE.root_id, hidden=True))
+
+    def test_update_node_refuses_unknown_node(self):
+        self.assertFalse(storage.update_node("no_such_node", title="X"))
+
+    # ---------- выключенный полный режим ----------
+
+    def test_full_edit_is_refused_when_migration_not_applied(self):
+        """Без `sql/intake_editor_v2.sql` правки запрещены, а не «тихо сохранены»."""
+        storage._v2_state = False
+        node = self._node_with_options()
+
+        self.assertFalse(storage.update_option(node.id, node.options[0].id, label="X"))
+        self.assertFalse(storage.move_option(node.id, node.options[0].id, "down"))
+        self.assertFalse(storage.update_node(node.id, title="X"))
+        self.assertEqual(self.db.rows.get("telegram_intake_options", []), [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
