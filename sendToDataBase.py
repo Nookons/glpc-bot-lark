@@ -143,10 +143,15 @@ def _json_or_none(response, table: str, action: str):
         return None
 
 
-def _rest_get(table: str, params: dict = None):
+def _rest_get(table: str, params: dict = None, optional: bool = False):
     """
     GET /rest/v1/<table>. Возвращает JSON (список или объект)
     либо None при ошибке.
+
+    `optional=True` — запрос, отсутствие которого ожидаемо: например проверка,
+    есть ли в таблице колонки новой версии. Тогда ошибка не пишется в лог как
+    ERROR (иначе живой бот без применённой миграции засоряет логи ожидаемыми
+    сообщениями, и настоящие проблемы в них не видно). Возврат тот же — None.
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
@@ -163,7 +168,10 @@ def _rest_get(table: str, params: dict = None):
         return _json_or_none(response, table, "GET")
 
     except requests.exceptions.RequestException as e:
-        logger.error("GET %s failed: %s", table, e)
+        if optional:
+            logger.debug("GET %s (ожидаемо недоступно): %s", table, e)
+        else:
+            logger.error("GET %s failed: %s", table, e)
         return None
 
 
@@ -222,9 +230,12 @@ def _rest_post(table: str, payload: dict, ignore_conflict: bool = False):
         return None
 
 
-def rest_get(table: str, params: dict = None):
-    """Публичный доступ к GET /rest/v1/<table> (для других модулей)."""
-    return _rest_get(table, params)
+def rest_get(table: str, params: dict = None, optional: bool = False):
+    """Публичный доступ к GET /rest/v1/<table> (для других модулей).
+
+    `optional=True` — ожидаемый промах: не логируется как ERROR.
+    """
+    return _rest_get(table, params, optional=optional)
 
 
 def rest_get_all(table: str, params: dict = None, page: int = 1000, max_pages: int = 10):

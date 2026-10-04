@@ -103,9 +103,12 @@ def _read_options() -> Optional[List[dict]]:
     # Если уже знаем, что v2-колонок нет, идём сразу к v1: иначе каждый вызов
     # даёт ожидаемую ошибку 400 в логе.
     if not _v2_known_unsupported():
+        # `optional=True`: отсутствие колонок v2 — ожидаемое состояние, пока
+        # миграция не применена. Иначе каждый прогон проверки даёт ERROR.
         rows = rest_get(
             OPTION_TABLE,
             {"select": _COLUMNS_V2, "order": "node_id.asc,sort_order.asc,id.asc"},
+            optional=True,
         )
 
         if rows is not None:
@@ -148,7 +151,10 @@ def load_node_rows() -> Optional[List[dict]]:
 
     from sendToDataBase import rest_get
 
-    rows = rest_get(NODE_TABLE, {"select": _NODE_COLUMNS, "order": "id.asc"})
+    # `optional=True`: таблица появляется вместе с миграцией; до неё 404 — норма.
+    rows = rest_get(
+        NODE_TABLE, {"select": _NODE_COLUMNS, "order": "id.asc"}, optional=True
+    )
 
     if rows is None:
         # Таблицы нет — значит и миграции v2 нет: отметить это, чтобы не

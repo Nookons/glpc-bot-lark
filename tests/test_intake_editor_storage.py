@@ -31,7 +31,7 @@ class FakeDB:
         self.rows: dict[str, list[dict]] = {}
 
     # --- sendToDataBase API, которым пользуется storage ---
-    def rest_get(self, table, params=None):
+    def rest_get(self, table, params=None, optional=False):
         params = params or {}
         out = list(self.rows.get(table, []))
         for key, value in params.items():
@@ -296,7 +296,7 @@ class EditorStorageTestCase(unittest.TestCase):
         probes = {"v2": 0, "v1": 0}
         module = types.ModuleType("sendToDataBase")
 
-        def rest_get(table, params=None):
+        def rest_get(table, params=None, optional=False):
             if table == storage.OPTION_TABLE:
                 if "is_builtin" in (params or {}).get("select", ""):
                     probes["v2"] += 1
@@ -326,7 +326,7 @@ class EditorStorageTestCase(unittest.TestCase):
         queries = {"nodes": 0}
         module = types.ModuleType("sendToDataBase")
 
-        def rest_get(table, params=None):
+        def rest_get(table, params=None, optional=False):
             if table == storage.NODE_TABLE:
                 queries["nodes"] += 1
             return None
