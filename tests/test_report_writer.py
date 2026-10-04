@@ -984,8 +984,11 @@ class CategoryChecks(unittest.TestCase):
             "Workstation": "workstation",
             "Charging station": "charging",
             "Charger": "charging",
-            "QR Code": "qr",
-            "QR": "qr",
+            # `qr_code`, а не `qr`: так называется категория в колонке
+            # `object_type` (комментарий в схеме) и так её канонизирует API.
+            # Прежнее ожидание `qr` фиксировало расхождение, а не правило.
+            "QR Code": "qr_code",
+            "QR": "qr_code",
         }
 
         for label, expected in cases.items():
@@ -1000,7 +1003,7 @@ class CategoryChecks(unittest.TestCase):
         self.assertEqual(rw.intake_category("Conveyor"), "conveyor")
 
     def test_category_reaches_first_and_second_column(self):
-        for label, expected in (("Robot", "robot"), ("QR Code", "qr")):
+        for label, expected in (("Robot", "robot"), ("QR Code", "qr_code")):
             with self.subTest(label=label):
                 data = result()
                 data["answers"]["object"] = label

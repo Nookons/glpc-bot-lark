@@ -97,14 +97,27 @@ def validate_warehouse(warehouse: Optional[str]) -> str:
 
 
 def intake_category(value: str) -> str:
-    """Operator's answer -> canonical category key."""
+    """
+    Ответ оператора → канонический ключ категории.
+
+    **`qr` → `qr_code`.** Дерево отдаёт `qr`, а колонка `object_type` и
+    справочник `equipment.category` используют `qr_code`. Раньше здесь
+    возвращалось `qr`, и одно понятие получало **два написания** в зависимости от
+    того, каким путём пришёл отчёт: через API (`telegram_reports.py`
+    канонизирует `qr` → `qr_code`) или напрямую из бота. Собственный комментарий
+    API называет это недопустимым, и он прав: группировка по категориям
+    разделила бы «qr» и «qr_code» на две строки.
+
+    Проверено по живой базе: словарь `equipment.category` —
+    `charging` / `qr_code` / `robot` / `workstation`, значения `qr` там нет.
+    """
     return {
         "robot": "robot",
         "workstation": "workstation",
         "charging station": "charging",
         "charger": "charging",
-        "qr code": "qr",
-        "qr": "qr",
+        "qr code": "qr_code",
+        "qr": "qr_code",
     }.get(str(value or "").strip().casefold(), str(value or "").strip().casefold())
 
 

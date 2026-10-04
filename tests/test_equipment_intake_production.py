@@ -623,5 +623,52 @@ class DeviceNumberShapeChecks(unittest.TestCase):
         self.assertIn(integrations.QUEUE, posted, "заявка не создана")
 
 
+class CategoryVocabularyChecks(unittest.TestCase):
+    """Категория из дерева должна совпадать со словарём справочника.
+
+    Дерево кладёт в `answers.object` **подпись** варианта, а не id: для зарядной
+    станции это `Charging station` (`tree_config.py`). Бот превращает её в
+    значение колонки `object_type`, и оно обязано быть из того же словаря, что
+    `equipment.category`, иначе группировка по категориям разделит одно понятие
+    на две строки.
+
+    Найдено на живой базе: словарь там
+    `charging` / `qr_code` / `robot` / `workstation` — значения `qr` и
+    `charging station` отсутствуют, а бот их писал.
+    """
+
+    #: Словарь из данных (`select distinct category from equipment`).
+    DATABASE_VOCABULARY = {"robot", "workstation", "charging", "qr_code"}
+
+    #: Подписи, которые реально отдаёт дерево.
+    TREE_LABELS = ("Robot", "Workstation", "Charging station", "QR Code")
+
+    def test_every_tree_label_maps_into_the_database_vocabulary(self):
+        for label in self.TREE_LABELS:
+            value = report_writer.intake_category(label)
+
+            self.assertIn(
+                value,
+                self.DATABASE_VOCABULARY,
+                f"{label!r} → {value!r}, а в справочнике только "
+                f"{sorted(self.DATABASE_VOCABULARY)}",
+            )
+
+    def test_qr_is_written_as_qr_code(self):
+        """`qr` и `qr_code` — одно понятие; в колонке должно быть одно написание.
+
+        API канонизирует `qr` → `qr_code`, и его комментарий называет два
+        написания одной сущности недопустимыми. Бот писал `qr` напрямую, минуя
+        API, — то есть расхождение было реальным.
+        """
+        for label in ("QR Code", "qr", "qr code", "qr_code"):
+            self.assertEqual(report_writer.intake_category(label), "qr_code")
+
+    def test_charging_station_label_maps_to_charging(self):
+        self.assertEqual(
+            report_writer.intake_category("Charging station"), "charging"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
