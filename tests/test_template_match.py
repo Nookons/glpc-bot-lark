@@ -73,6 +73,48 @@ class OperatorTextChecks(unittest.TestCase):
     def test_trailing_dot_is_dropped(self):
         self.assertEqual(tm.operator_text("unable to drive."), "unable to drive")
 
+    def test_robot_number_at_the_end_is_dropped(self):
+        """Операторы часто дописывают номер робота: «… exception. 3563».
+
+        Номер — не часть описания, но `token_set_ratio` считает его лишним словом
+        и роняет счёт со 100 до 80, ниже порога. Замерено на живых данных:
+        снятие номера поднимает покрытие строк бота с 63 % до 80 % при
+        неизменной точности эталона.
+        """
+        self.assertEqual(
+            tm.operator_text("EX: 驱动组件异常 Driver component exception. 3563"),
+            "驱动组件异常 Driver component exception",
+        )
+        self.assertEqual(tm.operator_text("unable to rotate 3670"), "unable to rotate")
+
+    def test_long_number_is_not_treated_as_a_robot_number(self):
+        """Номер робота четырёхзначный; длинное число — часть описания.
+
+        Срезать всё подряд значило бы испортить текст, поэтому ограничение в
+        1–6 цифр, и оно проверяется явно.
+        """
+        # 7 цифр — не номер робота, остаётся как есть.
+        self.assertEqual(
+            tm.operator_text("error 1234567"),
+            "error 1234567",
+        )
+
+    def test_number_inside_text_is_kept(self):
+        """Номер в середине, а не в хвосте, не трогаем."""
+        self.assertEqual(
+            tm.operator_text("robot 3452 went off track"),
+            "robot 3452 went off track",
+        )
+
+    def test_text_finds_template_after_number_is_dropped(self):
+        """Главное следствие: такой текст теперь распознаётся."""
+        found = tm.match_template(
+            "EX: 驱动组件异常 Driver component exception. 3563", TEMPLATES
+        )
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["issue_type"], "Unable to drive")
+
 
 class MatchChecks(unittest.TestCase):
     """Найден шаблон или честный отказ."""
