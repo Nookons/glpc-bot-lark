@@ -56,10 +56,24 @@ _OPTIONAL_TTL_SECONDS = 120
 _optional_columns_state: Optional[bool] = None
 _optional_columns_checked_at: float = 0.0
 
-# Legacy constant kept for parity with every existing row: the API intake also
-# writes "C2" for both warehouses, and nothing in the bot reads this column.
-# Changing it is a separate decision (integration plan, question 8.2).
-ISSUE_WAREHOUSE = "C2"
+#: Зона по умолчанию — для складов, у которых разбиения на зоны нет.
+#:
+#: **Раньше это была единственная зона для всех складов**, и получалось, что у
+#: SMALL-P3 в колонке стоял `C2` — зона GLP-C (проверено: 1 253 строки). Метрика
+#: «ошибки по зонам» складывала два склада в одну корзину.
+#:
+#: Теперь зона выводится из устройства: у SMALL-P3 она лежит в `sub_warehouse`
+#: робота (`D` / `E`), и находится по номеру, который оператор уже ввёл. Только
+#: GLP-C (и склады без зон) получают это значение.
+DEFAULT_ISSUE_WAREHOUSE = "C2"
+
+#: Склады, у которых есть разбиение на зоны. Для них зона берётся из
+#: `sub_warehouse` устройства, а не из значения по умолчанию.
+#: Проверено на живой базе: `sub_warehouse` заполнен только у SMALL-P3.
+WAREHOUSES_WITH_ZONES = ("SMALL-P3",)
+
+#: Справочник оборудования роботов — источник `sub_warehouse`.
+ROBOTS_TABLE = "robots_maintenance_list"
 
 # Categories that can be resolved against the canonical equipment inventory.
 INVENTORY_CATEGORIES = ("robot", "workstation", "charging")
@@ -210,6 +224,63 @@ def canonical_type(warehouse: str, category: str, code: str) -> Optional[str]:
         return None
 
     return str(types[0].get("type") or "").strip() or None
+
+
+def device_zone(warehouse: str, code: str) -> Optional[str]:
+    """
+    Зона склада, в которой стоит устройство: `D` / `E` на SMALL-P3.
+
+    **Откуда берётся.** У оборудования есть колонка `sub_warehouse` — это и есть
+    зона. Проверено на живой базе 05.10.2026: заполнена она **только** у
+    SMALL-P3, значениями `D` (40 роботов, 62 единицы оборудования, 13 зарядок,
+    9 станций) и `E` (80 / 118 / 27 / 11). У GLP-C, PNT-A и P3-DC-1 пусто — там
+    разбиения на зоны нет, и это нормально.
+
+    Поэтому у GLPC зона — `C2` (значение по умолчанию), а у SMALL-P3 она
+    находится по номеру устройства, который оператор уже ввёл.
+
+    **Почему не спрашиваем оператора заново.** Он уже назвал номер робота, а
+    зона из него выводится однозначно. Лишний шаг в дереве замедлял бы приём и
+    давал бы второй источник правды: оператор мог бы выбрать зону, не совпадающую
+    с фактическим положением робота.
+
+    **Ловушка, из-за которой нужен склад.** Номера роботов **повторяются между
+    складами**: `121`, `122`, `123` есть и в GLP-C, и в SMALL-P3. Без склада в
+    условии подбор вернул бы зону с чужого склада.
+
+    `None` — не ошибка: устройство не найдено или у склада нет зон. Тогда
+    вызывающий код оставляет значение по умолчанию.
+    """
+    if warehouse not in WAREHOUSES_WITH_ZONES or not code:
+        return None
+
+    # Только числовой номер: `sub_warehouse` ищется по `robot_number`, а
+    # составные номера (`H108/1834`) в этом справочнике не лежат.
+    number = _robot_number(code)
+
+    if number is None:
+        return None
+
+    from sendToDataBase import rest_get
+
+    # `optional=True`: сбой справочника не должен ронять запись отчёта.
+    rows = rest_get(
+        ROBOTS_TABLE,
+        {
+            "select": "sub_warehouse",
+            "warehouse": f"eq.{warehouse}",
+            "robot_number": f"eq.{number}",
+            "limit": "1",
+        },
+        optional=True,
+    )
+
+    if not rows:
+        return None
+
+    zone = str(rows[0].get("sub_warehouse") or "").strip()
+
+    return zone or None
 
 
 def _received_at(result: Dict[str, Any]) -> datetime:
@@ -552,7 +623,10 @@ def build_row(
         "shift_type": shift_name,
         "warehouse": warehouse,
         "issue_data": shift_date,
-        "issue_warehouse": ISSUE_WAREHOUSE,
+        # Зона склада. У SMALL-P3 она выводится из устройства (`D`/`E`), у
+        # GLP-C и складов без зон остаётся `C2`. Раньше здесь была константа для
+        # всех складов, из-за чего у SMALL-P3 стояла зона GLP-C.
+        "issue_warehouse": device_zone(warehouse, code) or DEFAULT_ISSUE_WAREHOUSE,
     }
 
     if include_optional:

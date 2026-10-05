@@ -1974,5 +1974,84 @@ class TemplateMatchingChecks(unittest.TestCase):
         self.assertEqual(row["issue_type"], "Unable to drive")
 
 
+class ZoneChecks(unittest.TestCase):
+    """Зона склада: у SMALL-P3 выводится из устройства, у остальных — C2.
+
+    До этой правки `issue_warehouse` была **константой `C2` для всех складов**,
+    и у SMALL-P3 стояла зона GLP-C (проверено: 1 253 строки). Метрика «ошибки по
+    зонам» складывала два склада в одну корзину.
+
+    Зона берётся из `sub_warehouse` робота — проверено на живой базе, что это
+    поле заполнено **только** у SMALL-P3 (`D`: 40 роботов, `E`: 80).
+    """
+
+    def setUp(self):
+        rw.reset_templates_cache()
+        self.addCleanup(rw.reset_templates_cache)
+        rw._templates_cache = []
+        rw._templates_checked_at = 9e9
+
+    def _zone(self, warehouse, number):
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = row_for(
+                warehouse,
+                answers=answers(device_number=str(number)),
+            )
+        return row["issue_warehouse"]
+
+    def test_glp_c_keeps_the_default_zone(self):
+        """GLP-C: разбиения на зоны нет, значение по умолчанию."""
+        self.assertEqual(self._zone("GLP-C", "3452"), "C2")
+
+    def test_warehouse_without_zones_keeps_the_default(self):
+        """PNT-A и прочие склады без зон — тоже значение по умолчанию."""
+        for warehouse in ("PNT-A", "P3-DC-1", "P3-DC-3"):
+            with self.subTest(warehouse=warehouse):
+                self.assertEqual(self._zone(warehouse, "100"), "C2")
+
+    def test_small_p3_zone_comes_from_the_robot(self):
+        """SMALL-P3: зона из `sub_warehouse` устройства, а не константа."""
+        with mock.patch.object(rw, "device_zone", return_value="E"):
+            self.assertEqual(self._zone("SMALL-P3", "98"), "E")
+
+        with mock.patch.object(rw, "device_zone", return_value="D"):
+            self.assertEqual(self._zone("SMALL-P3", "6"), "D")
+
+    def test_unknown_device_falls_back_to_the_default(self):
+        """Устройство не найдено — зона неизвестна, но отчёт не теряется.
+
+        Подставлять чужую зону нельзя, поэтому остаётся значение по умолчанию,
+        а не догадка.
+        """
+        with mock.patch.object(rw, "device_zone", return_value=None):
+            self.assertEqual(self._zone("SMALL-P3", "999999"), "C2")
+
+    def test_non_numeric_code_gives_no_zone(self):
+        """Составной номер (`H108/1834`) в справочнике роботов не лежит."""
+        self.assertIsNone(rw.device_zone("SMALL-P3", "H108/1834"))
+        self.assertIsNone(rw.device_zone("SMALL-P3", ""))
+
+    def test_warehouse_without_zones_does_not_query(self):
+        """Для GLP-C запрос к справочнику не делается вовсе."""
+        with mock.patch.object(rw, "rest_get", create=True) as get:
+            # Импорт внутри функции — подменяем через sys.modules
+            import sendToDataBase
+
+            with mock.patch.object(sendToDataBase, "rest_get") as rest_get:
+                self.assertIsNone(rw.device_zone("GLP-C", "3452"))
+                rest_get.assert_not_called()
+
+    def test_database_failure_does_not_lose_the_report(self):
+        """Сбой справочника роботов — отчёт всё равно записывается."""
+        import sendToDataBase
+
+        with mock.patch.object(sendToDataBase, "rest_get", return_value=None):
+            self.assertIsNone(rw.device_zone("SMALL-P3", "6"))
+
+        with mock.patch.object(rw, "device_zone", return_value=None):
+            row = self._zone("SMALL-P3", "6")
+        self.assertEqual(row, "C2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
