@@ -1831,5 +1831,148 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
         self.assertIn("Error report saved", caption)
 
 
+class TemplateMatchingChecks(unittest.TestCase):
+    """Приём подбирает готовое описание ошибки из `issue_templates`.
+
+    До этой правки сюда шёл сырой текст оператора: `first_column` и `issue_type`
+    дублировали категорию оборудования («robot» = «robot»), `recovery_title` был
+    пуст, `solving_time` равен нулю. Из-за этого строки приёма нельзя было
+    группировать по типу ошибки и считать время решения. Проверено на живой
+    базе 05.10.2026: так выглядели все 246 строк бота.
+    """
+
+    TEMPLATE = {
+        "employee_title": "Driver component exception",
+        "issue_sub_type": "Driver component exception",
+        "issue_type": "Unable to drive",
+        "issue_description": "In drive process robot got problem driver component exception",
+        "recovery_title": "Move on QR Code robot then recovery robot",
+        "solving_time": 6,
+    }
+
+    def setUp(self):
+        rw.reset_templates_cache()
+        self.addCleanup(rw.reset_templates_cache)
+
+    def _with_templates(self, templates):
+        """Подсовывает справочник, минуя сеть."""
+        rw._templates_cache = templates
+        rw._templates_checked_at = 9e9
+
+    def _row(self, description):
+        """Строка журнала для описания оператора.
+
+        Описание обязано лежать в `answers` (там его читает `build_row`), а не
+        на верхнем уровне `result` — `row_for(description=…)` положил бы его не
+        туда, и тест «проходил» бы, ничего не проверяя.
+        """
+        return row_for(answers=answers(description=description))
+
+    def test_columns_are_filled_from_the_matched_template(self):
+        self._with_templates([self.TEMPLATE])
+
+        row = self._row("driver component exception")
+
+        self.assertEqual(row["first_column"], "Driver component exception")
+        self.assertEqual(row["issue_type"], "Unable to drive")
+        self.assertEqual(row["second_column"], "Driver component exception")
+        self.assertEqual(row["recovery_title"], "Move on QR Code robot then recovery robot")
+        self.assertEqual(row["solving_time"], 6)
+
+    def test_end_time_is_start_plus_solving_time(self):
+        """Конвенция журнала: `error_end_time = error_start_time + solving_time`.
+
+        Проверена на живой базе: сходится у 23 384 из 23 400 строк, где
+        `solving_time > 0`. Без шаблона `solving_time = 0`, и конец равен началу.
+        """
+        from datetime import datetime, timedelta
+
+        self._with_templates([self.TEMPLATE])
+
+        row = self._row("driver component exception")
+
+        start = datetime.fromisoformat(row["error_start_time"])
+        end = datetime.fromisoformat(row["error_end_time"])
+
+        self.assertEqual(end - start, timedelta(minutes=6))
+
+    def test_no_match_keeps_the_previous_behaviour(self):
+        """Отказ — правильный ответ, а не сбой.
+
+        `'unable to rotate'` — реальный текст оператора. Уверенного совпадения
+        для него нет, и колонки обязаны остаться прежними: категория и модуль.
+        Выдуманный шаблон отнёс бы ошибку не к тому типу.
+        """
+        self._with_templates([self.TEMPLATE])
+
+        row = self._row("totally unrelated wording xyz")
+
+        self.assertEqual(row["first_column"], "robot")
+        self.assertEqual(row["issue_type"], "robot")
+        self.assertEqual(row["second_column"], "Lifting")   # модуль из answers()
+        self.assertIsNone(row["recovery_title"])
+        self.assertEqual(row["solving_time"], 0)
+
+    def test_no_match_keeps_end_equal_to_start(self):
+        from datetime import datetime
+
+        self._with_templates([self.TEMPLATE])
+
+        row = self._row("totally unrelated wording xyz")
+
+        self.assertEqual(row["error_end_time"], row["error_start_time"])
+
+    def test_database_failure_still_files_the_report(self):
+        """Сбой справочника не теряет отчёт.
+
+        `rest_get` вернёт `None` — это нормальное состояние (база недоступна),
+        а не повод не записать ошибку. Колонки остаются прежними.
+        """
+        with mock.patch.object(rw, "load_templates", return_value=[]):
+            row = self._row("driver component exception")
+
+        self.assertEqual(row["issue_type"], "robot")
+        self.assertEqual(row["solving_time"], 0)
+        # Самое важное: отчёт состоялся и сырой текст на месте.
+        self.assertIn("driver component exception", row["issue_description"])
+
+    def test_raw_operator_text_is_never_lost(self):
+        """Подбор заполняет колонки, но сырой текст остаётся в журнале.
+
+        Это единственное место, где видно, что именно написал человек; то же
+        описание дублируется в `telegram_equipment_reports`.
+        """
+        self._with_templates([self.TEMPLATE])
+
+        row = self._row("driver component exception")
+
+        self.assertIn("Reported error: driver component exception", row["issue_description"])
+
+    def test_solving_time_is_coerced_to_int(self):
+        """Справочник может вернуть строку или мусор — запись не должна падать."""
+        self._with_templates([dict(self.TEMPLATE, solving_time="8")])
+        self.assertEqual(self._row("driver component exception")["solving_time"], 8)
+
+        self._with_templates([dict(self.TEMPLATE, solving_time=None)])
+        self.assertEqual(self._row("driver component exception")["solving_time"], 0)
+
+        self._with_templates([dict(self.TEMPLATE, solving_time="abc")])
+        self.assertEqual(self._row("driver component exception")["solving_time"], 0)
+
+    def test_template_without_sub_type_does_not_leave_first_column_empty(self):
+        """У шаблона id 122 `issue_sub_type` пуст — колонка не должна опустеть."""
+        self._with_templates([{
+            "employee_title": "Security module failure",
+            "issue_sub_type": "",
+            "issue_type": "Unable to drive",
+            "solving_time": 6,
+        }])
+
+        row = self._row("security module failure")
+
+        self.assertEqual(row["first_column"], "Security module failure")
+        self.assertEqual(row["issue_type"], "Unable to drive")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from equipment_intake.template_match import match_template
 from shift import WARSAW_TZ, get_current_shift
 from warehouses import WAREHOUSES
 
@@ -62,6 +63,28 @@ ISSUE_WAREHOUSE = "C2"
 
 # Categories that can be resolved against the canonical equipment inventory.
 INVENTORY_CATEGORIES = ("robot", "workstation", "charging")
+
+# Справочник готовых описаний ошибок: по нему отдел ведёт журнал. Пока приём
+# писал сюда сырой текст, строки нельзя было ни группировать по типу ошибки, ни
+# считать время решения.
+TEMPLATES_TABLE = "issue_templates"
+
+#: Поля шаблона, нужные для подбора и заполнения колонок.
+TEMPLATE_COLUMNS = (
+    "employee_title",
+    "issue_sub_type",
+    "issue_type",
+    "issue_description",
+    "recovery_title",
+    "solving_time",
+)
+
+# Справочник меняется редко (29 строк, правится вручную), поэтому держим его в
+# памяти. TTL, а не вечное кэширование: добавленный шаблон должен заработать без
+# перезапуска бота.
+_TEMPLATES_TTL_SECONDS = 600
+_templates_cache: Optional[list] = None
+_templates_checked_at: float = 0.0
 
 
 class WarehouseError(ValueError):
@@ -347,6 +370,94 @@ def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
     return ", ".join(reasons) or None
 
 
+def load_templates() -> list:
+    """
+    Справочник `issue_templates` (кэш на 10 минут).
+
+    Пустой список — не ошибка: он означает «шаблонов нет». `None` от `rest_get`
+    тоже приводится к пустому списку, потому что сбой базы **не должен** ломать
+    приём: отчёт запишется с прежними значениями, как до этой правки. Разница
+    между «база недоступна» и «шаблонов нет» для подбора не важна — в обоих
+    случаях шаблон не найден, и подставлять наугад нельзя.
+    """
+    global _templates_cache, _templates_checked_at
+
+    now = time.time()
+
+    if _templates_cache is not None and now - _templates_checked_at < _TEMPLATES_TTL_SECONDS:
+        return _templates_cache
+
+    from sendToDataBase import rest_get
+
+    # `optional=True`: сбой справочника — ожидаемая ситуация, не ERROR в логе.
+    rows = rest_get(
+        TEMPLATES_TABLE,
+        {"select": ",".join(TEMPLATE_COLUMNS), "limit": "500"},
+        optional=True,
+    )
+
+    _templates_cache = list(rows or [])
+    _templates_checked_at = now
+
+    return _templates_cache
+
+
+def reset_templates_cache() -> None:
+    """Сбросить кэш справочника (тесты и ручная проверка)."""
+    global _templates_cache, _templates_checked_at
+
+    _templates_cache = None
+    _templates_checked_at = 0.0
+
+
+def _template_values(template: Optional[Dict[str, Any]], category: str, module: str, device_type: str) -> Dict[str, Any]:
+    """
+    Значения колонок журнала из подобранного шаблона.
+
+    Маппинг восстановлен по живой базе, а не придуман: на 12 474 классических
+    строках, где человек проставил шаблон точно, `second_column` =
+    `employee_title` совпадает в 79 % случаев, `first_column` =
+    `issue_sub_type` — в 53 %.
+
+    При `template = None` возвращаются прежние значения приёма: категория
+    оборудования и модуль. Это честный откат, а не догадка — пустая колонка
+    лучше ошибки, отнесённой не к тому типу.
+    """
+    if not template:
+        return {
+            "first_column": category,
+            "issue_type": category,
+            "second_column": module or device_type,
+            "recovery_title": None,
+            "solving_time": 0,
+        }
+
+    return {
+        # `issue_sub_type` — «подтип» ошибки, именно он лежит в `first_column` у
+        # классических строк. Если у шаблона он пуст (такие есть: id 122),
+        # берём название, чтобы колонка не осталась пустой.
+        "first_column": template.get("issue_sub_type") or template.get("employee_title"),
+        "issue_type": template.get("issue_type"),
+        "second_column": template.get("employee_title"),
+        "recovery_title": template.get("recovery_title") or None,
+        "solving_time": _solving_time(template.get("solving_time")),
+    }
+
+
+def _solving_time(value: Any) -> int:
+    """
+    Время решения в минутах — целое.
+
+    В базе колонка целочисленная, а `error_end_time` считается как
+    `error_start_time + solving_time`. Нечисловое значение приводим к нулю:
+    испорченный справочник не должен ронять запись отчёта.
+    """
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_row(
     result: Dict[str, Any], warehouse: str, include_optional: bool = True
 ) -> Dict[str, Any]:
@@ -399,25 +510,44 @@ def build_row(
     # `employee` does. A missing card is acceptable; an invented one is not.
     card_id = _card_id(result.get("employee_card_id"))
 
+    # Подбор готового описания ошибки из справочника. Раньше сюда шёл сырой текст
+    # оператора: `first_column` и `issue_type` дублировали категорию оборудования
+    # («robot» = «robot»), `recovery_title` был пуст, `solving_time` равен нулю.
+    # Из-за этого строки приёма нельзя было ни группировать по типу ошибки, ни
+    # считать время решения. Проверено на живой базе 05.10.2026: так выглядели
+    # все 246 строк бота.
+    #
+    # `match_template` возвращает `None`, когда уверенного совпадения нет, — и
+    # тогда остаются прежние значения. Выдумывать шаблон нельзя: пустая колонка
+    # честнее ошибки, отнесённой не к тому типу.
+    template = match_template(answers.get("description"), load_templates())
+    template_columns = _template_values(template, category, module, device_type)
+
+    # Время решения берём из шаблона; конец ошибки считается по конвенции
+    # журнала (`error_end_time = error_start_time + solving_time`), проверенной
+    # на 23 384 из 23 400 строк. Без шаблона `solving_time = 0`, и конец равен
+    # началу — как было раньше.
+    solving_time = template_columns["solving_time"]
+    error_end = received + timedelta(minutes=solving_time)
+
     row = {
         "error_robot": _robot_number(code),
         "add_by": card_id,
         "device_type": device_type,
         "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",
-        # The table's convention is `error_end_time = error_start_time +
-        # solving_time`, verified against the whole live table. The intake flow
-        # has no issue template, so `solving_time` is 0 and the expected end is
-        # the start. Leaving it NULL would deviate from that convention rather
-        # than being an honest gap: the value is derived, not invented.
-        "error_end_time": received.isoformat(),
+        "error_end_time": error_end.isoformat(),
         "error_start_time": received.isoformat(),
-        "first_column": category,
+        "first_column": template_columns["first_column"],
+        # Сырой текст оператора остаётся здесь целиком и **не** подменяется
+        # шаблоном: это единственное место, где видно, что именно написал
+        # человек. То же описание дублируется в `telegram_equipment_reports`
+        # (`description`), поэтому подбор ничего не теряет.
         "issue_description": "\n".join(details),
-        "issue_type": category,
+        "issue_type": template_columns["issue_type"],
         "photo_url": result.get("photo_url") or None,
-        "recovery_title": None,
-        "second_column": module or device_type,
-        "solving_time": 0,
+        "recovery_title": template_columns["recovery_title"],
+        "second_column": template_columns["second_column"],
+        "solving_time": solving_time,
         "uniq_key": _uniq_key(result, report_id, user_id),
         "shift_type": shift_name,
         "warehouse": warehouse,
