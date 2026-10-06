@@ -1027,7 +1027,16 @@ def send_to_data_base(
 
         "end_time": end_time_iso,
 
-        "exception_id": best_match.get("id"),
+        # **`template_id`, а не `exception_id`.** Миграция `0068` переименовала
+        # колонку (`exception_id` → `template_id`), потому что она ссылается на
+        # справочник шаблонов, а не хранит идентификатор инцидента. Бот писал
+        # старое имя, и **вставка падала целиком** с
+        # `column "exception_id" of relation "exceptions" does not exist`.
+        #
+        # Следствие было незаметным: запись в `exceptions_glpc` (legacy)
+        # проходит, поэтому инциденты не терялись, а «новая» таблица стояла на
+        # 7 строках, хотя бот писал в неё при каждом приёме.
+        "template_id": best_match.get("id"),
 
         "shift_type": shift_name,
 
