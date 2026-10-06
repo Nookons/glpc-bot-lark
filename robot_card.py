@@ -30,7 +30,16 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 ROBOTS_TABLE = "robots_maintenance_list"
 HISTORY_TABLE = "change_status_robots"
-EXCEPTIONS_TABLE = "exceptions"
+#: Таблица инцидентов, в которую **действительно пишут**.
+#:
+#: **Дефект, найденный 06.10.2026.** Здесь стояло `"exceptions"` — таблица под
+#: переход (`0068`/`0069`), **переход не сделан**, и писателя в ней нет: 7 строк
+#: против 24 185 в `exceptions_glpc`. Бот приёма и API пишут в legacy.
+#:
+#: Хуже: у `exceptions` **нет колонок** `start_time`, `exception_id`, `robot_id`,
+#: которые запрашивал код, — запрос карточки робота падал, и в карточке не было
+#: ни одной ошибки. Проверено на живой базе.
+EXCEPTIONS_TABLE = "exceptions_glpc"
 TEMPLATES_TABLE = "issue_templates"
 EMPLOYEES_TABLE = "employees"
 
@@ -274,29 +283,34 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         datetime.now(timezone.utc) - timedelta(days=ERROR_WINDOW_DAYS)
     ).isoformat()
 
-    total = rest_count(
-        EXCEPTIONS_TABLE,
-        {
-            "robot_id": f"eq.{robot.get('id')}",
-            "start_time": f"gte.{since}",
-        },
-    )
+    # **Колонки legacy, а не новой таблицы.** В `exceptions_glpc` начало ошибки —
+    # `error_start_time`, робот — `error_robot` (числом, равным
+    # `robots_maintenance_list.id`), автор — в `employee`, а не `handle_by`.
+    #
+    # **Склад обязателен.** Номера роботов повторяются между складами (`121`,
+    # `122`, `123` есть и в GLP-C, и в SMALL-P3; `201`, `2000` — в GLP-C и
+    # P3-DC-1), поэтому без склада карточка показала бы чужие ошибки.
+    errors_filter = {
+        "error_robot": f"eq.{robot.get('id')}",
+        "error_start_time": f"gte.{since}",
+        "warehouse": f"eq.{warehouse}",
+    }
+
+    total = rest_count(EXCEPTIONS_TABLE, errors_filter)
 
     recent = rest_get(
         EXCEPTIONS_TABLE,
         params={
-            "select": "start_time,exception_id,handle_by",
-            "robot_id": f"eq.{robot.get('id')}",
-            "start_time": f"gte.{since}",
-            "order": "start_time.desc",
+            "select": "error_start_time,issue_type,recovery_title,employee",
+            **errors_filter,
+            "order": "error_start_time.desc",
             "limit": "200",
         },
     )
 
-    names = _employee_names(
-        [row.get("add_by") for row in (history or [])]
-        + [row.get("handle_by") for row in (recent or [])]
-    )
+    # Автор ошибки лежит в `employee` (имя строкой), а не в `handle_by`:
+    # в legacy-таблице нет ссылки на сотрудника, только записанное имя.
+    names = _employee_names([row.get("add_by") for row in (history or [])])
 
     templates = _templates_map()
 
@@ -337,20 +351,26 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         })
 
     if recent:
-        counter = Counter(row.get("handle_by") for row in recent)
+        # В legacy-таблице автор записан **именем** (`employee`), а не ссылкой:
+        # переводить его через `_employee_names` нечего. Раньше здесь стоял
+        # `handle_by`, которого в таблице нет, — счётчик всегда был пуст.
+        counter = Counter(
+            row.get("employee") for row in recent if row.get("employee")
+        )
 
         card["reporters"] = [
-            (names.get(card_id) or f"id {card_id}", count)
-            for card_id, count in counter.most_common(3)
+            (employee, count) for employee, count in counter.most_common(3)
         ]
 
         for row in recent[:LAST_ISSUES_LIMIT]:
+            # Тип ошибки лежит в самой строке (`issue_type`), а не за
+            # `exception_id` в шаблонах: у legacy-строки нет ссылки на шаблон,
+            # текст уже подставлен при записи.
             card["last_issues"].append({
-                "at": _pretty(row.get("start_time")),
-                "issue_type": (
-                    templates.get(row.get("exception_id")) or "unknown"
-                ),
-                "by": names.get(row.get("handle_by")) or "-",
+                "at": _pretty(row.get("error_start_time")),
+                "issue_type": row.get("issue_type") or "unknown",
+                "recovery": row.get("recovery_title") or None,
+                "by": row.get("employee") or "-",
             })
 
     _card_cache[cache_key] = (now, card)
