@@ -1677,7 +1677,11 @@ class ConfirmationTextChecks(unittest.TestCase):
              mock.patch("equipment_intake.integrations.persist_and_send", delivery_mock):
             flow._confirm(-100, sender, session, 5)
 
-        return captions[0] if captions else ""
+        # **Последняя подпись, а не первая.** С 07.10.2026 `_confirm` сначала
+        # показывает состояние «Saving…» (чтобы нажатие не выглядело
+        # зависанием), и только потом — итоговую карточку. Первая подпись
+        # теперь служебная, а пользователь видит **последнюю**.
+        return captions[-1] if captions else ""
 
     def test_success_is_reported(self):
         text = self.confirm({
@@ -1788,7 +1792,7 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
 
     def test_card_says_the_error_was_saved(self):
         calls, _ = self.confirm(self.saved())
-        caption = calls[0][0][2]
+        caption = calls[-1][0][2]
 
         self.assertIn("Error report saved", caption)
 
@@ -1798,7 +1802,7 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
         status and one compact identity line are kept.
         """
         calls, _ = self.confirm(self.saved())
-        caption = calls[0][0][2]
+        caption = calls[-1][0][2]
 
         self.assertIn("robot · A42T C2 · 3490", caption)
         # The verbose path/description still lives in the Lark card and journal.
@@ -1812,21 +1816,21 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
 
         # `edit_caption` receives the session, and it is the session that carries
         # `thread_id` — the card cannot drift into another topic.
-        self.assertIs(calls[0][0][3].data["thread_id"], 318)
+        self.assertIs(calls[-1][0][3].data["thread_id"], 318)
 
     def test_card_reports_a_failed_save_plainly(self):
         calls, _ = self.confirm({
             "database_saved": False, "device_queued": False,
             "lark_delivered": False, "glpc_saved": False, "glpc_error": None,
         })
-        caption = calls[0][0][2]
+        caption = calls[-1][0][2]
 
         self.assertIn("Error report not saved", caption)
         self.assertIn("Journal entry not saved", caption)
 
     def test_confirmation_does_not_keep_the_whole_path_summary(self):
         calls, _ = self.confirm(self.saved())
-        caption = calls[0][0][2]
+        caption = calls[-1][0][2]
 
         for label in ("Equipment type", "Component", "Device number"):
             self.assertNotIn(label, caption)
@@ -1846,7 +1850,7 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
         report = send.call_args.args[0]
 
         self.assertNotIn("employee_card_id", report)
-        self.assertIn("Error report saved", calls[0][0][2])
+        self.assertIn("Error report saved", calls[-1][0][2])
 
     def test_unavailable_database_still_files_the_report(self):
         def boom(_):
@@ -1856,7 +1860,7 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
 
         send.assert_called_once()
         self.assertNotIn("employee_card_id", send.call_args.args[0])
-        self.assertIn("Error report saved", calls[0][0][2])
+        self.assertIn("Error report saved", calls[-1][0][2])
 
     def test_a_card_without_an_identity_still_renders(self):
         from equipment_intake import flow
@@ -2349,3 +2353,214 @@ class LarkCardTextIsCorrect(unittest.TestCase):
 
         self.assertIn("QR code", rows["Equipment"])
         self.assertEqual(rows["Intake details"], "Saved")
+
+
+class ConfirmShowsProgress(unittest.TestCase):
+    """Подтверждение показывает, что работа идёт, а не «зависает».
+
+    **Владелец 07.10.2026:** «сделай когда нажимаешь Submit на бота чтобы было
+    видно что грузится, а то оно как будто зависает».
+
+    **Причина была в порядке обратной связи.** `handle_callback` гасил «часики»
+    на входе и молчал дальше: для мгновенного выбора этого хватало, но
+    подтверждение делает три сетевые операции (запись — 10 с, фото — 30 с,
+    карточка в Lark — 15 с), и всё это время экран не менялся.
+    """
+
+    def _session(self):
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        for step in ("robot", "k50h", "safety"):
+            session.select(step)
+        session.submit_text("3780")
+        session.submit_text("Lift reports an error")
+        session.select("obstacle")
+        session.data.update(
+            {
+                "warehouse": "GLP-C",
+                "image": "/tmp/x.jpg",
+                "message_id": 5,
+                "menu_message_id": 5,
+                "thread_id": 318,
+            }
+        )
+        return session
+
+    def test_progress_is_shown_before_the_work(self):
+        """Состояние загрузки показывается **до** сетевой работы.
+
+        Порядок проверяется по подписям: сначала «Saving…», потом итоговая
+        карточка. Если поменять местами, первые секунды ожидания снова будут
+        выглядеть зависанием.
+        """
+        from equipment_intake import flow
+
+        captions = []
+
+        with mock.patch.object(flow, "edit_caption", side_effect=lambda *a, **k: captions.append(a[2])), \
+             mock.patch.object(flow, "_employee_context", return_value=("Тест", None)), \
+             mock.patch.object(flow, "_start_typing_keepalive"), \
+             mock.patch("equipment_intake.integrations.persist_and_send",
+                        return_value={"database_saved": True, "device_queued": False,
+                                      "lark_delivered": True, "glpc_saved": True,
+                                      "glpc_error": None}):
+            flow._confirm(-100, {"id": 1, "username": "u"}, self._session(), 5)
+
+        self.assertGreaterEqual(len(captions), 2, "ожидались прогресс и итог")
+        self.assertIn("Saving the report", captions[0], "прогресс должен идти первым")
+        self.assertIn("Journal entry saved", captions[-1], "итог — последним")
+
+    def test_progress_removes_the_buttons(self):
+        """На время сохранения кнопки убираются.
+
+        Иначе нетерпеливый человек жмёт «Confirm» повторно, и отчёт уходит
+        **дважды** — а это уже дубликаты в журнале.
+        """
+        from equipment_intake import flow
+
+        seen = []
+
+        def capture(chat_id, message_id, caption, session=None, reply_markup=None):
+            seen.append(reply_markup)
+
+        with mock.patch.object(flow, "edit_caption", side_effect=capture), \
+             mock.patch.object(flow, "_employee_context", return_value=("Тест", None)), \
+             mock.patch.object(flow, "_start_typing_keepalive"), \
+             mock.patch("equipment_intake.integrations.persist_and_send",
+                        return_value={"database_saved": True, "device_queued": False,
+                                      "lark_delivered": True, "glpc_saved": True,
+                                      "glpc_error": None}):
+            flow._confirm(-100, {"id": 1, "username": "u"}, self._session(), 5)
+
+        self.assertEqual(
+            seen[0], {"inline_keyboard": []}, "на время работы кнопок быть не должно"
+        )
+
+    def test_refusal_does_not_show_progress(self):
+        """Отказ (незавершённый путь) — **без** «Saving…».
+
+        Показывать прогресс, а следом ошибку значило бы давать два
+        противоречащих сигнала подряд.
+        """
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)  # путь не начат
+        captions = []
+
+        with mock.patch.object(flow, "edit_caption", side_effect=lambda *a, **k: captions.append(a[2])), \
+             mock.patch.object(flow, "_start_typing_keepalive") as typing, \
+             mock.patch.object(flow, "_bot"):
+            flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
+
+        self.assertFalse(typing.called, "при отказе индикатор не нужен")
+        for caption in captions:
+            self.assertNotIn("Saving the report", caption)
+
+    def test_typing_is_sent_to_the_report_topic(self):
+        """«Печатает…» уходит в топик отчёта, а не в общий чат.
+
+        Индикатор в чужом топике — это ответ там, где бот молчать обязан.
+
+        **Проверяется без гонки с потоком.** Первая версия теста ждала 0.2 с и
+        падала через раз: поток демон, и «успел ли он» зависело от загрузки
+        машины. Здесь поток **не запускается** — вместо него вызывается тело
+        цикла напрямую, поэтому проверка детерминирована.
+        """
+        from equipment_intake import flow
+
+        session = self._session()
+        calls = []
+
+        # Останавливаю цикл после первой итерации: `sleep` бросает — так тело
+        # выполняется ровно один раз и результат не зависит от планировщика.
+        class _Stop(Exception):
+            pass
+
+        def stop(_seconds):
+            raise _Stop
+
+        with mock.patch.object(flow.tg, "send_chat_action",
+                               side_effect=lambda *a, **k: calls.append(k)), \
+             mock.patch.object(flow.time, "sleep", side_effect=stop), \
+             mock.patch.object(flow.threading, "Thread") as thread:
+            # Сессия должна быть **живой**: индикатор останавливается, когда
+            # она исчезает (это признак конца записи).
+            flow.put_session(-100, 1, session)
+            flow._start_typing_keepalive(-100, session, user_id=1)
+            target = thread.call_args.kwargs.get("target") or thread.call_args.args[0]
+            try:
+                target()
+            except _Stop:
+                pass
+            flow.drop_session(-100, 1)
+
+        self.assertTrue(calls, "индикатор должен отправляться")
+        self.assertEqual(calls[0].get("message_thread_id"), 318)
+
+    def test_real_indicator_sends_when_session_is_alive(self):
+        """Настоящий индикатор отправляет «печатает…», пока сессия жива.
+
+        **Проверяется без мока самой функции.** Первая версия цикла проверяла
+        `session.is_completed`, а в `_confirm` сессия **уже завершена** —
+        поэтому индикатор не отправлялся **ни разу**. Здесь вызывается
+        настоящий `_start_typing_keepalive`: сессия лежит в памяти, `sleep`
+        подменён так, чтобы цикл сделал ровно один оборот и вышел.
+        """
+        from equipment_intake import flow
+
+        session = self._session()
+        sent = []
+
+        class _Stop(Exception):
+            pass
+
+        def stop(_seconds):
+            # Первый оборот уже сделан — выходим из цикла.
+            raise _Stop
+
+        flow.put_session(-100, 1, session)
+
+        try:
+            with mock.patch.object(flow.tg, "send_chat_action",
+                                   side_effect=lambda *a, **k: sent.append(k)), \
+                 mock.patch.object(flow.time, "sleep", side_effect=stop), \
+                 mock.patch.object(flow.threading, "Thread") as thread:
+                flow._start_typing_keepalive(-100, session, user_id=1)
+                target = thread.call_args.kwargs.get("target") or thread.call_args.args[0]
+                try:
+                    target()
+                except _Stop:
+                    pass
+        finally:
+            flow.drop_session(-100, 1)
+
+        self.assertTrue(sent, "индикатор не отправился при живой сессии")
+        self.assertEqual(sent[0].get("message_thread_id"), 318)
+
+    def test_indicator_stops_when_the_session_is_gone(self):
+        """Сессия исчезла (запись закончена) — индикатор молчит.
+
+        `_confirm` в конце вызывает `drop_session`, поэтому исчезновение сессии
+        и есть признак конца работы. Если проверять `is_completed`, условие
+        сработает **сразу** и индикатор не покажется вообще — этот тест ловит
+        такую подмену.
+        """
+        from equipment_intake import flow
+
+        session = self._session()
+        sent = []
+        # Сессию **не** кладу в память: работа как будто уже закончена.
+        flow.drop_session(-100, 1)
+
+        with mock.patch.object(flow.tg, "send_chat_action",
+                               side_effect=lambda *a, **k: sent.append(k)), \
+             mock.patch.object(flow.threading, "Thread") as thread:
+            flow._start_typing_keepalive(-100, session, user_id=1)
+            target = thread.call_args.kwargs.get("target") or thread.call_args.args[0]
+            target()
+
+        self.assertEqual(sent, [], "при завершённой работе индикатор не нужен")

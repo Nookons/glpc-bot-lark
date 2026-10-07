@@ -379,9 +379,6 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
     if not parts or parts[0] != CB_PREFIX:
         return False
 
-    if callback_id:
-        tg.answer_callback_query(callback_id)
-
     session = get_session(chat_id, sender.get("id"))
 
     if session is None:
@@ -414,7 +411,11 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             _bot()._delete_quiet(chat_id, message_id)
             return True
         elif action == CB_CONFIRM:
-            _confirm(chat_id, sender, session, message_id)
+            # Прогресс показывает сам `_confirm` — и только после проверки,
+            # что путь пройден до конца. Иначе при отказе («сначала закончите
+            # шаг») на экране на миг появлялось бы «Saving…», а затем сообщение
+            # об ошибке: два противоречащих сигнала подряд.
+            _confirm(chat_id, sender, session, message_id, callback_id)
             return True
     except EngineError as error:
         if callback_id:
@@ -424,6 +425,11 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         if callback_id:
             tg.answer_callback_query(callback_id, "Invalid action")
         return True
+
+    # Быстрые действия: гасим «часики» и перерисовываем шаг. Подтверждение сюда
+    # не доходит — оно вернулось выше, показав своё состояние загрузки.
+    if callback_id:
+        tg.answer_callback_query(callback_id)
 
     _redraw(chat_id, session, message_id)
     return True
@@ -567,7 +573,128 @@ def confirmation_card(session: Session, delivery: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _confirm(chat_id, sender, session: Session, message_id) -> None:
+def _show_confirm_progress(
+    chat_id,
+    session: Session,
+    callback_id: str = None,
+    message_id=None,
+) -> None:
+    """Показывает, что подтверждение **пошло**, а не зависло.
+
+    **Проблема, найденная владельцем 07.10.2026:** «сделай когда нажимаешь Submit
+    на бота чтобы было видно что грузится, а то оно как будто зависает».
+
+    **Причина была в порядке обратной связи.** `handle_callback` гасил «часики»
+    на входе и молчал дальше. Для обычного выбора это незаметно — ответ
+    мгновенный. Но подтверждение делает сразу три сетевые операции:
+
+    | Шаг | Таймаут |
+    |---|---|
+    | запись строки в базу | 10 с |
+    | загрузка фото в Lark | 30 с |
+    | отправка карточки в Lark | 15 с |
+
+    То есть человек мог ждать **до минуты**, глядя на неизменившийся экран.
+
+    **Что показываем:**
+    1. **«Печатает…» в чате** — `sendChatAction`. Telegram держит индикатор
+       примерно пять секунд, поэтому при длинной записи его надо **повторять**:
+       ниже он продлевается из фонового потока, пока идёт работа.
+    2. **Всплывашку на кнопке** (`answer_callback_query`) — она гасит «часики»
+       **осмысленным текстом** «Saving…», а не молча.
+    3. **Подпись под карточкой** меняется на «Saving the report…» с убранными
+       кнопками — чтобы было видно, что нажатие принято, и **нельзя было нажать
+       Confirm второй раз**.
+
+    Последнее важно отдельно: без снятия кнопок нетерпеливый человек жмёт
+    «Confirm» повторно, и отчёт уходит дважды.
+    """
+    # 1. Всплывашка на кнопке: гасит «часики» и объясняет, что происходит.
+    if callback_id:
+        tg.answer_callback_query(callback_id, "Saving…")
+
+    # 2. Подпись карточки: подтверждаем нажатие и убираем кнопки.
+    if message_id is None:
+        message_id = session.data.get("menu_message_id")
+
+    if message_id is not None:
+        try:
+            edit_caption(
+                chat_id,
+                message_id,
+                "⏳ Saving the report…\n\nWriting to the journal and sending "
+                "to Lark. This can take up to a minute.",
+                session,
+                reply_markup={"inline_keyboard": []},
+            )
+        except Exception:
+            # Отрисовка не должна мешать самой записи: если подпись не
+            # обновилась, отчёт всё равно обязан сохраниться.
+            logger.warning("intake: не удалось показать состояние сохранения")
+
+    # 3. «Печатает…» на время работы + продление в фоне.
+    _start_typing_keepalive(chat_id, session, session.data.get("user_id"))
+
+
+#: Сколько держать «печатает…», если основной поток ещё работает (секунды).
+#: Чуть больше минуты — с запасом на все три сетевые операции.
+_TYPING_KEEPALIVE_SECONDS = 70
+
+#: Как часто продлевать индикатор. Telegram гасит его примерно через 5 с,
+#: поэтому берём интервал с запасом.
+_TYPING_REFRESH_SECONDS = 4
+
+
+def _start_typing_keepalive(chat_id, session: Session, user_id=None) -> None:
+    """Держит «печатает…», пока идёт сохранение.
+
+    **Почему отдельным потоком.** Обработка подтвержд��ния занимает основной
+    поток целиком, поэтому продлевать индикатор из него невозможно. Поток
+    демон, он завершается сам по времени или по флагу сессии.
+
+    **Почему не бесконечно.** Ограничение по времени обязательно: если запись
+    затянется из-за сети, индикатор не должен мигать в чате вечно. Поток
+    проверяет, что сессия ещё жива, и следит за общим сроком.
+    """
+    thread_id = session.data.get("thread_id")
+
+    def _keepalive() -> None:
+        deadline = time.time() + _TYPING_KEEPALIVE_SECONDS
+
+        while time.time() < deadline:
+            # **Работа закончилась — индикатор больше не нужен.**
+            #
+            # Признак — **исчезновение сессии**, а не `is_completed`. Первая
+            # версия проверяла `is_completed`, и индикатор не работал
+            # **вообще**: в `_confirm` сессия уже ��авершена (пройденный до конца
+            # путь — это и есть условие подтверждения), поэтому цикл выходил на
+            # первой итерации. Поймал тест: он ждал отправку «печатае��…» и
+            # получал пустой список вызовов.
+            #
+            # `_confirm` в конце вызывает `drop_session`, поэтому исчезновение
+            # сессии — точный признак конца записи.
+            if get_session(chat_id, user_id) is None:
+                break
+
+            try:
+                tg.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+            except Exception:
+                # Индикатор — удобство, а не часть записи: его сбой не должен
+                # ничего ломать и попадать в лог как ошибка.
+                pass
+
+            time.sleep(_TYPING_REFRESH_SECONDS)
+
+    threading.Thread(target=_keepalive, daemon=True).start()
+
+
+def _confirm(
+    chat_id,
+    sender,
+    session: Session,
+    message_id,
+    callback_id: str = None,
+) -> None:
     """
     Confirm: сохраняем сырые данные в Supabase и независимо отправляем
     карточку через Lark webhook.
@@ -592,6 +719,8 @@ def _confirm(chat_id, sender, session: Session, message_id) -> None:
     # Отказ мягкий: сообщаем человеку, что путь не закончен, и оставляем сессию
     # живой — он допишет ответ и подтвердит снова. Терять уже введённое нельзя.
     if not session.is_completed:
+        # Отказ: **никакого «Saving…»** — показывать прогресс, а следом ошибку
+        # значило бы давать два противоречащих сигнала подряд.
         node = session.current_node()
         missing = node.title if node is not None else "the last step"
 
@@ -602,6 +731,22 @@ def _confirm(chat_id, sender, session: Session, message_id) -> None:
             delete_after=10,
         )
         return
+
+    # **Теперь показываем, что работа пошла.**
+    #
+    # Место выбрано точно: после проверки полноты (иначе прогресс мелькал бы
+    # при отказе) и **до** первой сетевой операции (иначе первые секунды
+    # ожидания снова выглядят зависанием).
+    #
+    # Раньше «часики» гасились на входе в `handle_callback` и молчали дальше:
+    # для мгновенного выбора этого хватало, а подтверждение пишет строку в базу,
+    # загружает фото и шлёт карточку в Lark — таймауты 10, 30 и 15 секунд.
+    # Владелец 07.10.2026: «как будто зависает».
+    # `user_id` нужен индикатору, чтобы понять, что запись закончена (сессия
+    # удаляется из памяти в конце `_confirm`).
+    session.data.setdefault("user_id", sender.get("id"))
+
+    _show_confirm_progress(chat_id, session, callback_id, message_id)
 
     result = session.result()
     result["warehouse"] = session.data.get("warehouse") or ""

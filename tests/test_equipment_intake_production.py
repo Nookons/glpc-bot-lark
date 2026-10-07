@@ -463,9 +463,12 @@ class IntegrationChecks(unittest.TestCase):
                  get_employee_name=lambda _: "U")}):
             flow._confirm(-100, sender, session, 5)
 
+        # **Последняя подпись.** С 07.10.2026 `_confirm` сначала показывает
+        # «Saving…» (иначе нажатие выглядит зависанием), а итоговую карточку —
+        # следом. Пользователь видит последнюю.
         self.assertTrue(captions)
-        self.assertIn("Not filed in the journal", captions[0])
-        self.assertIn("Warehouse is not set", captions[0])
+        self.assertIn("Not filed in the journal", captions[-1])
+        self.assertIn("Warehouse is not set", captions[-1])
 
     def test_confirm_message_reports_success(self):
         sender = {"id": 1, "username": "u"}
@@ -487,8 +490,8 @@ class IntegrationChecks(unittest.TestCase):
                  get_employee_name=lambda _: "U")}):
             flow._confirm(-100, sender, session, 5)
 
-        self.assertIn("Journal entry saved", captions[0])
-        self.assertIn("Lark card sent", captions[0])
+        self.assertIn("Journal entry saved", captions[-1])
+        self.assertIn("Lark card sent", captions[-1])
 
 
 class DeviceNumberShapeChecks(unittest.TestCase):
