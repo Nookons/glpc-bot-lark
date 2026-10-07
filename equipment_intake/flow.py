@@ -509,7 +509,16 @@ def save_status_text(delivery: Dict[str, Any]) -> str:
     else:
         status += " Lark card was not delivered; check LARK_HOOK_ERROR settings."
     if delivery.get("device_queued"):
-        status += " Device added to the add queue."
+        # **Говорим, ГДЕ разбирать.** Прежний текст «Device added to the add
+        # queue.» был правдив, но бесполезен: человек читал его и не знал, куда
+        # идти. Владелец: «текст бота правдив, но не говорит, где разбирать».
+        #
+        # Кнопки разбора появились 07.10.2026 (`review.decide`), поэтому путь
+        # теперь существует и его можно назвать точно.
+        status += (
+            " The device is not in the registry.\n"
+            "Open Equipment → Needs review in the app to accept or reject it."
+        )
 
     return status
 

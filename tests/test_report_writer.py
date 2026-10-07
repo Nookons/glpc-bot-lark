@@ -1694,12 +1694,19 @@ class ConfirmationTextChecks(unittest.TestCase):
         self.assertIn("Journal entry not saved", text)
 
     def test_queued_device_is_mentioned(self):
+        """Текст не только сообщает о заявке, но и **говорит, где разбирать**.
+
+        Владелец 07.10.2026: «текст бота правдив, но не говорит, где разбирать».
+        Прежний текст («Device added to the add queue.») называл факт, но не
+        путь; кнопки разбора появились, и путь можно назвать точно.
+        """
         text = self.confirm({
             "database_saved": True, "device_queued": True,
             "lark_delivered": True, "glpc_saved": True, "glpc_error": None,
         })
 
-        self.assertIn("add queue", text)
+        self.assertIn("Needs review", text, "не сказано, где разбирать заявку")
+        self.assertIn("Equipment", text)
 
     def test_missing_keys_do_not_raise(self):
         text = self.confirm({})
