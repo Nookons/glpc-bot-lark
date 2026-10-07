@@ -2152,7 +2152,9 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
             flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
 
         self.assertTrue(sent)
-        self.assertIn("Which robot module?", sent[0][1])
+        # Заголовок называет модель: два узла модулей иначе не различить, и
+        # сообщение «сначала закончите шаг» не говорило бы, какой именно.
+        self.assertIn("K50H: which module?", sent[0][1])
 
     def test_completed_session_is_written(self):
         """Завершённый путь пишется — защита не ломает обычную работу."""

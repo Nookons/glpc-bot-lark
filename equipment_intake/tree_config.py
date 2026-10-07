@@ -127,9 +127,19 @@ def _build_nodes() -> dict:
     # он попадает в отчёт и в статистику, поэтому префикс модели к нему не
     # добавляю — иначе в отчётах появились бы `k50h_lifting` и `a42t_lifting`
     # как разные модули, хотя это один и тот же узел железа.
+    # **Заголовок называет модель — иначе узлы не различить.**
+    #
+    # Дефект, найденный владельцем 07.10.2026: «не понятно как настроить модули
+    # на роботах, текста одинаковые». Разделив модули по моделям, я дал обоим
+    # узлам **один и тот же** заголовок «Which robot module?», и в редакторе
+    # (`/tree`) они выглядели как две одинаковые строки, различимые только по
+    # техническому id в скобках.
+    #
+    # Теперь заголовок отвечает на вопрос «какие модули у **этой** модели» и
+    # работа��т как подпись в списке редактора.
     add(choice_node(
         "robot_module_k50h",
-        "Which robot module?",
+        "K50H: which module?",
         key="module",
         summary_label="Module",
         description="K50H has three modules: lifting, chassis and safety.",
@@ -146,7 +156,7 @@ def _build_nodes() -> dict:
 
     add(choice_node(
         "robot_module_a42t",
-        "Which robot module?",
+        "A42T / A42T C2: which module?",
         key="module",
         summary_label="Module",
         description="A42T and A42T C2 have lifting, rotation, tray and chassis.",
@@ -161,10 +171,13 @@ def _build_nodes() -> dict:
 
     add(choice_node(
         "workstation_module",
-        "Which workstation module?",
+        "Workstation: which module?",
         key="module",
         summary_label="Module",
-        description="Choose the faulty module or add an option via /tree.",
+        description=(
+            "Same list for Pick, Conveyor and Tally. "
+            "Choose the faulty module or add an option via /tree."
+        ),
         options=(
             opt("offline", "Offline", ASK_NUMBER),
             opt("wrong_task", "Wrong task", ASK_NUMBER),

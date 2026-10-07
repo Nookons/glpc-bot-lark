@@ -135,3 +135,68 @@ class TestCauseQuestion:
     def test_cause_is_recorded_in_answers(self) -> None:
         """Ответ о причине попадает в результат с ключом `cause`."""
         assert DEFAULT_TREE.node("ask_cause").answer_key() == "cause"
+
+
+class TestEditorExplainsTheStructure:
+    """Редактор показывает, **чем** достигается узел и для какой он модели.
+
+    **Владелец 07.10.2026:** «не понятно как настроить модули на роботах, текста
+    одинаковые и не гибкий бот получается. Нужно улучшить логику этого всего
+    чтобы было просто и понятно но и эффективно».
+
+    **Причина.** Разделив модули по моделям, я дал обоим узлам **один и тот же**
+    заголовок «Which robot module?». В редакторе они выглядели как две
+    одинаковые строки, различимые только техническим id в скобках, �� **не было
+    видно, чем узел достигается** — то есть что модули K50H открываются после
+    выбора модели K50H.
+    """
+
+    def test_module_nodes_have_distinct_titles(self) -> None:
+        """Заголовки узлов модулей **различаются** и называют модель."""
+        k50h = DEFAULT_TREE.node("robot_module_k50h").title
+        a42t = DEFAULT_TREE.node("robot_module_a42t").title
+
+        assert k50h != a42t, "заголовки не должны совпадать"
+
+        for title, model in ((k50h, "K50H"), (a42t, "A42T")):
+            assert model in title, f"заголовок обязан называть модель: {title}"
+
+    def test_structure_shows_how_a_node_is_reached(self) -> None:
+        """Список структуры говорит, после какого шага открывается узел."""
+        from equipment_intake.editor import _structure_screen
+
+        text, _ = _structure_screen(DEFAULT_TREE, 0)
+
+        assert "after K50H" in text, "не видно, чем достигается узел K50H"
+        assert "after A42T" in text, "не видно, чем достигается узел A42T"
+
+    def test_node_card_shows_the_context(self) -> None:
+        """Карточка правки узла называет, где этот шаг показывается."""
+        from equipment_intake.editor import _node_edit_caption
+
+        node = DEFAULT_TREE.node("robot_module_k50h")
+        caption = _node_edit_caption(DEFAULT_TREE, node, "admin")
+
+        assert "shown after K50H" in caption
+
+    def test_root_has_no_parent_context(self) -> None:
+        """У корня нет «после чего» — и это не должно выглядеть поломкой."""
+        from equipment_intake.editor import _context_label, _node_parents
+
+        parents = _node_parents(DEFAULT_TREE)
+
+        assert _context_label(parents, DEFAULT_TREE, DEFAULT_TREE.root_id) == "start"
+
+    def test_module_lists_stay_independent(self) -> None:
+        """У моделей **разные** списки модулей.
+
+        Без этого «настройка модулей» снова превратилась бы в один общий список,
+        где у K50H предлагают поворот, которого у него нет.
+        """
+        k50h = {o.label for o in DEFAULT_TREE.node("robot_module_k50h").options}
+        a42t = {o.label for o in DEFAULT_TREE.node("robot_module_a42t").options}
+
+        assert "Safety" in k50h
+        assert "Safety" not in a42t, "Safety — только у K50H"
+        assert "Rotation" in a42t
+        assert "Rotation" not in k50h, "Rotation — только у A42T"

@@ -846,12 +846,62 @@ def _show_option(chat_id, sender, role: str, message_id, notice: str = "") -> bo
 PAGE_SIZE = 8
 
 
+def _node_parents(tree: DecisionTree) -> Dict[str, List[str]]:
+    """Чем достигается узел: «Robot → K50H» для `robot_module_k50h`.
+
+    **Зачем.** Владелец 07.10.2026: «не понятно как настроить модули на роботах,
+    текста одинаковые». Причина была не только в одинаковых заголовках: плоский
+    список узлов **не говорил, чем этот узел достигается**. Увидев
+    `robot_module_a42t`, админ не понимал, что это шаг **после выбора модели
+    A42T**, а не отдельный экран.
+
+    Возвращает для каждого узла подписи ведущих к нему вариантов, например
+    `robot_module_k50h → ["K50H"]`.
+    """
+    parents: Dict[str, List[str]] = {}
+
+    for node in tree.nodes.values():
+        for option in node.options or ():
+            if option.next_node:
+                parents.setdefault(option.next_node, []).append(option.label)
+        # Узлы ввода ведут дальше по `next_node`, вариантов у них нет.
+        if node.next_node and not node.options:
+            parents.setdefault(node.next_node, []).append("→")
+
+    return parents
+
+
+def _context_label(parents: Dict[str, List[str]], tree: DecisionTree, node_id: str) -> str:
+    """Короткая подпись «чем достигается узел» для списка структуры."""
+    raw = parents.get(node_id)
+
+    if not raw:
+        return "start" if node_id == tree.root_id else "not linked"
+
+    labels = [label for label in raw if label != "→"]
+
+    if not labels:
+        # Узел достижим только по цепочке ввода (номер → описание → причина).
+        return "after the previous step"
+
+    unique = sorted(set(labels))
+    head = ", ".join(unique[:3])
+    rest = len(unique) - 3
+
+    return f"after {head}" + (f" +{rest} more" if rest > 0 else "")
+
+
 def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, list]]:
     """
     Обзор всех узлов дерева: видно структуру и скрытые узлы.
 
     Плоский список, но с постраничной навигацией и переходом в любой узел:
     это карта дерева, а не способ правки.
+
+    **Под каждым узлом — чем он достигается.** Без этого список читался как
+    набор равнозначных экранов, и модули роботов выглядели «одинаковыми
+    текстами»: не было видно, что у K50H и A42T **разные** списки, а выбор
+    начинается с модели.
     """
     node_ids = list(tree.nodes)
     pages = max(1, (len(node_ids) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -859,6 +909,7 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
     chunk = node_ids[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     overrides = storage.node_overrides()
+    parents = _node_parents(tree)
 
     lines = [
         "Tree structure",
@@ -876,7 +927,10 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
         position = page * PAGE_SIZE + offset + 1
         options = len(node.options)
         lines.append(f"{position}. {node.title}  ({node.id})")
-        lines.append(f"     {node.type.value} · options: {options}")
+        lines.append(
+            f"     {node.type.value} · options: {options} · "
+            f"{_context_label(parents, tree, node_id)}"
+        )
 
     hidden = [
         node_id for node_id, row in overrides.items()
@@ -981,6 +1035,16 @@ def _node_edit_caption(tree: DecisionTree, node: Node, role: str, notice: str = 
 
     lines.append(f"{node.title}")
     lines.append(f"id: {node.id} · {node.type.value}")
+
+    # **Чем этот узел достигается — прямо в карточке правки.**
+    #
+    # Владелец 07.10.2026: «не понятно как настроить модули на роботах». Узлы
+    # модулей отличались только техническим id, и по карточке нельзя было
+    # понять, что правка затронет **только** выбранную модель.
+    context = _context_label(_node_parents(tree), tree, node.id)
+
+    if context not in ("start", "not linked"):
+        lines.append(f"shown {context}")
 
     if node.description:
         lines.append(f"description: {node.description}")
