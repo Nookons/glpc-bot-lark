@@ -1106,6 +1106,95 @@ def is_shared_topic(chat_id, thread_id) -> bool:
     return False
 
 
+#: Топики, в которые бот **вправе** писать. Всё остальное — молчание.
+#:
+#: Заполняется при старте из конфигурации и используется `_output_topic_allowed`
+#: как последний барьер перед отправкой.
+_ALLOWED_OUTPUT_TOPICS: set = set()
+
+
+def allowed_output_topics() -> set:
+    """Топики, куда бот может писать: приём ошибок, статусы, статистика.
+
+    **Зачем отдельный список.** Владелец 07.10.2026: «бот время от времени
+    продолжает слать в другие топики что он не может его отслеживатьмне нужно
+    чтобы он смотрел только за Ex GLPC, Ex SP3 and Stats ни в какой больше
+    топик он не должен писать вообще его там нету».
+
+    Причина была в `_handle_wrong_topic`: получив сообщение из **чужого**
+    топика, бот отвечал **в тот же чужой топик** — «This topic is not
+    monitored». То есть защита сама и создавала то, от чего защищала.
+
+    Здесь собираются топики, которые бот **обслуживает**: оба топика ошибок
+    (по складам), статусы и статистика. Этот список — единственный источник
+    прав��ы для отправки.
+    """
+    global _ALLOWED_OUTPUT_TOPICS
+
+    if _ALLOWED_OUTPUT_TOPICS:
+        return _ALLOWED_OUTPUT_TOPICS
+
+    topics = set()
+
+    for thread_id in error_topic_map().values():
+        if thread_id is not None:
+            topics.add(int(thread_id))
+
+    # fallback-топик ошибок: в него уходит доставка, если основной недоступен
+    if TELEGRAM_TOPIC_ID:
+        try:
+            topics.add(int(TELEGRAM_TOPIC_ID))
+        except (TypeError, ValueError):
+            pass
+
+    for kind in ("status", "stats"):
+        configured = topic_thread(kind)
+
+        if configured is not None:
+            topics.add(int(configured))
+
+    # Белый список тестового бота — тоже разрешённые топики.
+    topics.update(int(tid) for tid in LISTEN_TOPIC_IDS)
+
+    _ALLOWED_OUTPUT_TOPICS = topics
+
+    return topics
+
+
+def _output_topic_allowed(chat_id, thread_id) -> bool:
+    """Можно ли отправить сообщение в этот топик.
+
+    Проверяется **перед каждой отправкой** и не даёт ни одному пути кода
+    написать туда, где бота «нет». Возвращает True, только если топик
+    принадлежит списку обслуживаемых.
+
+    **Почему не `topic_allowed`.** Тот отвечает на другой вопрос — «следует ли
+    обрабатывать входящее». Команды настройки (`/id`) разрешены из чужого
+    топика намеренно, чтобы человек мог узнать номер; но **ответ** в чужой
+    топик — это уже нарушение.
+    """
+    allowed = allowed_output_topics()
+
+    # **Пустой список или режим «фильтра нет» — барьер не активен.**
+    #
+    # Крайний случай, найденный тестами стенда: когда топики не настроены
+    # (локальный прогон, свежая установка), список пуст. Строгая проверка
+    # превратила бы это в **полную немоту бота**, и поломка выглядела бы как
+    # «бот перестал отвечать» без единой ошибки в логе.
+    #
+    # Молчание правильно только тогда, когда **есть** топики, куда бот вправе
+    # писать: значит, текущий точно чужой. Если не настроено ничего, работает
+    # обычный фильтр топиков.
+    if not allowed:
+        return True
+
+    # General (без топика): при настроенных топиках бот туда не пишет вообще.
+    if thread_id is None:
+        return False
+
+    return int(thread_id) in allowed
+
+
 def monitored_topic_label() -> str:
     """Человекочитаемое описание топиков ошибок (по складам)."""
     # Белый список важнее: если он задан, именно он описывает приём.
@@ -1259,6 +1348,25 @@ def _send(
     if thread_id is None:
         thread_id = _reply_thread(chat_id)
 
+    # **Последний барьер: бот молчит там, где его нет.**
+    #
+    # Владелец 07.10.2026: «ни в какой больше топик он не должен писать вообще
+    # его там нету». Проверка стоит в **единственной** точке отправки, поэтому
+    # её не обойдёт ни один путь кода — ни команда, ни фоновая досылка, ни
+    # предупреждение о чужом топике.
+    #
+    # Раньше такого барьера не было, и `_handle_wrong_topic` отвечал **в тот же
+    # чужой топик** («This topic is not monitored») — защита сама создавала то,
+    # от чего защищала.
+    if not _output_topic_allowed(chat_id, thread_id):
+        logger.warning(
+            "Отправка отклонена: топик %s не обслуживается (chat=%s, allowed=%s)",
+            thread_id,
+            chat_id,
+            sorted(allowed_output_topics()),
+        )
+        return None
+
     if dry_run():
         # Отвечать ли в этот топик, решает telegram_api: он пропускает
         # только топики из белого списка. Здесь — необязательная пометка
@@ -1321,10 +1429,22 @@ def _send(
 
 
 def _send_action(chat_id, action="typing"):
+    """«Печатает…» в топике маршрута.
+
+    **Тот же барьер, что и у сообщений.** Индикатор — тоже отправка в Telegram:
+    появившись в чужом топике, он выдаёт присутствие бота там, где его быть не
+    должно. Владелец 07.10.2026: «ни в какой больше топик он не должен писать
+    вообще его там нету».
+    """
+    thread_id = _route_thread(chat_id)
+
+    if not _output_topic_allowed(chat_id, thread_id):
+        return None
+
     return tg.send_chat_action(
         chat_id,
         action,
-        message_thread_id=_route_thread(chat_id),
+        message_thread_id=thread_id,
     )
 
 
@@ -1334,15 +1454,20 @@ def _fallback_thread_allowed(chat_id, thread_id) -> bool:
 
     Фолбэк существует только для случая «в топике-источнике отправить
     нельзя» (например, General закрыт). Но сам фолбэк — тоже отправка в
-    Telegram, поэтому он разрешён лишь в топик, который бот мониторит.
-    Иначе бот снова писал бы в чужой топик — ровно то, что запрещено.
+    Telegram, поэтому он разрешён лишь в топик, который бот **обслуживает**.
+
+    **Проверка усилена 07.10.2026.** Раньше здесь стоял `topic_allowed` — а он
+    отвечает на другой вопрос: «обрабатывать ли входящее». Он **пропускает**
+    команды настройки и�� чужого топика (это нужно для `/id`), поэтому как
+    разрешение на отправку он не годится: фолбэк мог уйти туда, где бота нет.
+
+    Теперь используется тот же барьер, что и в `_send`, — список обслуживаемых
+    топиков.
     """
     if thread_id is None:
         return False
 
-    allowed, _reason = topic_allowed(chat_id, thread_id)
-
-    return bool(allowed)
+    return _output_topic_allowed(chat_id, thread_id)
 
 
 
@@ -1558,7 +1683,25 @@ def _handle_wrong_topic(chat_id, thread_id, reason, error_attempt: bool = False)
             f"to the {monitored_topic_label()}."
         )
 
-    _send(chat_id, text, thread_id=thread_id)
+    # **Отвечаем в СВОЙ топик, а не в чужой.**
+    #
+    # Владелец 07.10.2026: «бот время от времени продолжает слать в другие
+    # топики что он не может его отслеживатьмне нужно чтобы он смотрел только
+    # за Ex GLPC, Ex SP3 and Stats ни в какой больше топик он не должен писать
+    # вообще его там нету».
+    #
+    # Дефект был именно здесь: получив сообщение из чужого топика, бот отвечал
+    # **в тот же чужой топик** — «This topic is not monitored». То есть защита
+    # сама создавала то, от чего защищала: в топике, где бота «нет», появлялось
+    # его сообщение.
+    #
+    # Теперь предупреждение уходит в **служебный топик статистики** — туда, где
+    # бот вправе писать. Если и его нет, `_send` молча отклонит отправку
+    # (барьер `_output_topic_allowed`), что и требуется: лучше промолчать, чем
+    # отметиться там, где бота быть не должно.
+    target = topic_thread("stats")
+
+    _send(chat_id, text, thread_id=target)
 
 
 # ============================================================
@@ -2400,11 +2543,17 @@ def _show_error_menu(
     if path:
         caption = f"📷 {error_menu_label(path)}\nChoose a sub-type:"
 
+    # Барьер тот же: меню не должно появляться в необслуживаемом топике.
+    target = _reply_thread(chat_id)
+
+    if not _output_topic_allowed(chat_id, target):
+        return None
+
     sent = tg.send_photo(
         chat_id,
         photo_path,
         caption=caption,
-        message_thread_id=_reply_thread(chat_id),
+        message_thread_id=target,
         reply_markup=keyboard,
     )
 
@@ -5255,6 +5404,16 @@ def main():
             )
 
     console.print(f"[cyan]Monitored topic: {monitored_topic_label()}[/cyan]")
+
+    # **Где бот вправе писать — видно в стартовом логе.**
+    #
+    # Список строится один раз при старте: это единственный источник правды для
+    # барьера `_output_topic_allowed`. Если ожидаемого топика здесь нет, бот
+    # будет в нём молчать — и это видно сразу, а не по жалобе владельца.
+    console.print(
+        f"[cyan]Allowed output topics: "
+        f"{sorted(allowed_output_topics()) or 'NONE — бот будет молчать'}[/cyan]"
+    )
 
     console.print("[cyan]Topic routing:[/cyan]")
 
