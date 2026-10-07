@@ -7,6 +7,30 @@ REPORTS = "telegram_equipment_reports"
 QUEUE = "telegram_devices_to_add"
 
 
+def _escape_md(value) -> str:
+    """Готовит значение к подстановке в разметку Lark (`lark_md`).
+
+    **Зачем.** Значения карточки — это **введённое человеком**: номер устройства
+    бывает составным (`H108/1834`), а бывает и целой строкой текста
+    (`X=123.45; Y=453.35; Zone=30`). В `lark_md` символы `*`, `_`, `~`, `` ` ``
+    управляют офор��лением, поэтому значение вида `**важное**` **ломало
+    разметку** карточки: часть текста становилась жирной, а структура полей
+    разъезжалась.
+
+    Проверено 07.10.2026: `device_number = "**жирный**"` давал
+    `**Device number**: **жирный**` вместо обычного текста.
+
+    Экранируется ровно то, что определяет оформление в Lark; апострофы и
+    двоеточия не трогаются — они безвредны и в номерах встречаются.
+    """
+    text = str(value)
+
+    for char in ("\\", "*", "_", "~", "`"):
+        text = text.replace(char, "\\" + char)
+
+    return text
+
+
 def _category(value):
     """Single source of truth: the journal writer owns this mapping."""
     from .report_writer import intake_category
@@ -155,11 +179,23 @@ def _identity_field(answers):
 
 def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     a = result.get("answers") or {}; category = _category(a.get("object"))
-    labels = {"robot":"Robot", "workstation":"Workstation", "charging":"Charging station", "qr":"QR code"}
+    # Ключ `qr_code`, а не `qr`: `intake_category` канонизирует именно в
+    # `qr_code` (так записано в базе), и прежний ключ `qr` **не совпадал** —
+    # карточка показывала сырое `qr_code` вместо «QR code». Найдено 07.10.2026
+    # проверкой карточки для QR-отчёта.
+    labels = {
+        "robot": "Robot",
+        "workstation": "Workstation",
+        "charging": "Charging station",
+        "qr_code": "QR code",
+        # Старое написание оставлено на случай данных, записанных до
+        # канонизации: иначе такая строка сно��а показалась бы сырым кодом.
+        "qr": "QR code",
+    }
     identity_label, identity_value = _identity_field(a)
-    fields = [("Warehouse",result.get("warehouse") or "Unknown"),("Equipment",f"{labels.get(category,category)} · {a.get('device_type') or '—'}"),(identity_label,identity_value)]
-    if a.get("module"): fields.append(("Module",a["module"]))
-    fields.append(("Reported by",result.get("employee") or result.get("username") or "Unknown"))
+    fields = [("Warehouse",_escape_md(result.get("warehouse") or "Unknown")),("Equipment",f"{labels.get(category,category)} · {_escape_md(a.get('device_type') or '—')}"),(identity_label,_escape_md(identity_value))]
+    if a.get("module"): fields.append(("Module",_escape_md(a["module"])))
+    fields.append(("Reported by",_escape_md(result.get("employee") or result.get("username") or "Unknown")))
 
     # **Осталось одно поле вместо трёх.**
     #

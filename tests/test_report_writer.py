@@ -2281,3 +2281,71 @@ class StatsRobotTopIsLonger(unittest.TestCase):
         )
 
         self.assertIn("more", robots_line)
+
+
+class LarkCardTextIsCorrect(unittest.TestCase):
+    """Карточка в Lark: ярлык категории и экранирование разметки.
+
+    **Дефект 1 (07.10.2026):** карточка показывала сырое `qr_code`.
+    `intake_category` канонизирует `qr` → `qr_code` (так записано в базе), а
+    словарь ярлыков в `_card` знал только ключ `qr` — он **не совпадал**.
+
+    **Дефект 2:** значения карточки — введённый человеком текст, а в разметке
+    Lark символы `*`, `_`, `~`, `` ` `` управляют оформлением. Номер устр��йства
+    вида `**важное**` ломал структуру полей.
+    """
+
+    def _fields(self, answers: dict) -> dict:
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {"answers": answers, "warehouse": "GLP-C", "employee": "Тест"},
+            None, True, False, True,
+        )
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+        return rows
+
+    def test_qr_report_shows_a_readable_label(self) -> None:
+        """QR-отчёт показывает «QR code», а не сырое `qr_code`."""
+        rows = self._fields({"object": "qr_code", "device_number": "30"})
+
+        self.assertIn("QR code", rows["Equipment"])
+        self.assertNotIn("qr_code", rows["Equipment"])
+
+    def test_other_categories_are_readable_too(self) -> None:
+        for key, expected in (
+            ("robot", "Robot"),
+            ("workstation", "Workstation"),
+            ("charging", "Charging station"),
+        ):
+            rows = self._fields({"object": key, "device_number": "1"})
+            self.assertIn(expected, rows["Equipment"], f"категория {key}")
+
+    def test_markdown_characters_are_escaped(self) -> None:
+        """Спецсимволы в значении не ломают разметку карточки."""
+        rows = self._fields({"object": "robot", "device_number": "**жирный**"})
+
+        self.assertEqual(rows["Device number"], "\\*\\*жирный\\*\\*")
+        # Ключевое: без экранирования Lark сделал бы текст жирным и съел
+        # звёздочки — структура полей разъехалась бы.
+        self.assertNotEqual(rows["Device number"], "**жирный**")
+
+    def test_ordinary_numbers_are_untouched(self) -> None:
+        """Экранирование не портит обычные значения.
+
+        Номера бывают составными (`H108/1834`) и с координатами
+        (`X=123.45; Y=453.35`) — они обязаны отображаться **как есть**.
+        """
+        for value in ("3780", "H108/1834", "X=123.45; Y=453.35; Zone=30"):
+            rows = self._fields({"object": "qr_code", "device_number": value})
+            self.assertEqual(rows["Device number"], value)
+
+    def test_qr_code_without_a_number_still_renders(self) -> None:
+        """У QR-отчёта может не быть номера — карточка обязана собраться."""
+        rows = self._fields({"object": "qr_code"})
+
+        self.assertIn("QR code", rows["Equipment"])
+        self.assertEqual(rows["Intake details"], "Saved")
