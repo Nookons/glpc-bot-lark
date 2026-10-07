@@ -1642,6 +1642,16 @@ class ConfirmationTextChecks(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
+        # **Сессию доводим до конца.** 07.10.2026 `_confirm` получил защиту от
+        # незавершённой сессии: раньше он писал что есть, и в базу уходили
+        # строки с пустым описанием и без устройства — таких нашли 11 с 04.10.
+        # Тест подтверждает **завершённый** путь, поэтому его и проходим.
+        session.select("robot")
+        session.select("k50h")
+        session.select("safety")
+        session.submit_text("3780")
+        session.submit_text("Lift reports an error")
+        session.select("obstacle")
         session.data.update(
             {"warehouse": warehouse, "image": "/tmp/p.jpg", "message_id": 5}
         )
@@ -1712,6 +1722,10 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
+        # Сессию доводит до конца сам тест ниже: у него свои шаги, и добавленные
+        # здесь дублировали бы их (`summary` не принимает выбор варианта).
+        # Первый помощник сессию завершает сам — `_confirm` теперь не пишет
+        # незавершённый путь.
         session.data.update(
             {
                 "warehouse": warehouse,
@@ -1725,6 +1739,9 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
 
         session.submit_text("3490")
         session.submit_text("Lift reports an error")
+        # Причина — последний шаг: без него сессия не завершена, и `_confirm`
+        # справедливо откажет (защита от записи неполного пути).
+        session.select("obstacle")
 
         calls = []
         lookup = context or (lambda _: ("Smoke User", {"card_id": 60072001}))
@@ -2055,3 +2072,88 @@ class ZoneChecks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class IncompleteSessionIsNotWritten(unittest.TestCase):
+    """Незавершённую сессию не записываем в базу.
+
+    **Дефект, найденный 07.10.2026.** `_confirm` брал `session.result()` и сразу
+    писал строку, **не проверяя полноту**. Если подтверждение приходило до конца
+    пути (кнопка Confirm висит на финальном экране, но callback можно отправить
+    и раньше — повторным нажатием из старого сообщения), в базу уходила запись с
+    **пустым описанием и без устройства**.
+
+    Проверено на живой базе: **11 таких строк** с 04.10, у всех
+    `issue_description = 'Reported error: '` и `solving_time = 0`. В отчёте они
+    выглядели как ошибки без типа и устройства и портили топ устройств и среднее
+    время.
+    """
+
+    def test_incomplete_session_is_refused(self):
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        # Путь не начат: ответов нет вовсе.
+        session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
+        sent = []
+
+        with mock.patch.object(flow, "_bot") as bot, \
+             mock.patch.object(flow, "edit_caption") as edit, \
+             mock.patch("equipment_intake.integrations.persist_and_send") as save:
+            bot.return_value._send.side_effect = lambda *a, **k: sent.append(a)
+            flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
+
+        self.assertFalse(save.called, "незавершённая сессия не должна писаться")
+        self.assertFalse(edit.called, "карточк�� не должна рисоваться")
+        self.assertTrue(sent, "человеку нужно сказать, чего не хватает")
+
+    def test_refusal_names_the_unfinished_step(self):
+        """Отказ называет шаг, который не закончен, — иначе непонятно, что делать."""
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        session.select("robot")
+        session.select("k50h")
+        session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
+        sent = []
+
+        with mock.patch.object(flow, "_bot") as bot, \
+             mock.patch.object(flow, "edit_caption"), \
+             mock.patch("equipment_intake.integrations.persist_and_send"):
+            bot.return_value._send.side_effect = lambda *a, **k: sent.append(a)
+            flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
+
+        self.assertTrue(sent)
+        self.assertIn("Which robot module?", sent[0][1])
+
+    def test_completed_session_is_written(self):
+        """Завершённый путь пишется — защита не ломает обычную работу."""
+        from equipment_intake import flow
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(tree=DEFAULT_TREE)
+        for step in ("robot", "k50h", "safety"):
+            session.select(step)
+        session.submit_text("3780")
+        session.submit_text("Lift reports an error")
+        session.select("obstacle")
+        session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
+
+        with mock.patch.object(flow, "_bot"), \
+             mock.patch.object(flow, "edit_caption"), \
+             mock.patch.object(flow, "_employee_context", return_value=("U", None)), \
+             mock.patch("equipment_intake.integrations.persist_and_send",
+                        return_value={"database_saved": True, "device_queued": False,
+                                      "lark_delivered": True, "glpc_saved": True,
+                                      "glpc_error": None}) as save:
+            flow._confirm(-100, {"id": 1, "username": "u"}, session, 5)
+
+        self.assertTrue(save.called, "завершённый путь должен записываться")
+        report = save.call_args.args[0]
+        self.assertEqual(report["answers"]["device_number"], "3780")
+        self.assertEqual(report["answers"]["cause"], "Obstacle on the path")

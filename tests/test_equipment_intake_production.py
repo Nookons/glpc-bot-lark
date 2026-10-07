@@ -443,6 +443,13 @@ class IntegrationChecks(unittest.TestCase):
         """The operator must learn the report was not filed, and why."""
         sender = {"id": 1, "username": "u"}
         session = Session(tree=DEFAULT_TREE)
+        # Путь до конца: `_confirm` не пишет незавершённую сессию — иначе в базу
+        # уходили строки с пустым описанием (11 таких нашли с 04.10).
+        for step in ("robot", "k50h", "safety"):
+            session.select(step)
+        session.submit_text("3780")
+        session.submit_text("Lift reports an error")
+        session.select("obstacle")
         session.data.update({"warehouse": "", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
 
@@ -463,6 +470,11 @@ class IntegrationChecks(unittest.TestCase):
     def test_confirm_message_reports_success(self):
         sender = {"id": 1, "username": "u"}
         session = Session(tree=DEFAULT_TREE)
+        for step in ("robot", "k50h", "safety"):
+            session.select(step)
+        session.submit_text("3780")
+        session.submit_text("Lift reports an error")
+        session.select("obstacle")
         session.data.update({"warehouse": "SMALL-P3", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
 

@@ -567,6 +567,33 @@ def _confirm(chat_id, sender, session: Session, message_id) -> None:
     словами. Через 1–2 недели по этим записям видно, какие формулировки и
     модули повторяются — из них делаются готовые варианты кнопок.
     """
+    # **Незавершённую сессию не пишем.**
+    #
+    # Дефект, найденный 07.10.2026: `_confirm` брал `session.result()` и сразу
+    # писал строку, **не проверяя полноту**. Если подтверждение приходило до
+    # конца пути (кнопка Confirm висит на финальном экране, но callback можно
+    # отправить и раньше — например, повторным нажатием из старого сообщения),
+    # в базу уходила запись с **пустым описанием и без устройства**.
+    #
+    # Проверено на живой базе: **11 таких строк** с 04.10, у всех
+    # `issue_description = 'Reported error: '` и `solving_time = 0`. В отчёте
+    # они попадали как ошибки без типа и устройства и портили и топ устройств, и
+    # среднее время.
+    #
+    # Отказ мягкий: сообщаем человеку, что путь не закончен, и оставляем сессию
+    # живой — он допишет ответ и подтвердит снова. Терять уже введённое нельзя.
+    if not session.is_completed:
+        node = session.current_node()
+        missing = node.title if node is not None else "the last step"
+
+        _bot()._send(
+            chat_id,
+            f"⚠️ Finish «{missing}» first, then confirm.",
+            reply_to_message_id=message_id,
+            delete_after=10,
+        )
+        return
+
     result = session.result()
     result["warehouse"] = session.data.get("warehouse") or ""
     result["note"] = session.data.get("note") or ""
