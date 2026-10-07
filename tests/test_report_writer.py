@@ -1402,7 +1402,19 @@ class LarkCardChecks(unittest.TestCase):
 
         self.assertEqual(rows["Device number"], "—")
 
-    def test_supabase_field_reflects_the_save_result(self):
+    def test_card_does_not_carry_the_save_status(self):
+        """Карточка в Lark **не** сообщает о результате записи.
+
+        **07.10.2026 владелец:** «убери Intake details, оно там не нужно».
+
+        Строка была внутренней подробностью: кладовщик читает карточку, чтобы
+        понять, что случилось на складе, а не в какую таблицу попали данные.
+
+        **Сбой записи при этом не скрывается** — он виден оператору в Telegram
+        (`flow.confirmation_card`: «Journal entry not saved», «Details save
+        failed») и остаётся в логе. Здесь проверяется именно то, что карточка
+        группы больше его не дублирует.
+        """
         from equipment_intake import integrations
 
         card = integrations._card(
@@ -1411,7 +1423,59 @@ class LarkCardChecks(unittest.TestCase):
         )
         text = json.dumps(card, ensure_ascii=False)
 
-        self.assertIn("Save failed", text)
+        self.assertNotIn("Intake details", text)
+        self.assertNotIn("Save failed", text)
+
+    def test_reason_is_sent_to_the_group(self):
+        """Причина ошибки уходит в карточку группы.
+
+        **Владелец 07.10.2026:** «в парк так же нужно отправлять Reason для
+        ошибки».
+
+        Вопрос «What caused it?» был добавлен в дерево приёма, и ответ
+        **сохранялся** в `answers`, но в карточку не попадал: группа видела,
+        **что** случилось, и не видела, **почему**.
+        """
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {
+                "answers": {
+                    "object": "Robot",
+                    "device_number": "3528",
+                    "module": "Chassis",
+                    "cause": "Mechanical wear",
+                },
+                "warehouse": "GLP-C",
+                "employee": "Тест",
+            },
+            None, True, False,
+        )
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+
+        self.assertEqual(rows["Reason"], "Mechanical wear")
+
+    def test_card_without_a_reason_still_renders(self):
+        """Старые записи без причины не ломают карточку.
+
+        Причину начали спрашивать 07.10.2026, поэтому у ранних отчётов её нет.
+        Пустое поле «Reason: —» только занимало бы место.
+        """
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {"answers": {"object": "Robot", "device_number": "1"}, "warehouse": "GLP-C"},
+            None, True, False,
+        )
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+
+        self.assertNotIn("Reason", rows)
 
     def test_card_reports_the_shift_journal_separately(self):
         """Сбой журнала смен виден в карточке.
@@ -1427,7 +1491,9 @@ class LarkCardChecks(unittest.TestCase):
         """
         rows = self.fields_glpc(db_saved=True, glpc_saved=False)
 
-        self.assertEqual(rows["Intake details"], "Saved")
+        # `Intake details` убрано из карточки 07.10.2026 («оно там не нужно») —
+        # это внутренняя подробность записи, а не событие склада.
+        self.assertNotIn("Intake details", rows)
         self.assertEqual(rows["Shift journal"], "Save failed")
 
     def test_card_does_not_show_the_journal_when_it_succeeded(self):
@@ -1438,7 +1504,7 @@ class LarkCardChecks(unittest.TestCase):
         """
         rows = self.fields_glpc(db_saved=True, glpc_saved=True)
 
-        self.assertEqual(rows["Intake details"], "Saved")
+        self.assertNotIn("Intake details", rows, "служебное поле убрано")
         self.assertNotIn(
             "Shift journal", rows, "успешная запись в журнал не должна выводиться"
         )
@@ -2354,7 +2420,7 @@ class LarkCardTextIsCorrect(unittest.TestCase):
         rows = self._fields({"object": "qr_code"})
 
         self.assertIn("QR code", rows["Equipment"])
-        self.assertEqual(rows["Intake details"], "Saved")
+        self.assertIn("Reported by", rows, "карточка собралась")
 
 
 class ConfirmShowsProgress(unittest.TestCase):
