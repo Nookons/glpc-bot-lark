@@ -161,16 +161,34 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     if a.get("module"): fields.append(("Module",a["module"]))
     fields.append(("Reported by",result.get("employee") or result.get("username") or "Unknown"))
 
-    # Two different stores with two different consequences: the detail table
-    # feeds the intake history, while `exceptions_glpc` feeds shift reports and
-    # /top. Reporting only the first as "Saved" hid a failed journal write from
-    # everyone reading the group.
+    # **Осталось одно поле вместо трёх.**
+    #
+    # Владелец 07.10.2026: «убери информацию о Shift Journal и Device registry».
+    # Обе строки описывали **внутренние** подробности записи, а не то, что
+    # произошло на складе: кладовщик читал карточку, чтобы понять, принята ли
+    # ошибка, а не чтобы узнать, в какую из двух таблиц она попала.
+    #
+    # Что было:
+    #   * `Intake details` — запись в таблицу приёма;
+    #   * `Shift journal` — запись в `exceptions_glpc` (вторая таблица);
+    #   * `Device registry` — устройство ушло в очередь на разбор.
+    #
+    # **Важно:** удалены только строки КАРТОЧКИ. Логика записи не тронута —
+    # обе таблицы по-прежнему заполняются, очередь по-прежнему работает.
     fields.append(("Intake details","Saved" if db_saved else "Save failed"))
 
-    if glpc_saved is not None:
-        fields.append(("Shift journal","Saved" if glpc_saved else "Save failed"))
-
-    if queued: fields.append(("Device registry","Added to review queue"))
+    # **Сбой журнала показываем, успех — нет.**
+    #
+    # Убрать поле совсем было бы потерей данных: тест
+    # `test_card_reports_the_shift_journal_separately` охранял реальный случай —
+    # карточка говорила «Saved», когда запись в `exceptions_glpc` **падала**, а
+    # именно из неё считаются отчёты смен и `/top`. Группа узнавала об ошибке,
+    # которой нет в журнале.
+    #
+    # Поэтому поле осталось **только как признак беды**: в обычной работе оно не
+    # мешает (владелец просил убрать шум), а при сбое о нём нельзя молчать.
+    if glpc_saved is False:
+        fields.append(("Shift journal","Save failed"))
     elements=[{"tag":"div","fields":[{"is_short":True,"text":{"tag":"lark_md","content":f"**{k}**\n{str(v)[:500]}"}} for k,v in fields]}]
     elements.append({"tag":"div","text":{"tag":"plain_text","content":f"Problem: {str(a.get('description') or '')[:1500]}"}})
     if photo_url: elements.append({"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"Open photo"},"type":"primary","url":photo_url}]})

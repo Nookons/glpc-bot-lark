@@ -1414,21 +1414,34 @@ class LarkCardChecks(unittest.TestCase):
         self.assertIn("Save failed", text)
 
     def test_card_reports_the_shift_journal_separately(self):
-        """
-        Regression: the card claimed "Supabase: Saved" even when the shift
-        journal (`exceptions_glpc`) failed. Shift reports and /top read that
-        journal, so the group was told a fault was recorded when it was not.
+        """Сбой журнала смен виден в карточке.
+
+        Regression: карточка говорила «Saved», когда запись в `exceptions_glpc`
+        **падала**. Из этого журнала считаются отчёты смен и `/top`, то есть
+        группа узнавала об ошибке, которой в журнале нет.
+
+        **07.10.2026 владелец попросил убрать строку из карточки** («убери
+        информацию о Shift Journal») — она была внутренней подробностью и
+        мешала читать карточку. Убрана **только как признак успеха**: при сбое
+        о ней по-прежнему сообщаем, иначе потеря данных стала бы молчаливой.
         """
         rows = self.fields_glpc(db_saved=True, glpc_saved=False)
 
         self.assertEqual(rows["Intake details"], "Saved")
         self.assertEqual(rows["Shift journal"], "Save failed")
 
-    def test_card_shows_both_stores_when_both_succeed(self):
+    def test_card_does_not_show_the_journal_when_it_succeeded(self):
+        """Успех журнала не показываем — это и просил убрать владелец.
+
+        Строка дублировала «Intake details: Saved» и описывала внутреннюю
+        подробность записи, а не то, что произошло на складе.
+        """
         rows = self.fields_glpc(db_saved=True, glpc_saved=True)
 
         self.assertEqual(rows["Intake details"], "Saved")
-        self.assertEqual(rows["Shift journal"], "Saved")
+        self.assertNotIn(
+            "Shift journal", rows, "успешная запись в журнал не должна выводиться"
+        )
 
     def test_card_omits_the_journal_field_when_the_caller_does_not_know(self):
         """Legacy callers that pass no journal outcome still get a valid card."""
@@ -2164,3 +2177,107 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         report = save.call_args.args[0]
         self.assertEqual(report["answers"]["device_number"], "3780")
         self.assertEqual(report["answers"]["cause"], "Obstacle on the path")
+
+
+class StatsRobotTopIsLonger(unittest.TestCase):
+    """`/stats` показывает больше роботов, чем автоматический отчёт.
+
+    **Владелец 07.10.2026:** «на команду /stats сделай больше роботов в топе
+    10-20».
+
+    **Почему лимитов два, а не один.** Автоматический отчёт приходит в группу по
+    расписанию (06:00 и 18:00) и читается на ходу — длинный список роботов
+    мешал бы видеть главное. `/stats` человек запрашивает **специально**, чтобы
+    разобраться, и «+N more» там бесполезно: роботов на складе сотни.
+    """
+
+    def _metrics(self, robots: int) -> dict:
+        return {
+            "total": robots,
+            "types": {"Structural damage": robots},
+            "employees": {"Тест": robots},
+            # Ключи — номера роботов, значения — число ошибок (по убыванию).
+            "robots": {str(1000 + i): robots - i for i in range(robots)},
+            "maintenance": {},
+            "downtime_minutes": 0,
+            # `previous` и `delta` повторяют форму из `shift_report.shift_metrics`:
+            # `delta` — **число** (разница итогов), а не словарь, иначе
+            # `format_delta` падает на сравнении.
+            "previous": {"total": 0, "shift": None, "date": None},
+            "delta": 0,
+            "warehouse": "GLP-C",
+        }
+
+    def test_stats_top_holds_more_than_the_default(self) -> None:
+        import shift_report
+
+        text = shift_report.build_shift_summary(
+            "2026-10-06", "day", self._metrics(40), "GLP-C",
+            robot_top=shift_report.STATS_ROBOT_TOP,
+        )
+        robots_line = next(
+            line for line in text.splitlines() if line.startswith("🤖 Top robots:")
+        )
+
+        # Каждый показанный робот — это «номер (число)».
+        shown = robots_line.count("(") - robots_line.count("more")
+        self.assertGreaterEqual(shown, 10, f"в /stats слишком мало роботов: {shown}")
+        self.assertLessEqual(shown, 20, f"в /stats слишком много роботов: {shown}")
+
+    def test_default_report_stays_short(self) -> None:
+        """Автоматический отчёт остаётся коротким — его читают на ходу."""
+        import shift_report
+
+        text = shift_report.build_shift_summary(
+            "2026-10-06", "day", self._metrics(40), "GLP-C"
+        )
+        robots_line = next(
+            line for line in text.splitlines() if line.startswith("🤖 Top robots:")
+        )
+        shown = robots_line.count("(") - robots_line.count("more")
+
+        self.assertEqual(shown, shift_report.REPORT_TOP)
+
+    def test_stats_command_actually_passes_its_limit(self) -> None:
+        """Команда `/stats` **реально передаёт** свой лимит.
+
+        **Почему этот тест отдельный.** Первые три проверяли
+        `build_shift_summary` напрямую — и **не падали**, когда я сломал
+        проводку в `_stats_text` (подменил лимит на короткий). Тест, который
+        сам зовёт функцию и сам передаёт параметр, **не проверяет**, что
+        приложение передаёт его так же.
+
+        Здесь проверяется настоящий путь `_stats_text` → `build_shift_summary`.
+        """
+        import telegram_bot
+        import shift_report
+
+        captured = {}
+
+        def fake_summary(shift_date, shift_name, metrics=None, warehouse=None, robot_top=None):
+            captured["robot_top"] = robot_top
+            return "ok"
+
+        with mock.patch.object(shift_report, "shift_metrics", return_value={}), \
+             mock.patch.object(telegram_bot, "build_shift_summary", fake_summary):
+            telegram_bot._stats_text("2026-10-06", "day", "GLP-C")
+
+        self.assertEqual(
+            captured.get("robot_top"),
+            shift_report.STATS_ROBOT_TOP,
+            "команда /stats обязана передавать СВОЙ лимит, а не общий",
+        )
+
+    def test_longer_top_keeps_the_remaining_count(self) -> None:
+        """Остаток всё равно называется: иначе непонятно, что список неполон."""
+        import shift_report
+
+        text = shift_report.build_shift_summary(
+            "2026-10-06", "day", self._metrics(40), "GLP-C",
+            robot_top=shift_report.STATS_ROBOT_TOP,
+        )
+        robots_line = next(
+            line for line in text.splitlines() if line.startswith("🤖 Top robots:")
+        )
+
+        self.assertIn("more", robots_line)

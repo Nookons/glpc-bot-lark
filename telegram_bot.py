@@ -79,7 +79,10 @@ from sendToDataBase import (
     table_exists,
 )
 from shift import get_current_shift
-from shift_report import build_shift_summary, shift_metrics, start_shift_scheduler
+from shift_report import (
+    STATS_ROBOT_TOP,
+    build_shift_summary, shift_metrics, start_shift_scheduler,
+)
 from text_utils import ascii_digits, truncate
 from telegram_store import (
     StoreUnavailable,
@@ -2790,7 +2793,13 @@ def _stats_text(shift_date: str, shift_name: str, warehouse: str = None) -> str:
     """
     metrics = shift_metrics(shift_date, shift_name, warehouse)
 
-    return build_shift_summary(shift_date, shift_name, metrics, warehouse)
+    # Топ роботов по команде — длиннее, чем в автоматическом отчёте.
+    # Владелец 07.10.2026: «на команду /stats сделай больше роботов в топе 10-20»:
+    # отчёт приходит по расписанию и читается на ходу, а `/stats` запрашивают
+    # специально, чтобы разобраться, и «+N more» там бесполезно.
+    return build_shift_summary(
+        shift_date, shift_name, metrics, warehouse, robot_top=STATS_ROBOT_TOP
+    )
 
 
 def _handle_stats(chat_id, args, reply_to):
