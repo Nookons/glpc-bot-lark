@@ -48,6 +48,11 @@ from .types import (
 # спросить номер оборудования, затем описание.
 ASK_NUMBER = "ask_number"
 ASK_DESCRIPTION = "ask_description"
+#: Вопрос о причине ошибки — **владелец: «добавить причину ошибки как ещё один
+#: вопрос»**. Отв��чает на «почему это случилось», а не «что сломалось»:
+#: описание проблемы и её причина — разные вещи, и раньше причину не спрашивали
+#: вовсе, поэтому в отчётах её не было.
+ASK_CAUSE = "ask_cause"
 SUMMARY = "summary"
 
 
@@ -84,9 +89,9 @@ def _build_nodes() -> dict:
         summary_label="Type",
         description="Choose the robot model.",
         options=(
-            opt("a42t_c2", "A42T C2", "robot_module"),
-            opt("a42t", "A42T", "robot_module"),
-            opt("k50h", "K50H", "robot_module"),
+            opt("a42t_c2", "A42T C2", "robot_module_a42t"),
+            opt("a42t", "A42T", "robot_module_a42t"),
+            opt("k50h", "K50H", "robot_module_k50h"),
         ),
     ))
 
@@ -103,17 +108,54 @@ def _build_nodes() -> dict:
         ),
     ))
 
+    # ------------------------------------------------------------
+    # Модули робота — **отдельный узел на каждую модель**
+    # ------------------------------------------------------------
+    #
+    # **Владелец 07.10.2026:** «нужно как-то сделать модуля отдельно на роботов,
+    # потому что например на K50H мы имеем только 3 модуля это lift, chassis and
+    # safety, больше нету — и нету смысла показывать все в таком случае».
+    #
+    # **Почему отдельные узлы, а не один с `only_for`.** Механизм `only_for` в
+    # дереве есть и работае�� (`visible_options` фильтрует варианты по пути), но
+    # валидатор запрещает **одинаковые id вариантов внутри узла** — а `lifting`
+    # нужен и K50H, и A42T. Отдельные узлы снимают это ограничение честно:
+    # у каждой модели свой список модулей, и его правит редактор независимо.
+    # Побочно это точнее отвечает на вопрос «какие модули у этой модели».
+    #
+    # Идентификатор варианта остаётся **человеческим** (`lifting`, `chassis`):
+    # он попадает в отчёт и в статистику, поэтому префикс модели к нему не
+    # добавляю — иначе в отчётах появились бы `k50h_lifting` и `a42t_lifting`
+    # как разные модули, хотя это один и тот же узел железа.
     add(choice_node(
-        "robot_module",
+        "robot_module_k50h",
         "Which robot module?",
         key="module",
         summary_label="Module",
-        description="Choose the faulty module or add an option via /tree.",
+        description="K50H has three modules: lifting, chassis and safety.",
+        options=(
+            opt("lifting", "Lifting", ASK_NUMBER),
+            opt("chassis", "Chassis", ASK_NUMBER),
+            opt("safety", "Safety", ASK_NUMBER),
+            # Ошибка бывает не в модуле: сбой программы, грязный код пола,
+            # посторонний предмет. Без этого варианта человек выбирал чужой
+            # модуль наугад и портил статистику.
+            opt("not_a_module", "Not a module", ASK_NUMBER),
+        ),
+    ))
+
+    add(choice_node(
+        "robot_module_a42t",
+        "Which robot module?",
+        key="module",
+        summary_label="Module",
+        description="A42T and A42T C2 have lifting, rotation, tray and chassis.",
         options=(
             opt("lifting", "Lifting", ASK_NUMBER),
             opt("rotation", "Rotation", ASK_NUMBER),
             opt("tray", "Tray", ASK_NUMBER),
             opt("chassis", "Chassis", ASK_NUMBER),
+            opt("not_a_module", "Not a module", ASK_NUMBER),
         ),
     ))
 
@@ -183,7 +225,36 @@ def _build_nodes() -> dict:
         summary_label="Problem",
         description="Describe the problem in your own words.",
         placeholder="For example: does not lift the forks, red light is blinking",
-        next_node=SUMMARY,
+        next_node=ASK_CAUSE,
+    ))
+
+    # ------------------------------------------------------------
+    # Шаг 5: причина ошибки
+    # ------------------------------------------------------------
+    # **Владелец: «добавить причину ошибки как ещё один вопрос».** Это не
+    # повтор описания: описание отвечает «что не так» («не поднимает вилы»),
+    # причина — «почему» («наехал на посторонний предмет»). Раньше причина не
+    # спрашивалась, поэтому в отчётах её не было, и разбор повторяющихся ошибок
+    # упирался в догадки.
+    #
+    # Список — стартовый набор из практики склада; правится через редактор
+    # (`/tree`), как и остальные узлы. «Other» оставлен намеренно: закрытый
+    # список без него заставляет выбирать неточное и портит статистику.
+    add(choice_node(
+        ASK_CAUSE,
+        "What caused it?",
+        key="cause",
+        summary_label="Cause",
+        description="Why it happened — helps to prevent a repeat.",
+        options=(
+            opt("human_error", "Human error", SUMMARY),
+            opt("obstacle", "Obstacle on the path", SUMMARY),
+            opt("dirty_code", "Dirty or damaged floor code", SUMMARY),
+            opt("mechanical_wear", "Mechanical wear", SUMMARY),
+            opt("software_fault", "Software fault", SUMMARY),
+            opt("battery_charge", "Battery or charging", SUMMARY),
+            opt("other", "Other", SUMMARY),
+        ),
     ))
 
     # ------------------------------------------------------------

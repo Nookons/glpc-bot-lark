@@ -318,17 +318,27 @@ class IntegrationChecks(unittest.TestCase):
                  get_employee_name=lambda _: "Smoke User")}):
             self.assertTrue(flow.start(-100123, sender, "/tmp/photo.jpg", 777, warehouse="GLP-C"))
 
+            # Путь: робот → модель → модуль → **номер → описание → причина**.
+            # Вопрос о причине добавлен 07.10.2026 («добавить причину ошибки как
+            # ещё один вопрос»), поэтому шагов стало на один больше.
+            #
+            # **Порядок важен:** причина спрашивается **после** описания. Первая
+            # версия этого теста отвечала причину перед номером, и сессия не
+            # завершалась — шаг причины оставался неотвеченным.
             for option in ("robot", "a42t_c2", "lifting"):
                 self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", option], 900, "cb"))
 
             self.assertTrue(flow.handle_text(-100123, sender, "ROBOT-SMOKE-9182", 901))
             self.assertTrue(flow.handle_text(-100123, sender, "Lift reports an error", 902))
+            # Причина — отдельный вопрос, поэтому ответ на него идёт последним.
+            self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", "obstacle"], 903, "cb"))
 
             session = flow.get_session(-100123, sender["id"])
             self.assertTrue(session.is_completed)
             self.assertEqual(session.result()["answers"], {
                 "object": "Robot", "device_type": "A42T C2", "module": "Lifting",
-                "device_number": "ROBOT-SMOKE-9182", "description": "Lift reports an error"})
+                "device_number": "ROBOT-SMOKE-9182", "description": "Lift reports an error",
+                "cause": "Obstacle on the path"})
 
             flow._confirm(-100123, sender, session, 900)
             deliver.assert_called_once()
@@ -343,7 +353,11 @@ class IntegrationChecks(unittest.TestCase):
         with patch("sendToDataBase.rest_get", return_value=[]), \
              patch("sendToDataBase.rest_post",
                    side_effect=lambda table, row: inserted.append(row) or [row]):
-            option_id = storage.add_option("robot_module", "Auxiliary sensor", created_by=12345)
+            # Узел модулей **отдельный на модель** (07.10.2026): у K50H три
+            # модуля, у A42T — четыре, и общий узел показывал всем всё.
+            option_id = storage.add_option(
+                "robot_module_a42t", "Auxiliary sensor", created_by=12345
+            )
 
         self.assertTrue(option_id)
         self.assertEqual(inserted[0]["label"], "Auxiliary sensor")
@@ -352,7 +366,9 @@ class IntegrationChecks(unittest.TestCase):
         with patch("sendToDataBase.rest_get", return_value=inserted):
             merged = storage.apply_overlay(DEFAULT_TREE)
 
-        self.assertIn(option_id, {o.id for o in merged.node("robot_module").options})
+        self.assertIn(
+            option_id, {o.id for o in merged.node("robot_module_a42t").options}
+        )
 
     def test_lark_is_attempted_when_supabase_fails(self):
         sent = []

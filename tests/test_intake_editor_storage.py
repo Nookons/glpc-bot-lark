@@ -100,10 +100,26 @@ class EditorStorageTestCase(unittest.TestCase):
         self.addCleanup(storage.reset_capability_cache)
 
     def _node_with_options(self):
+        """Узел с вариантами, который **можно скрыть**.
+
+        **Почему не любой узел с вариантами.** 07.10.2026 `robot_type` перестал
+        подходить: его варианты ведут в **разные** узлы модулей
+        (`robot_module_k50h` и `robot_module_a42t`), а такой узел скрывать
+        нельзя — ссылки сошлись бы в одну и часть дерева потерялась бы (см.
+        `hidden_node_target`). Первый узел в обходе оказался именно им, и тест
+        падал, хотя защита сработала **правильно**.
+
+        Здесь берётся узел, все варианты которого ведут в одно место, — на нём
+        и проверяется сброс `hidden`.
+        """
         for node in DEFAULT_TREE.nodes.values():
-            if node.options and node.id != DEFAULT_TREE.root_id:
+            if not node.options or node.id == DEFAULT_TREE.root_id:
+                continue
+            targets = {option.next_node for option in node.options}
+            targets.discard(None)
+            if len(targets) == 1:
                 return node
-        self.fail("в дереве нет узла с вариантами")
+        self.fail("в дереве нет скрываемого узла с вариантами")
 
     # ---------- правка ВСТРОЕННОГО варианта ----------
 

@@ -94,10 +94,34 @@ def node_keyboard(session: Session) -> Dict[str, list]:
 
     if node.type in (NodeType.CHOICE, NodeType.YESNO, NodeType.MULTI):
         # Только варианты, доступные при текущем пути (only_for).
-        for option in session.visible_options(node):
-            # По одной кнопке в ряд: на телефоне карточка читается целиком,
-            # а длинные подписи не обрезаются.
-            rows.append([_button(node, option, option.id in session.draft)])
+        visible = session.visible_options(node)
+
+        # **Две колонки, когда вариантов много.**
+        #
+        # Владелец: «нужно сделать кнопки в два столбца на модулях, так будет
+        # лучше, так как модулей много». Одна колонка растягивала экран: у
+        # robot_module пять вариантов — это пять строк подряд, и на телефоне
+        # приходилось листать, чтобы увидеть последний.
+        #
+        # Порог в три варианта выбран по замеру: список из трёх и меньше
+        # читается сверху вниз одним взглядом, и две колонки там только дробят
+        # внимание. С четырёх — уже выгодно.
+        #
+        # **Подписи переносятся, а не обрезаются.** Telegram не даёт задать
+        # ширину кнопки, поэтому в две колонки длинный текст («Dirty or damaged
+        # floor code») сам переносится на вторую строку внутри кнопки. Это
+        # приемлемо: важнее видеть все варианты на одном экране, чем читать
+        # каждый в полную ширину по очереди.
+        if len(visible) >= 4:
+            for index in range(0, len(visible), 2):
+                pair = [
+                    _button(node, option, option.id in session.draft)
+                    for option in visible[index : index + 2]
+                ]
+                rows.append(pair)
+        else:
+            for option in visible:
+                rows.append([_button(node, option, option.id in session.draft)])
 
         if node.type == NodeType.MULTI:
             rows.append([{
