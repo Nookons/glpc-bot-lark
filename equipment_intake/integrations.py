@@ -117,6 +117,15 @@ def _save(result, image_path):
         "module": str(answers.get("module") or "").strip() or None,
         "device_number": device_number,
         "description": str(answers.get("description") or "").strip(),
+        # **Причина ошибки — отдельной колонкой.**
+        #
+        # Требование владельца 08.10.2026: «Reason тоже нужно хранить на
+        # сервере». Раньше ответ жил только в JSON `answers` — по нему нельзя
+        # построить отчёт, а причина спрашивалась именно ради него.
+        "cause": str(answers.get("cause") or "").strip() or None,
+        # Откуда пришёл отчёт. Сейчас писатель один, но при появлении второго
+        # без этого поля нельзя будет понять происхождение записи.
+        "source": "bot",
         "photo_url": photo_url, "employee": result.get("employee") or "",
         "telegram_user_id": result.get("user_id"), "telegram_username": result.get("username") or "",
         "telegram_chat_id": result.get("chat_id"), "topic_id": result.get("thread_id"),

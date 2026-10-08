@@ -47,7 +47,17 @@ GLPC_TABLE = "exceptions_glpc"
 # from the live table while the bot is already deployed, so the write must work
 # without them (see `write_exception`). A missing column is an expected state
 # during rollout, not a failure.
-OPTIONAL_COLUMNS = ("module", "device_number", "object_type", "report_id", "unresolved_reason")
+OPTIONAL_COLUMNS = (
+    "module",
+    "device_number",
+    "object_type",
+    "report_id",
+    "unresolved_reason",
+    # Причина ошибки. Раньше жила **только** в JSON `answers`, поэтому отчёт
+    # «ошибки по причинам» был невозможен: SQL-агрегат по JSON никто не
+    # напишет. Колонка добавлена миграцией `0075`.
+    "cause",
+)
 
 # How long the "columns are missing" answer is remembered. Short TTL, same
 # reasoning as the intake editor's schema cache: after the migration is applied
@@ -330,6 +340,53 @@ def _robot_number(code: str) -> Optional[int]:
     return value if value <= 9_223_372_036_854_775_807 else None
 
 
+def device_numbers(code: str) -> list[str]:
+    """Номера устройств из того, что ввёл оператор.
+
+    **Требование владельца 08.10.2026, дословно:** «номера девайсов делятся
+    через `/`, если `4305/435` то это два отдельных девайса, и одна ошибка
+    должна быть продублирована на сервере два раза или больше, в зависимости от
+    того, сколько разделений с разными номерами девайсов».
+
+    **Зачем.** Раньше `3561/3528` целиком уходило в `device_number`, а
+    `error_robot` оставался пустым — ошибка не была связана **ни с одним** из
+    двух роботов. Проверено на живой базе: **56 таких строк**, и у всех
+    `error_robot is null`. Отчёт «сколько ошибок у робота 3561» их не видел.
+
+    **Почему возвращается список, а не один номер.** Из одного сообщения
+    рождается **столько строк журнала, сколько номеров**: у каждой свой
+    `error_robot`, своя зона и свой `uniq_key`. Иначе пришлось бы выбирать
+    «главный» номер, и второй робот молча выпал бы из статистики.
+
+    **Что считается разделителем.** Только `/`. Дефис и пробел — нет: в номерах
+    встречается `H108/1834`, а `H156` в `3452/3707/H156` — это уже третий
+    элемент, и он тоже отдельное устройство.
+
+    **Пустые части отбрасываются, повторы схлопываются.** `4305//435` — тот же
+    случай, что `4305/435`; `3561/3561` (оператор повторил номер) не должен
+    создать две одинаковые строки с одним `uniq_key` — вторая всё равно
+    отсеклась бы уникальным индексом, но тихо, а не как осознанное решение.
+
+    **Порядок сохраняется.** Первый номер — тот, что оператор назвал первым:
+    по нему строится текст описания, и он же остаётся «основным» для читателя.
+    """
+    text = str(code or "").strip()
+
+    if not text:
+        return []
+
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    for chunk in text.split("/"):
+        value = chunk.strip()
+        if value and value not in seen:
+            seen.add(value)
+            parts.append(value)
+
+    return parts
+
+
 def _uniq_key(result: Dict[str, Any], report_id: str, user_id) -> str:
     """
     Stable identifier used by the unique index to make writes idempotent.
@@ -398,12 +455,17 @@ def _optional_fields(
     """
     device_number = str(answers.get("device_number") or "").strip()
 
+    # Причина — человекочитаемая подпись из дерева («Obstacle on the path»),
+    # а не внутренний код: по ней строят отчёт и её читает человек.
+    cause = str(answers.get("cause") or "").strip()
+
     return {
         "module": module or None,
         "device_number": device_number or None,
         "object_type": category or None,
         "report_id": report_id or None,
         "unresolved_reason": unresolved_reason,
+        "cause": cause or None,
     }
 
 
@@ -532,8 +594,39 @@ def _solving_time(value: Any) -> int:
 def build_row(
     result: Dict[str, Any], warehouse: str, include_optional: bool = True
 ) -> Dict[str, Any]:
+    """Первая (и обычно единственная) строка журнала для отчёта.
+
+    Оставлена ради существующих вызовов: у отчёта об одном устройстве строка
+    ровно одна. Для нескольких устройств (см. `device_numbers`) нужен
+    `build_rows`, потому что вернуть одну строку из нескольких нельзя, не
+    потеряв остальные.
+    """
+    rows = build_rows(result, warehouse, include_optional=include_optional)
+
+    return rows[0] if rows else {}
+
+
+def build_rows(
+    result: Dict[str, Any], warehouse: str, include_optional: bool = True
+) -> list[Dict[str, Any]]:
     """
     Map an intake result onto the legacy journal columns.
+
+    **Возвращается список: по строке на каждое устройство в номере.**
+    Требование владельца 08.10.2026, дословно: «номера девайсов делятся через
+    `/`, если `4305/435` то это два отдельных девайса, и одна ошибка должна быть
+    продублирована на сервере два раза или больше, в зависимости от того сколько
+    разделений с разными номерами девайсов».
+
+    До этой правки `3561/3528` уходило в `device_number` целиком, а
+    `error_robot` оставался пустым — на живой базе таких строк **56**, и у всех
+    `error_robot is null`. Ошибка не принадлежала ни одному роботу, поэтому в
+    отчётах «ошибки по роботам» не учитывалась вообще.
+
+    **Каждая строка самостоятельна:** свой `error_robot`, своя зона
+    (`issue_warehouse`), свой `device_number` и **свой `uniq_key`**. Последнее
+    обязательно: `uniq_key` уникален, и без суффикса вторая строка была бы
+    отброшена уникальным индексом как дубликат — молча и без ошибки.
 
     `include_optional=False` drops the analytics columns for a table that does
     not have them yet; every other value stays identical, so a pending
@@ -601,40 +694,91 @@ def build_row(
     solving_time = template_columns["solving_time"]
     error_end = received + timedelta(minutes=solving_time)
 
-    row = {
-        "error_robot": _robot_number(code),
-        "add_by": card_id,
-        "device_type": device_type,
-        "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",
-        "error_end_time": error_end.isoformat(),
-        "error_start_time": received.isoformat(),
-        "first_column": template_columns["first_column"],
-        # Сырой текст оператора остаётся здесь целиком и **не** подменяется
-        # шаблоном: это единственное место, где видно, что именно написал
-        # человек. То же описание дублируется в `telegram_equipment_reports`
-        # (`description`), поэтому подбор ничего не теряет.
-        "issue_description": "\n".join(details),
-        "issue_type": template_columns["issue_type"],
-        "photo_url": result.get("photo_url") or None,
-        "recovery_title": template_columns["recovery_title"],
-        "second_column": template_columns["second_column"],
-        "solving_time": solving_time,
-        "uniq_key": _uniq_key(result, report_id, user_id),
-        "shift_type": shift_name,
-        "warehouse": warehouse,
-        "issue_data": shift_date,
-        # Зона склада. У SMALL-P3 она выводится из устройства (`D`/`E`), у
-        # GLP-C и складов без зон остаётся `C2`. Раньше здесь была константа для
-        # всех складов, из-за чего у SMALL-P3 стояла зона GLP-C.
-        "issue_warehouse": device_zone(warehouse, code) or DEFAULT_ISSUE_WAREHOUSE,
-    }
+    # **Разделение номеров: по строке на каждое устройство.**
+    #
+    # `device_numbers` разбирает `3561/3528` на два номера. Для каждого строится
+    # своя строка журнала: со своим `error_robot`, своей зоной и своим
+    # `uniq_key`. Без суффикса в ключе вторая строка была бы отброшена
+    # уникальным индексом как дубликат — молча и без ошибки.
+    numbers = device_numbers(code) or [""]
 
-    if include_optional:
-        row.update(
-            _optional_fields(answers, category, module, report_id, _unresolved_reason(card_id, result))
-        )
+    rows: list[Dict[str, Any]] = []
 
-    return row
+    for number in numbers:
+        # Описание получает номер устройства: строки в журнале выглядят
+        # самостоятельными записями, и по тексту видно, к какому роботу какая.
+        # У единственного устройства текст остаётся ровно таким, как был.
+        row_details = list(details)
+
+        if len(numbers) > 1:
+            row_details.insert(1, f"Device: {number}")
+
+        row = {
+            "error_robot": _robot_number(number),
+            "add_by": card_id,
+            "device_type": device_type,
+            "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",
+            "error_end_time": error_end.isoformat(),
+            "error_start_time": received.isoformat(),
+            "first_column": template_columns["first_column"],
+            # Сырой текст оператора остаётся здесь целиком и **не** подменяется
+            # шаблоном: это единственное место, где видно, что именно написал
+            # человек. То же описание дублируется в `telegram_equipment_reports`
+            # (`description`), поэтому подбор ничего не теряет.
+            "issue_description": "\n".join(row_details),
+            "issue_type": template_columns["issue_type"],
+            "photo_url": result.get("photo_url") or None,
+            "recovery_title": template_columns["recovery_title"],
+            "second_column": template_columns["second_column"],
+            "solving_time": solving_time,
+            # Суффикс только при нескольких устройствах: у обычного отчёта ключ
+            # остаётся прежним, и уже записанные строки не теряют идентичность.
+            "uniq_key": _uniq_key(result, report_id, user_id)
+            + (f":{number}" if len(numbers) > 1 else ""),
+            "shift_type": shift_name,
+            "warehouse": warehouse,
+            "issue_data": shift_date,
+            # Зона склада. У SMALL-P3 она выводится из устройства (`D`/`E`), у
+            # GLP-C и складов без зон остаётся `C2`. Раньше здесь была константа
+            # для всех складов, из-за чего у SMALL-P3 стояла зона GLP-C.
+            #
+            # Считается **по своему** номеру: у `3561/3528` зоны могут
+            # различаться, и одна общая зона была бы неверна для второго робота.
+            "issue_warehouse": device_zone(warehouse, number) or DEFAULT_ISSUE_WAREHOUSE,
+        }
+
+        if include_optional:
+            row.update(
+                _optional_fields(
+                    answers, category, module, report_id, _unresolved_reason(card_id, result)
+                )
+            )
+            # `device_number` — своё у каждой строки, а не общая строка с косой
+            # чертой: иначе поиск по номеру робота не нашёл бы ни одну из них.
+            row["device_number"] = number or None
+
+        rows.append(row)
+
+    return rows
+
+
+def _wire_payload(rows: list[Dict[str, Any]]) -> Any:
+    """Тело запроса к PostgREST: объект для одного устройства, массив — для нескольких.
+
+    **Почему не всегда массив.** У отчёта об одном устройстве (обычный случай)
+    тело обязано остаться **тем же объектом**, что и раньше: `rest_post`
+    отвечает на массив списком, а вся обработка ответа и логи рассчитаны на
+    объект. Менять формат там, где форма не нужна, — риск без выгоды.
+
+    **Почему массив, а не N запросов.** Разделённый отчёт (`3561/3528`) — это
+    две строки, и они должны записаться **вместе**: PostgREST выполняет массив
+    одной транзакцией, поэтому «половина отчёта» (ошибка учтена у одного робота
+    и потеряна у другого) невозможна.
+    """
+    if len(rows) == 1:
+        return rows[0]
+
+    return rows
 
 
 def _analytics_columns_available() -> bool:
@@ -729,11 +873,25 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
 
     from sendToDataBase import rest_post
 
-    saved = rest_post(
-        GLPC_TABLE,
-        build_row(result, title, include_optional=include_optional),
-        ignore_conflict=True,
-    )
+    # **Все строки уходят одним запросом.**
+    #
+    # `build_rows` возвращает по строке на каждое устройство из номера (см.
+    # `device_numbers`): `3561/3528` — две строки, у каждой свой `error_robot` и
+    # свой `uniq_key`. PostgREST принимает массив и вставляет его одной
+    # транзакцией: либо все строки, либо ни одной — «половина отчёта» записана
+    # быть не может.
+    #
+    # Отправка по одной в цикле дала бы ту же атомарность только ценой N
+    # запросов; здесь он всегда один.
+    # **У одного устройства формат прежний — объект, а не массив из одного.**
+    # Это не мелочь: `rest_post` с массивом отвечает списком, и вся
+    # существующая обработка ответа рассчитана на объект. Массив там, где
+    # всегда был объект, — изменение ради изменения.
+    rows = build_rows(result, title, include_optional=include_optional)
+    # Номера устройств нужны для логов и переживают пересборку ниже.
+    row_numbers = [str(row.get("device_number") or "?") for row in rows]
+    payload = _wire_payload(rows)
+    saved = rest_post(GLPC_TABLE, payload, ignore_conflict=True)
 
     if saved is None and include_optional:
         # The probe just succeeded, so the database is reachable and the insert
@@ -747,14 +905,31 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
         _optional_columns_state = False
         _optional_columns_checked_at = time.time()
 
-        saved = rest_post(
-            GLPC_TABLE,
-            build_row(result, title, include_optional=False),
-            ignore_conflict=True,
-        )
+        rows = build_rows(result, title, include_optional=False)
+        row_numbers = [str(row.get("device_number") or "?") for row in rows]
+        payload = _wire_payload(rows)
+        saved = rest_post(GLPC_TABLE, payload, ignore_conflict=True)
+
+    # Список устройств для логов. **Не** итерирую `payload`: у одного устройства
+    # это объект, и перебор дал бы его ключи, а не строки.
+    devices = ", ".join(str(number or "?") for number in row_numbers)
 
     if saved is None:
-        logger.error("Could not write report to %s: warehouse=%s", GLPC_TABLE, title)
+        logger.error(
+            "Could not write report to %s: warehouse=%s, devices=%s",
+            GLPC_TABLE,
+            title,
+            devices,
+        )
         return False
+
+    if len(row_numbers) > 1:
+        # Запись о разделении: по одному номеру в логе нельзя понять, что отчёт
+        # размножился, а это меняет число строк в отчётности.
+        logger.info(
+            "Report split across %d devices: %s",
+            len(row_numbers),
+            devices,
+        )
 
     return True

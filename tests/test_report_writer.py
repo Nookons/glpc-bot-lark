@@ -48,6 +48,9 @@ def answers(**overrides):
         "module": "Lifting",
         "device_number": "3490",
         "description": "Lift reports an error",
+        # Шаг `ask_cause` идёт после описания и спрашивает «почему», а не
+        # «что»: «Software fault» — причина, «Lift reports an error» — симптом.
+        "cause": "Software fault",
     }
     data.update(overrides)
     return data
@@ -588,6 +591,126 @@ class PhotoUrlChecks(unittest.TestCase):
         self.assertIsNone(row["photo_url"])
 
 
+class DeviceSplitChecks(unittest.TestCase):
+    """Номер со слэшем — это НЕСКОЛЬКО устройств, и строк тоже несколько.
+
+    **Требование владельца 08.10.2026, дословно:** «номера девайсов делятся
+    через `/`, если `4305/435` то это два отдельных девайса, и одна ошибка
+    должна быть продублирована на сервере два раза или больше, в зависимости от
+    того сколько разделений с разными номерами девайсов».
+
+    **Дефект, который это чинит.** `3561/3528` уходило в `device_number`
+    целиком, а `error_robot` оставался пустым. На живой базе таких строк
+    **56**, и у всех `error_robot is null` — ошибка не принадлежала ни одному
+    роботу, поэтому в отчётах «ошибки по роботам» не учитывалась вообще.
+    """
+
+    def rows_for(self, device_number):
+        res = {
+            "answers": {
+                "object": "Robot",
+                "device_type": "A42T",
+                "module": "Lifting",
+                "device_number": device_number,
+                "description": "Lift reports an error",
+            },
+            "warehouse": "GLP-C",
+            "employee": "Smoke User",
+            "employee_card_id": 60130607,
+            "photo_url": "https://x/p.jpg",
+            "user_id": 1,
+            "chat_id": -100,
+            "message_id": 99,
+        }
+        with mock.patch.object(rw, "canonical_type", return_value=None), \
+             mock.patch.object(rw, "match_template", return_value=None), \
+             mock.patch.object(rw, "load_templates", return_value=[]):
+            return rw.build_rows(res, "GLP-C")
+
+    def test_two_numbers_produce_two_rows(self):
+        """`3561/3528` — две строки, каждая со своим роботом."""
+        rows = self.rows_for("3561/3528")
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["error_robot"] for r in rows], [3561, 3528])
+        self.assertEqual([r["device_number"] for r in rows], ["3561", "3528"])
+
+    def test_keys_differ_so_the_second_row_survives(self):
+        """`uniq_key` различается — иначе вторая строка потерялась бы.
+
+        `exceptions_glpc.uniq_key` уникален. С одинаковым ключом вторая строка
+        была бы отброшена индексом **молча**: `ignore_conflict` считает 409
+        успехом. То есть отчёт выглядел бы записанным, а второго робота в
+        журнале не было бы.
+        """
+        rows = self.rows_for("3561/3528")
+
+        keys = [r["uniq_key"] for r in rows]
+
+        self.assertEqual(len(set(keys)), 2, f"ключи должны различаться: {keys}")
+        # Суффикс — номер устройства: по ключу видно, какая это строка.
+        self.assertTrue(keys[0].endswith(":3561"), keys[0])
+        self.assertTrue(keys[1].endswith(":3528"), keys[1])
+
+    def test_single_device_key_is_unchanged(self):
+        """У одного устройства ключ **прежний**, без суффикса.
+
+        Иначе уже записанные строки перестали бы опознаваться: повторная
+        доставка того же сообщения создала бы **дубль** вместо совпадения по
+        ключу. Обратная совместимость здесь обязательна.
+        """
+        rows = self.rows_for("3490")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["uniq_key"], "telegram-photo-bot:-100:99")
+
+    def test_three_numbers_produce_three_rows(self):
+        """`3452/3707/H156` — три устройства, а не два.
+
+        Буквенно-цифровой хвост — тоже отдельное устройство: `H156` существует
+        в справочнике, и терять его нельзя.
+        """
+        rows = self.rows_for("3452/3707/H156")
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r["error_robot"] for r in rows], [3452, 3707, None])
+
+    def test_zone_is_computed_per_device(self):
+        """Зона считается **по своему** номеру, а не одна на отчёт.
+
+        У `3561/3528` зоны могут различаться (например `C2` и `C1`). Одна общая
+        зона была бы неверна для второго робота, а зона — это то, по чему
+        строятся отчёты «ошибки по зонам склада».
+        """
+        with mock.patch.object(rw, "canonical_type", return_value=None), \
+             mock.patch.object(
+                 rw, "device_zone",
+                 side_effect=lambda warehouse, code: {"3561": "C2", "3528": "C1"}.get(code),
+             ), \
+             mock.patch.object(rw, "match_template", return_value=None), \
+             mock.patch.object(rw, "load_templates", return_value=[]):
+            res = {
+                "answers": {
+                    "object": "Robot", "device_type": "A42T", "module": "Lifting",
+                    "device_number": "3561/3528", "description": "x",
+                },
+                "warehouse": "GLP-C", "employee": "U", "employee_card_id": 1,
+                "photo_url": None, "user_id": 1, "chat_id": -100, "message_id": 1,
+            }
+            rows = rw.build_rows(res, "GLP-C")
+
+        self.assertEqual([r["issue_warehouse"] for r in rows], ["C2", "C1"])
+
+    def test_repeated_number_is_not_duplicated(self):
+        """Повтор номера (`3561/3561`) даёт **одну** строку.
+
+        Оператор мог продублировать номер по привычке. Две одинаковые строки с
+        одним `uniq_key` всё равно схлопнулись бы, но тихо; здесь это осознанное
+        решение с видимым поведением.
+        """
+        self.assertEqual(len(self.rows_for("3561/3561")), 1)
+
+
 class AnalyticsColumnChecks(unittest.TestCase):
     """
     The analytics columns arrive with a migration that may lag the deploy.
@@ -684,6 +807,27 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertEqual(row["device_number"], "3490")
         self.assertEqual(row["object_type"], "robot")
         self.assertEqual(row["report_id"], "photo-1.jpg")
+
+    def test_cause_is_filed_as_its_own_column(self):
+        """Причина ошибки едет отдельной колонкой, а не только в JSON.
+
+        **Требование владельца 08.10.2026:** «Reason тоже нужно хранить на
+        сервере». До этой правки ответ жил **только** внутри `answers`, и отчёт
+        «ошибки по причинам» был невозможен: по JSON-полю никто не напишет
+        SQL-агрегат. Причина спрашивалась у человека ради отчёта и в отчёт не
+        попадала — та же ошибка, что была с `module` до миграции `0072`.
+
+        **Проверяется значение, а не факт наличия ключа.** Колонка, заполняемая
+        пустой строкой, выглядела бы в отчёте как «причина не указана» у всех
+        записей — то есть дефект остался бы, но стал незаметнее.
+        """
+        row = self.row()
+
+        self.assertEqual(row["cause"], "Software fault")
+        # Совместимость до миграции: без колонок строка не должна ломаться.
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            old_row = rw.build_row(result(), "GLP-C", include_optional=False)
+        self.assertNotIn("cause", old_row)
 
     def test_optional_columns_can_be_dropped(self):
         with mock.patch.object(rw, "canonical_type", return_value=None):
