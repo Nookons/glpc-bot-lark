@@ -25,7 +25,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, redirect, request
@@ -1792,6 +1792,23 @@ def reasons_keyboard(direction: str, robot_id) -> dict:
         for code, label in robot_status.REASONS.get(direction, ())
     ]
 
+    # **«Skip» — сразу в офлайн без описания.**
+    #
+    # Требование владельца 08.10.2026: «когда офлайн то была возможность без
+    # описания и текста сразу пустить в офлайн».
+    #
+    # Причина уже выбрана кнопкой — это и есть причина. Требовать ещё и текст
+    # значило задерживать вывод робота из работы ради формулировки: робот стоит
+    # в проходе или мешает линии, и каждая минута ожидания — простой.
+    #
+    # Кнопка есть **только у офлайна**: возврат в работу без описания не нужен —
+    # там нечего объяснять, а причина «почему вернули» уже не проблема.
+    if direction == "offline":
+        rows.append([{
+            "text": "⏭️ Skip — no description",
+            "callback_data": f"st:{direction}:{robot_id}:skip",
+        }])
+
     rows.append([{
         "text": "✖️ Cancel",
         "callback_data": f"st:{direction}:{robot_id}:cancel",
@@ -2248,6 +2265,38 @@ def handle_status_callback(callback: dict):
         _delete_quiet(chat_id, message_id)
         return
 
+    # **`skip` — сразу меняем статус, без шага описания.**
+    #
+    # Требование владельца 08.10.2026: «когда офлайн то была возможность без
+    # описания и текста сразу пустить в офлайн». Причина выбрана кнопкой — этого
+    # достаточно; текст необязателен, и ждать его значит держать робота в работе.
+    #
+    # Запись всё равно попадает в журнал: `type_problem` = выбранная причина,
+    # `problem_note` = пусто. Пустая заметка честно означает «описания нет», а
+    # не «данные потеряли».
+    if code == "skip":
+        result = robot_status.change_robot_status(robot, direction, label, "", employee)
+
+        if not result:
+            tg.answer_callback_query(
+                callback_id, "Could not change the status — try again"
+            )
+            return
+
+        tg.answer_callback_query(callback_id, f"{spec['label']} — no description")
+        _delete_quiet(chat_id, message_id)
+        _send(
+            chat_id,
+            "\n".join([
+                robot_status.status_title(direction, robot),
+                f"Reason: {label}",
+                "Note: —",
+            ]),
+        )
+        _ask_repair_photo(chat_id, sender, direction, robot, label, message_id)
+        _notify_lark_status(direction, result, employee.get("user_name"))
+        return
+
     set_pending_status(chat_id, sender.get("id"), {
         "direction": direction,
         "robot_number": robot.get("robot_number"),
@@ -2267,7 +2316,8 @@ def handle_status_callback(callback: dict):
         f"{robot.get('status')} → {spec['new_status']}\n"
         f"Reason: {label}\n"
         "\n"
-        "✍️ Describe the reason in one message (or /cancel).",
+        "✍️ Describe the reason in one message, press «Skip» to go offline "
+        "without a description, or /cancel.",
         message_thread_id=_reply_thread(chat_id, thread_id),
     )
 
@@ -2297,6 +2347,108 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
     )
 
     return False
+
+
+def _attach_photo_to_repair(chat_id, sender, photo_path, pending: dict) -> bool:
+    """Приписывает фото к ремонту выведенного из работы робота.
+
+    **Требование владельца 08.10.2026:** «в боте когда робот отправляется в
+    офлайн, нужно чтобы он ещё просил фотографию и потом сохранял и приписывал к
+    ремонту».
+
+    **Куда попадает фото.** В `robot_repair_assignments.photo_urls` — массив,
+    потому что кадров бывает несколько: общий вид и крупный план. Ссылка та же,
+    что у фото ошибок (`upload_photo_and_get_url`), поэтому фото открывается в
+    карточке ремонта и в Lark.
+
+    **Почему запись ремонта создаётся здесь, а не раньше.** До фото ремонта
+    может не быть вовсе: робота вывели из работы, описания нет (кнопка «Skip»), и
+    заводить пустую запись заранее значило бы плодить строки без содержания.
+    Фото — первый признак, что ремонтом занимаются, и оно же создаёт запись.
+
+    **Почему неудача не ломает офлайн.** Робот **уже выведен** из работы, и
+    вернуть его обратно из-за несохранённого снимка нельзя: сообщаем отдельно и
+    оставляем возможность прислать фото ещё раз.
+    """
+    robot_number = pending.get("robot_number")
+    warehouse = pending.get("warehouse") or current_warehouse()
+
+    from supabase_storage import upload_photo_and_get_url
+
+    url = upload_photo_and_get_url(photo_path, object_name=os.path.basename(photo_path))
+
+    if not url:
+        _send(
+            chat_id,
+            "⚠️ Can't save the photo on the server. The robot stays offline — "
+            "send the photo again in a moment.",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return False
+
+    from sendToDataBase import rest_get, rest_patch, rest_post
+
+    # Ищем открытый ремонт этого робота: фото дописывается к нему, а не создаёт
+    # вторую запись.
+    existing = rest_get(
+        "robot_repair_assignments",
+        {
+            "select": "id,photo_urls",
+            "robot_number": f"eq.{robot_number}",
+            "warehouse": f"eq.{warehouse}",
+            "status": "eq.open",
+            "order": "id.desc",
+            "limit": "1",
+        },
+        optional=True,
+    )
+
+    if existing:
+        urls = list(existing[0].get("photo_urls") or [])
+        urls.append(url)
+        updated = rest_patch(
+            "robot_repair_assignments",
+            params={"id": f"eq.{existing[0]['id']}"},
+            payload={"photo_urls": urls},
+        )
+        saved = updated is not None
+    else:
+        created = rest_post(
+            "robot_repair_assignments",
+            {
+                "robot_number": robot_number,
+                "warehouse": warehouse,
+                "card_id": (get_employee(sender.get("id")) or {}).get("card_id"),
+                "note": pending.get("type_problem") or "",
+                "status": "open",
+                "photo_urls": [url],
+                # Простой считается от вывода из работы, а не от заведения
+                # записи: фото может прийти позже.
+                "offline_at": pending.get("started_at"),
+            },
+        )
+        saved = created is not None
+
+    if not saved:
+        _send(
+            chat_id,
+            "⚠️ The photo was uploaded, but the repair record could not be "
+            "updated. Tell a shift leader.",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return False
+
+    # Фото пришло — больше не ждём: следующее фото будет уже новой ошибкой.
+    done = dict(pending)
+    done.pop("awaiting_photo", None)
+    set_pending_status(chat_id, sender.get("id"), done)
+
+    _send(
+        chat_id,
+        f"📷 Photo attached to the repair of robot {robot_number}.",
+    )
+
+    return True
 
 
 def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bool:
@@ -2411,9 +2563,54 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
         ]),
     )
 
+    _ask_repair_photo(chat_id, sender, direction, robot, pending.get("type_problem"), message_id)
+
     _notify_lark_status(direction, result, employee.get("user_name"))
 
     return True
+
+
+def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> None:
+    """Просит фото поломки и ставит флоу в ожидание снимка.
+
+    **Требование владельца 08.10.2026:** «в боте когда робот отправляется в
+    офлайн, нужно чтобы он ещё просил фотографию и потом сохранял и приписывал к
+    ремонту».
+
+    **Только для офлайна.** Возврат в работу фотографировать незачем: т��м нечего
+    показывать, а лишний шаг задерживал бы постановку робота на линию.
+
+    **Почему `awaiting_photo`, а не отдельное состояние.** Ожидание живёт в том
+    же `pending`, что и описание причины, и удаляется вместе с ним. Два
+    независимых словаря пришлось бы чистить согласованно — а рассинхрон дал бы
+    либо потерянное фото, либо вечное «пришлите фото».
+    """
+    if direction != "offline":
+        return
+
+    pending = peek_pending_status(chat_id, sender.get("id")) or {}
+
+    pending.update({
+        "direction": direction,
+        "robot_number": robot.get("robot_number"),
+        "type_problem": reason,
+        "warehouse": robot.get("warehouse") or current_warehouse(),
+        # Момент вывода из работы: простой считается от него, а не от времени,
+        # когда прислали снимок.
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        # Флаг, по которому ветка фото понимает, что снимок относится к ремонту.
+        "awaiting_photo": True,
+    })
+
+    set_pending_status(chat_id, sender.get("id"), pending)
+
+    _send(
+        chat_id,
+        "📷 Send a photo of the fault (or /cancel). It will be attached to the "
+        "repair record.",
+        reply_to_message_id=message_id,
+        delete_after=CONFIRM_TTL_SECONDS,
+    )
 
 
 def _handle_cancel(chat_id, sender, reply_to):
@@ -4345,6 +4542,23 @@ def handle_photo(chat_id, sender, message, message_id):
 
     caption = (message.get("caption") or "").strip()
     employee_name = get_employee_name(sender.get("id"))
+
+    # **Фото к ремонту — раньше всех остальных веток.**
+    #
+    # Требование владельца 08.10.2026: «в боте когда робот отправляется в офлайн,
+    # нужно чтобы он ещё просил фотографию и потом сохранял и приписывал к
+    # ремонту».
+    #
+    # Проверка идёт **первой**, потому что иначе фото перехватил бы приём ошибок:
+    # он тоже показывает меню на любое фото. Фото, присланное во время вывода
+    # робота из работы, относится к ремонту, а не к новой ошибке — робот уже
+    # выведен, и второй записи об ошибке быть не должно.
+    repair_pending = peek_pending_status(chat_id, sender.get("id"))
+
+    if repair_pending and repair_pending.get("awaiting_photo"):
+        if _attach_photo_to_repair(chat_id, sender, destination, repair_pending):
+            _delete_quiet(chat_id, message_id)
+            return
 
     # Start the guided production intake for every photo.
     import equipment_intake.flow as intake_flow

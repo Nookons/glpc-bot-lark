@@ -2776,3 +2776,107 @@ class ConfirmShowsProgress(unittest.TestCase):
             target()
 
         self.assertEqual(sent, [], "при завершённой работе индикатор не нужен")
+
+
+class RepairOfflineChecks(unittest.TestCase):
+    """Офлайн без описания и фото к ремонту.
+
+    **Требования владельца 08.10.2026, дословно:**
+    1. «в боте когда робот отправляется в офлайн /offline то нужно чтобы ещё он
+       просил фотографию и потом сохранял и приписывал к ремонту»;
+    2. «когда офлайн то была возможность без описания и текста сразу пустить в
+       офлайн».
+
+    Проверяется **исходный код**, потому что обе правки живут в обработчиках
+    Telegram: они требуют живого чата и проверяются живым прогоном
+    (`tools/live_test_bot.py`). Здесь сторожится то, что легко потерять при
+    следующей правке и что глазами не видно.
+    """
+
+    @staticmethod
+    def _bot_source() -> str:
+        import pathlib
+
+        return (
+            pathlib.Path(__file__).resolve().parent.parent / "telegram_bot.py"
+        ).read_text(encoding="utf-8")
+
+    def test_skip_button_exists_for_offline(self):
+        """Кнопка «Skip» есть у офлайна.
+
+        Причина уже выбрана кнопкой — требовать ещё и текст значит держать робота
+        в работе ради формулировки, а он стоит в проходе или мешает линии.
+        """
+        source = self._bot_source()
+
+        assert "Skip — no description" in source
+        # Кнопка добавляется под условием: у возврата в работу её быть не должно.
+        assert 'if direction == "offline":' in source
+
+    def test_skip_changes_status_without_note(self):
+        """`skip` меняет статус с пустой заметкой, а не просит описание."""
+        source = self._bot_source()
+
+        assert 'if code == "skip":' in source
+        # Пустая заметка — осознанно: `""`, а не пропуск вызова.
+        assert 'change_robot_status(robot, direction, label, "", employee)' in source
+
+    def test_photo_is_requested_after_offline(self):
+        """После вывода из работы бот просит фото."""
+        source = self._bot_source()
+
+        assert "def _ask_repair_photo" in source
+        assert "awaiting_photo" in source
+        # Фото просят только у офлайна: возврат в работу фотографировать незачем.
+        assert 'if direction != "offline":' in source
+        # Функция вызывается в обоих путях: и после описания, и после skip.
+        assert source.count("_ask_repair_photo(") >= 3, (
+            "вызов должен быть и в skip-пути, и в обычном: " + str(source.count("_ask_repair_photo("))
+        )
+
+    def test_photo_is_attached_to_repair_record(self):
+        """Присланное фото дописывается к записи ремонта, а не теряется."""
+        source = self._bot_source()
+
+        assert "def _attach_photo_to_repair" in source
+        assert "robot_repair_assignments" in source
+        assert "photo_urls" in source
+
+    def test_repair_photo_branch_runs_before_intake(self):
+        """Ветка фото ремонта стоит **раньше** приёма ошибок.
+
+        Иначе фото перехватил бы приём: он тоже показывает меню на любое фото, и
+        снимок поломки стал бы второй записью об ошибке — хотя робот уже выведен
+        из работы.
+        """
+        source = self._bot_source()
+
+        # **Ищем внутри `handle_photo`, а не по всему файлу.** Первая версия
+        # этого теста брала `index()` по всему модулю и находила **чужой**
+        # импорт приёма (в файле их четыре) — тест падал ��а верном коде.
+        # Проверка обязана смотреть на ту функцию, о которой говорит.
+        start = source.index("def handle_photo(")
+        end = source.index("\ndef ", start + 10)
+        body = source[start:end]
+
+        repair = body.index("if repair_pending and repair_pending.get")
+        intake = body.index("import equipment_intake.flow as intake_flow")
+
+        assert repair < intake, (
+            "фото ремонта обязано проверяться раньше приёма ошибок, "
+            "иначе снимок поломки создаст лишнюю ошибку"
+        )
+
+    def test_photo_failure_does_not_revert_offline(self):
+        """Сбой загрузки фото не возвращает робота в работу.
+
+        Робот **уже выведен**, и оставлять его в работе из-за несохранённого
+        снимка нельзя: сообщаем отдельно и предлагаем прислать фото снова.
+        """
+        source = self._bot_source()
+        body = source[source.index("def _attach_photo_to_repair"):]
+        body = body[: body.index("\ndef ", 10)]
+
+        assert "stays offline" in body
+        # Возврат статуса назад в ветке фото быть не должен.
+        assert "change_robot_status" not in body
