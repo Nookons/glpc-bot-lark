@@ -759,17 +759,27 @@ def queue_missing_robot(
     warehouse: str = WAREHOUSE,
 ) -> bool:
     """
-    Ставит номер в очередь `robots_to_add` (робота нет в справочнике).
+    Ставит номер в очередь устройств (робота нет в справочнике).
+
+    **Таблица сменилась 11.10.2026.** Раньше заявка уходила в `robots_to_add`,
+    но эта таблица **перестала наполняться** 04.10.2026: приём оборудования пишет
+    в `telegram_devices_to_add`. Старый путь (эта функция) продолжал писать в
+    мёртвую таблицу, и его заявки **не попадали** на админскую страницу
+    `/dashboard/devices-admin` — то есть терялись для разбора.
 
     True — заявка есть (создана сейчас или уже была). Уведомление сотруднику
     отправляется только при notify=True: Telegram-бот может сам решить, что
     написать (например, предложить исправить опечатку в номере).
     """
     queued = _rest_post(
-        "robots_to_add",
+        "telegram_devices_to_add",
         {
-            "robot_number": str(robot_number),
-            "employee_id": employee_card_id,
+            # **Имена колонок новой таблицы.** `robot_number` → `device_number`,
+            # `employee_id` → не пишем вовсе: новая таблица хранит автора
+            # текстом (`employee`) и телеграм-идентификатором, а `card_id` в ней
+            # нет. Категория обязательна — очередь принимает не только роботов.
+            "category": "robot",
+            "device_number": str(robot_number),
             "warehouse": warehouse,
         },
         ignore_conflict=True,

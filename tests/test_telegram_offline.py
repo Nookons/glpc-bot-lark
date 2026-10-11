@@ -3402,9 +3402,13 @@ def test_missing_robot_is_queued_and_reported():
         result,
     )
     check(
+        # **Новая таблица очереди.** Старая `robots_to_add` перестала
+        # наполняться 04.10.2026, и заявки этого пути не попадали на
+        # админскую страницу — то есть терялись для разбора.
         "robot missing: робот поставлен в очередь добавления",
-        posted and posted[0][0] == "robots_to_add"
-        and posted[0][1]["robot_number"] == "3884",
+        posted and posted[0][0] == "telegram_devices_to_add"
+        and posted[0][1]["device_number"] == "3884"
+        and posted[0][1]["category"] == "robot",
         posted,
     )
     check(
@@ -7910,3 +7914,82 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_queue_uses_the_new_table_and_text_status():
+    """Очередь читает `telegram_devices_to_add`, а не мёртвую `robots_to_add`.
+
+    **Реальный дефект, найденный 11.10.2026.** Приём оборудования с 04.10.2026
+    пишет заявки в `telegram_devices_to_add` (все категории устройств, статус
+    текстом). Старая `robots_to_add` **перестала наполняться** — последняя
+    запись от 04.10. Но дайджест в Lark продолжал считать **старую** таблицу и
+    сообщал «195 заявок», хотя реально их было **297** — люди видели неверное
+    число.
+
+    **Что именно проверяю.** Не «функция вызвалась», а **схему запроса**: имя
+    таблицы, колонку номера и **значение статуса**. Ошибка здесь не падает с
+    исключением — PostgREST просто вернёт пустой список, и очередь будет
+    выглядеть пустой. Такой дефект молчаливый, поэтому нужен явный сторож.
+    """
+    import importlib
+
+    import robot_queue
+
+    importlib.reload(robot_queue)
+
+    assert robot_queue.QUEUE_TABLE == "telegram_devices_to_add", (
+        "очередь обязана читать новую таблицу: старая `robots_to_add` не "
+        "наполняется с 04.10.2026, и счётчик в дайджесте врёт"
+    )
+    assert robot_queue.NUMBER_FIELD == "device_number", (
+        "в новой таблице номер устройства лежит в `device_number`, "
+        "а не в `robot_number`"
+    )
+    assert robot_queue.OPEN_FILTER == "eq.pending", (
+        "статус в новой таблице текстовый: открытая заявка — `pending`. "
+        "Фильтр `is.false` (boolean) не найдёт ни одной строки"
+    )
+    assert robot_queue.CLOSED_VALUE == {"status": "accepted"}, (
+        "закрывать заявку надо текстом `accepted`: PostgREST отверг бы `true`"
+    )
+
+
+def test_queue_queries_name_the_new_columns():
+    """Запросы очереди используют колонки новой таблицы.
+
+    Отдельно от констант: можно поправить константу и забыть запрос — тогда
+    PostgREST вернёт ошибку неизвестной колонки, а очередь покажется пустой.
+    """
+    import importlib
+
+    import robot_queue
+
+    importlib.reload(robot_queue)
+
+    seen = []
+
+    def fake_get(table, params=None):
+        seen.append((table, dict(params or {})))
+        return []
+
+    original = robot_queue.rest_get
+    robot_queue.rest_get = fake_get
+    try:
+        robot_queue.open_queue_rows()
+        robot_queue.known_robot_numbers(["1"], "GLP-C")
+    finally:
+        robot_queue.rest_get = original
+
+    queue_calls = [p for t, p in seen if t == robot_queue.QUEUE_TABLE]
+
+    assert queue_calls, "очередь не прочитана ни одним запросом"
+
+    for params in queue_calls:
+        select = str(params.get("select") or "")
+        assert "device_number" in select or not select, (
+            f"запрос очереди не выбирает `device_number`: {select!r}"
+        )
+        assert "robot_number" not in select, (
+            f"запрос очереди всё ещё просит `robot_number` — такой колонки в "
+            f"новой таблице нет: {select!r}"
+        )

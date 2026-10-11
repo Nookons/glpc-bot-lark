@@ -1,10 +1,10 @@
 """
-Очередь роботов, которых нет в справочнике (`robots_to_add`).
+Очередь устройств, которых нет в справочнике (`telegram_devices_to_add`).
 
 Сотрудник присылает ошибку с номером робота, которого нет в
 `robots_maintenance_list`. Записать исключение нельзя (нет robot_id), но и
 терять его нельзя — ошибка уходит в Lark, а номер ставится в очередь
-`robots_to_add`, чтобы администратор добавил робота.
+очереди, чтобы администратор добавил устройство через `/dashboard/devices-admin`.
 
 Проблема: очередь никто не разбирает. Проверка 23.09.2026 показала 282
 открытых строки, из которых 140 — роботы, которые УЖЕ есть в справочнике
@@ -31,8 +31,22 @@ from logging_config import setup_logging
 logger = setup_logging(__name__)
 
 
-QUEUE_TABLE = "robots_to_add"
+# **Новая очередь.** `telegram_devices_to_add` — все категории устройств, а не
+# только роботы. Пишет в неё приём оборудования (`equipment_intake`), поэтому
+# бот и админская страница `/dashboard/devices-admin` смотрят в одно место.
+#
+# **Почему перешли 11.10.2026.** Старая `robots_to_add` **перестала
+# наполняться** 04.10.2026 (последняя запись — того дня), а в новой с тех пор
+# **308**. Дайджест в Lark продолжал показывать счётчик старой: сообщал «195
+# заявок», хотя реально их **297**. Люди видели неверное число.
+QUEUE_TABLE = "telegram_devices_to_add"
 ROBOTS_TABLE = "robots_maintenance_list"
+#: Поле с номером устройства: в новой таблице имя другое.
+NUMBER_FIELD = "device_number"
+#: Открытая заявка: в новой таблице статус текстовый, а не boolean.
+OPEN_FILTER = "eq.pending"
+#: Что писать при закрытии заявки.
+CLOSED_VALUE = {"status": "accepted"}
 
 AUTOCLOSE_ENABLED = env_bool("QUEUE_AUTOCLOSE_ENABLED", True)
 
@@ -76,8 +90,12 @@ def open_queue_rows(limit: int = None):
     return rest_get(
         QUEUE_TABLE,
         params={
-            "select": "id,robot_number,created_at,employee_id,warehouse",
-            "status": "is.false",
+            # **Имена колонок новой таблицы.** В `robots_to_add` было
+            # `robot_number` и `employee_id`; здесь — `device_number`, а автора
+            # заявки несёт `employee` (текстом) и `telegram_user_id`.
+            "select": f"id,{NUMBER_FIELD},created_at,warehouse,category",
+            # Статус текстовый: открытая заявка — `pending`.
+            "status": OPEN_FILTER,
             "order": "id.asc",
             "limit": str(limit or QUEUE_SCAN_LIMIT),
         },
@@ -137,7 +155,7 @@ def close_queued_robots() -> dict:
     by_warehouse = {}
 
     for row in rows:
-        numbers = _digits([row.get("robot_number")])
+        numbers = _digits([row.get(NUMBER_FIELD)])
 
         if not numbers:
             continue
@@ -161,14 +179,16 @@ def close_queued_robots() -> dict:
 
         for chunk in _chunks(to_close, IN_CHUNK):
             params = {
-                "status": "is.false",
-                "robot_number": f"in.({','.join(chunk)})",
+                "status": OPEN_FILTER,
+                NUMBER_FIELD: f"in.({','.join(chunk)})",
             }
 
             if title:
                 params["warehouse"] = f"eq.{title}"
 
-            patched = rest_patch(QUEUE_TABLE, params=params, payload={"status": True})
+            # **`accepted`, а не `true`.** В новой таблице статус текстовый;
+            # `true` PostgREST отверг бы, и очередь не закрывалась бы вовсе.
+            patched = rest_patch(QUEUE_TABLE, params=params, payload=CLOSED_VALUE)
 
             if patched is None:
                 logger.error(
@@ -220,7 +240,7 @@ def queue_stats(days: int = 1, warehouse: str = None) -> dict:
     recent = rest_get(
         QUEUE_TABLE,
         params={
-            "select": "robot_number,created_at,employee_id",
+            "select": f"{NUMBER_FIELD},created_at,category",
             **base,
             "order": "created_at.desc",
             "limit": "200",

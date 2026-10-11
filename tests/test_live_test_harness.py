@@ -539,7 +539,10 @@ class BotFlowTestCase(unittest.TestCase):
         # База между тестами: строки, которые пишет бот, накапливались бы.
         self.server.RequestHandlerClass.store.tables["exceptions"] = []
         self.server.RequestHandlerClass.store.tables["exceptions_glpc"] = []
-        self.server.RequestHandlerClass.store.tables["robots_to_add"] = []
+        # **Очередь устройств.** Раньше здесь была `robots_to_add`; с
+        # 11.10.2026 бот пишет в `telegram_devices_to_add` — старая таблица
+        # перестала наполняться 04.10, и заявки старого пути терялись.
+        self.server.RequestHandlerClass.store.tables["telegram_devices_to_add"] = []
 
     # Сквозной счётчик: дедупликация бота ключуется (chat, message_id) и
     # живёт в памяти процесса, поэтому в каждом вызове id должен быть новым.
@@ -615,10 +618,13 @@ class BotFlowTestCase(unittest.TestCase):
         self._run("Unable to drive: Security module failure. 99999")
 
         _, dump = _request("GET", "/__dump")
-        queue = dump["tables"].get("robots_to_add") or []
+        queue = dump["tables"].get("telegram_devices_to_add") or []
 
         self.assertTrue(queue, f"неизвестный робот не попал в очередь: {self.sent}")
-        self.assertEqual(str(queue[0]["robot_number"]), "99999")
+        # Колонки новой таблицы: номер лежит в `device_number`, а не в
+        # `robot_number`, и категория обязательна.
+        self.assertEqual(str(queue[0]["device_number"]), "99999")
+        self.assertEqual(queue[0]["category"], "robot")
 
     def test_stub_failure_does_not_crash_dispatch(self):
         """Сбой базы — это «нет данных», а не падение бота (согласованность)."""
