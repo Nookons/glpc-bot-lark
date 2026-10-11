@@ -709,5 +709,114 @@ class CategoryVocabularyChecks(unittest.TestCase):
         )
 
 
+class OwnerDeviceTypeMapChecks(unittest.TestCase):
+    """Карта типов устройств от владельца (11.10.2026) — эталон, не догадка.
+
+    ```
+    K50H    = RT_KUBOT_MINI_HAIFLEX
+    A42T    = RT_KUBOT
+    A42T E2 = RT_KUBOT_E2
+    ```
+
+    **Почему эталон, а не подстановка.** Тип по-прежнему берётся из справочника
+    `equipment` (склад + категория + код): номера повторяются между складами, и
+    на P3-DC-1 под меткой `A42T` стоят `P1200`. Поэтому карта используется как
+    проверка ожиданий: сторож падает, если для этих меток справочник начнёт
+    отдавать другой тип.
+    """
+
+    #: Живые коды из справочника `equipment` (проверено 11.10.2026).
+    LIVE_CODES = {
+        "K50H": ("GLP-C", "robot", "3628"),
+        "A42T": ("GLP-C", "robot", "33"),
+        "A42T E2": ("GLP-C", "robot", "141"),
+    }
+
+    def test_the_map_matches_the_owner(self):
+        self.assertEqual(
+            report_writer.OWNER_LABEL_TYPES,
+            {
+                "K50H": "RT_KUBOT_MINI_HAIFLEX",
+                "A42T": "RT_KUBOT",
+                "A42T E2": "RT_KUBOT_E2",
+            },
+        )
+
+    def test_every_label_resolves_through_the_catalog(self):
+        """Метка → тип через справочник `equipment_types`, как в бою."""
+        for label, expected in report_writer.OWNER_LABEL_TYPES.items():
+            with self.subTest(label=label):
+                warehouse, category, code = self.LIVE_CODES[label]
+                # id типов из живой базы: 2 — mini haiflex, 13 — RT_KUBOT,
+                # 12 — RT_KUBOT_E2.
+                ids = {"K50H": 2, "A42T": 13, "A42T E2": 12}
+
+                def fake_rest_get(table, params=None, optional=False):
+                    if table == "equipment":
+                        return [{"equipment_type_id": ids[label]}]
+                    return [{"type": expected}]
+
+                with patch("sendToDataBase.rest_get", side_effect=fake_rest_get):
+                    resolved = report_writer.canonical_type(warehouse, category, code)
+
+                self.assertEqual(
+                    resolved,
+                    expected,
+                    f"{label} → {resolved!r}, а карта владельца говорит {expected!r}",
+                )
+
+    def test_the_label_reaches_its_own_column_while_the_type_comes_from_the_catalog(self):
+        """`reported_type` — метка, `device_type` — код справочника.
+
+        Это то, ради чего карта хранится отдельно: смешать их значило бы
+        потерять ответ оператора (`K50H`) или соврать про модель флота.
+        """
+        result = _result()
+        result["answers"]["device_type"] = "K50H"
+
+        with patch.object(
+            report_writer, "canonical_type", return_value="RT_KUBOT_MINI_HAIFLEX"
+        ):
+            row = report_writer.build_row(result, "GLP-C")
+
+        self.assertEqual(row["device_type"], "RT_KUBOT_MINI_HAIFLEX")
+        self.assertEqual(row["reported_type"], "K50H")
+
+
+class EmptyAnswersAreRefused(unittest.TestCase):
+    """Пустая запись приёма не создаётся (9 живых строк-сирот).
+
+    Проверено на живой базе: `telegram_equipment_reports` id 146, 353, 375, 614,
+    678, 706, 717, 828, 862 — фотография есть, а `answers`/`category`/
+    `device_type`/`device_number`/`description` пусты и `path = []`. Диалог не
+    прошёл ни шага, но строка сохранилась.
+    """
+
+    def test_persist_refuses_an_empty_report(self):
+        with patch.object(integrations, "_save") as save, \
+             patch.object(integrations, "_send") as send:
+            outcome = integrations.persist_and_send(
+                {"answers": {}, "warehouse": "GLP-C"}, "/tmp/p.jpg"
+            )
+
+        save.assert_not_called()
+        send.assert_not_called()
+        self.assertFalse(outcome["database_saved"])
+        self.assertTrue(outcome["glpc_error"])
+
+    def test_a_real_report_is_still_filed(self):
+        """Сторож не должен глушить нормальный отчёт — проверка обеих сторон."""
+        from equipment_intake import report_writer as writer
+
+        with patch.object(integrations, "_save", return_value=(True, False, None)), \
+             patch.object(integrations, "_send", return_value=True), \
+             patch.object(writer, "write_exception", return_value=True):
+            outcome = integrations.persist_and_send(_result(), "/tmp/p.jpg")
+
+        self.assertTrue(outcome["database_saved"])
+        self.assertTrue(outcome["glpc_saved"])
+        self.assertIsNone(outcome["glpc_error"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

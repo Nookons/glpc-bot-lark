@@ -82,6 +82,34 @@ def looks_like_device_number(value: str) -> bool:
     return text.isascii()
 
 
+def _missing_answers(result):
+    """
+    Чего не хватает, чтобы запись вообще имела смысл — одной строкой, или None.
+
+    **Зачем, если `flow._confirm` уже отвергает незавершённую сессию.**
+    Проверка в `_confirm` появилась 07.10.2026, но до неё в базу успели уйти
+    **9 записей** с пустыми `answers`, `category`, `device_type`,
+    `device_number` и `description` (проверено на живой базе:
+    `telegram_equipment_reports` id 146, 353, 375, 614, 678, 706, 717, 828,
+    862) — фотография есть, ответов нет, `path = []`. Такая строка не
+    анализируется вовсе: ни тип устройства, ни причина, ни номер.
+
+    Поэтому проверка стоит **на входе в запись**, а не только у вызывающего
+    кода: любой второй вызывающий (или новый путь) обязан упереться в неё так
+    же. Пустая запись хуже отказа: отказ виден человеку, а пустая строка молча
+    искажает метрики.
+    """
+    answers = result.get("answers") or {}
+
+    if not str(answers.get("object") or "").strip():
+        return (
+            "The report has no equipment answer, so it cannot be filed. "
+            "Send the photo again and finish the questions."
+        )
+
+    return None
+
+
 def _warehouse_error(result):
     """
     Validate the warehouse once, for every destination.
@@ -104,6 +132,12 @@ def _save(result, image_path):
     from sendToDataBase import rest_get, rest_post
     from supabase_storage import upload_photo_and_get_url
     answers = result.get("answers") or {}
+
+    # Пустой отчёт не пишем вовсе: без ответа об оборудовании строку нельзя
+    # разобрать (дыра на 9 живых записей, см. `_missing_answers`).
+    if _missing_answers(result):
+        return False, False, None
+
     category = _category(answers.get("object"))
     photo_url = None
     try:
@@ -281,6 +315,21 @@ def persist_and_send(result: Dict[str, Any], image_path: str) -> dict:
     destination unsafe (a detail row with `warehouse=""`, a card posted to the
     default GLP-C group). Such a report is refused wholesale.
     """
+    missing = _missing_answers(result)
+
+    if missing:
+        # Тот же класс, что и неизвестный склад: предусловие, а не независимый
+        # сбой. Писать «частично» здесь нечего — в записи нет ни одного
+        # содержательного поля.
+        logger.error("Equipment intake refused: %s", missing)
+        return {
+            "database_saved": False,
+            "device_queued": False,
+            "lark_delivered": False,
+            "glpc_saved": False,
+            "glpc_error": missing,
+        }
+
     warehouse, warehouse_error = _warehouse_error(result)
 
     if warehouse_error:

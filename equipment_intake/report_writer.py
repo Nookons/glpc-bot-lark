@@ -57,26 +57,42 @@ OPTIONAL_COLUMNS = (
     # «ошибки по причинам» был невозможен: SQL-агрегат по JSON никто не
     # напишет. Колонка добавлена миграцией `0075`.
     "cause",
-    # **Разложенные пункты записи** (миграция `0080_error_columns_not_text.sql`).
-    #
-    # Здесь они ��бязательны: пока миграция не применена, вставка с этими
-    # колонками падала бы, и **отчёт терялся бы целиком** — а писатель обязан
-    # пережить расхождение схемы и кода (тот же принцип, что у `cause` выше).
-    #
-    # Требование владельца 11.10.2026: «каждый пункт записи был в отдельном
-    # столбе». До этого текст ошибки, тип и модуль склеивались в
-    # `issue_description` четырьмя строками.
+)
+
+#: **Разложенные пункты записи** (миграция `0080_error_columns_not_text.sql`).
+#:
+#: Требование владельца 11.10.2026: «каждый пункт записи был в отдельном
+#: столбе». До этого текст ошибки, тип и модуль склеивались в
+#: `issue_description` четырьмя строками.
+#:
+#: **Почему это ОТДЕЛЬНЫЙ набор, а не часть `OPTIONAL_COLUMNS`.** Дыра,
+#: найденная 11.10.2026 на живой базе: проверка «есть ли аналитические
+#: колонки» читала **все** колонки одним запросом, а PostgREST отвергает
+#: запрос целиком, если отсутствует **хотя бы одна**. То есть одна не
+#: приехавшая миграция (`reported_*`) снимала заодно и старые колонки, и
+#: аналитика пропадала целиком: в журнале оказалось **1663** строк без
+#: `cause` из 2574. Наборы приезжают разными миграциями — проверяться они
+#: обязаны **по отдельности**.
+SPLIT_COLUMNS = (
     "reported_error",
     "reported_type",
     "module_text",
 )
 
+#: Оба набора — для читаемости и для мест, которым нужен полный список.
+ALL_ANALYTICS_COLUMNS = OPTIONAL_COLUMNS + SPLIT_COLUMNS
+
 # How long the "columns are missing" answer is remembered. Short TTL, same
 # reasoning as the intake editor's schema cache: after the migration is applied
 # the bot picks the columns up without a restart.
 _OPTIONAL_TTL_SECONDS = 120
+#: Состояние набора `OPTIONAL_COLUMNS` и набора `SPLIT_COLUMNS` — **по
+#: отдельности**. Одна общая память была частью дыры: раз наборы приезжают
+#: разными миграциями, сбой проверки одного не должен прятать другой.
 _optional_columns_state: Optional[bool] = None
 _optional_columns_checked_at: float = 0.0
+_split_columns_state: Optional[bool] = None
+_split_columns_checked_at: float = 0.0
 
 #: Зона по умолчанию — для складов, у которых разбиения на зоны нет.
 #:
@@ -99,6 +115,28 @@ ROBOTS_TABLE = "robots_maintenance_list"
 
 # Categories that can be resolved against the canonical equipment inventory.
 INVENTORY_CATEGORIES = ("robot", "workstation", "charging")
+
+#: **Карта владельца 11.10.2026: метка оператора → канонический тип флота.**
+#:
+#: ```
+#: K50H    = RT_KUBOT_MINI_HAIFLEX
+#: A42T    = RT_KUBOT
+#: A42T E2 = RT_KUBOT_E2
+#: ```
+#:
+#: Это **проверка ожиданий**, а не таблица подстановки: тип по-прежнему берётся
+#: из справочника `equipment` (склад + категория + код), и подменять его догадкой
+#: нельзя — номера роботов повторяются между складами, а на P3-DC-1 под теми же
+#: метками стоят другие модели (`P1200`). Карта служит эталоном для сторожей:
+#: они падают, если справочник начнёт отдавать для этих меток другой тип.
+#:
+#: Проверено на живой базе: код `3628` (GLP-C) → `RT_KUBOT_MINI_HAIFLEX` (id 2),
+#: у `RT_KUBOT` — id 13, у `RT_KUBOT_E2` — id 12.
+OWNER_LABEL_TYPES = {
+    "K50H": "RT_KUBOT_MINI_HAIFLEX",
+    "A42T": "RT_KUBOT",
+    "A42T E2": "RT_KUBOT_E2",
+}
 
 # Справочник готовых описаний ошибок: по нему отдел ведёт журнал. Пока приём
 # писал сюда сырой текст, строки нельзя было ни группировать по типу ошибки, ни
@@ -604,7 +642,10 @@ def _solving_time(value: Any) -> int:
 
 
 def build_row(
-    result: Dict[str, Any], warehouse: str, include_optional: bool = True
+    result: Dict[str, Any],
+    warehouse: str,
+    include_optional: bool = True,
+    include_split: bool = True,
 ) -> Dict[str, Any]:
     """Первая (и обычно единственная) строка журнала для отчёта.
 
@@ -613,13 +654,18 @@ def build_row(
     `build_rows`, потому что вернуть одну строку из нескольких нельзя, не
     потеряв остальные.
     """
-    rows = build_rows(result, warehouse, include_optional=include_optional)
+    rows = build_rows(
+        result, warehouse, include_optional=include_optional, include_split=include_split
+    )
 
     return rows[0] if rows else {}
 
 
 def build_rows(
-    result: Dict[str, Any], warehouse: str, include_optional: bool = True
+    result: Dict[str, Any],
+    warehouse: str,
+    include_optional: bool = True,
+    include_split: bool = True,
 ) -> list[Dict[str, Any]]:
     """
     Map an intake result onto the legacy journal columns.
@@ -640,9 +686,13 @@ def build_rows(
     обязательно: `uniq_key` уникален, и без суффикса вторая строка была бы
     отброшена уникальным индексом как дубликат — молча и без ошибки.
 
-    `include_optional=False` drops the analytics columns for a table that does
-    not have them yet; every other value stays identical, so a pending
-    migration can never lose a report.
+    **Два независимых набора колонок.** `include_optional` отвечает за старые
+    аналитические колонки (миграции 0067–0075), `include_split` — за
+    разложенные пункты (миграция `0080`). Выключение одного **не** выключает
+    другой: раньше это был один флаг, и одна неприехавшая миграция уносила всю
+    аналитику разом (на живой базе — **1663** строки без `cause` из 2574).
+    Выключенный набор просто не пишется; всё остальное в строке совпадает,
+    поэтому расхождение схемы и кода не теряет отчёт.
 
     `add_by`, `photo_url` and the analytics fields are read from `result`,
     which `flow._confirm` fills while it already has the employee row at hand —
@@ -802,14 +852,15 @@ def build_rows(
             # чертой: иначе поиск по номеру робота не нашёл бы ни одну из них.
             row["device_number"] = number or None
 
-            # **Каждый пункт — в своей колонке** (миграция
-            # `0080_error_columns_not_text.sql`).
-            #
-            # Здесь, а **не в основном словаре**: колонки новые, и на базе без
-            # миграции вставка с ними упала бы — отчёт потерялся бы целиком.
-            # Запасной путь (`include_optional=False`) обязан работать на
-            # прежней схеме, поэтому эти поля идут вместе с остальными
-            # аналитическими.
+        # **Каждый пункт — в своей колонке** (миграция
+        # `0080_error_columns_not_text.sql`).
+        #
+        # Отдельный набор (`include_split`), а не общий с `include_optional`:
+        # миграции разные, и раньше отсутствие `reported_*` снимало заодно
+        # `cause` и прочую аналитику — дыра на **1663** строки живой базы.
+        # Проверка здесь, а не в основном словаре: на базе без миграции вставка
+        # с этими колонками упала бы, и отчёт потерялся бы целиком.
+        if include_split:
             row["reported_error"] = reported_error
             row["reported_type"] = reported_type
             row["module_text"] = module_text
@@ -838,74 +889,108 @@ def _wire_payload(rows: list[Dict[str, Any]]) -> Any:
     return rows
 
 
-def _analytics_columns_available() -> bool:
+def _columns_available(
+    table: str, columns: tuple, cache: str, checked_at_key: str,
+    ttl: float = _OPTIONAL_TTL_SECONDS,
+) -> bool:
     """
-    Are the intake-analytics columns present yet?
+    Присутствует ли **конкретный** набор колонок в таблице?
 
-    Asked as a cheap, expected-to-fail single-row read, exactly like the intake
-    editor probes its v2 schema: the bot is deployed before the migration is
-    applied, so a missing column is a normal state and must not reach the logs as
-    ERROR on every report.
+    **Почему один набор, а не таблица целиком.** Наборы приезжают разными
+    миграциями (`0075` — `cause`, `0080` — `reported_*`). Пока проверка была
+    одна на все колонки, отсутствие **любой** из них отключало аналитику
+    целиком: PostgREST отвечает `400`, если в `select` есть хотя бы одна
+    неизвестная колонка.
 
-    A `None` answer is ambiguous — the column may be missing, or the database may
-    be unreachable. The second case is told apart by one extra plain read, and it
-    is deliberately **not** cached: a network blip must not strip the analytics
-    columns from the next 120 seconds of reports. The happy path costs a single
-    request, and the answer is cached with a short TTL so a migration applied
-    while the bot runs is picked up without a restart.
+    Проверка идёт дешёвым чтением одной строки, как это делает редактор дерева
+    для своей v2-схемы: бот выкатывается **раньше**, чем применяется миграция,
+    и пропавшая колонка — ожидаемое состояние, а не сбой.
+
+    `None` неоднозначен (колонки нет **или** база недоступна). Второе
+    выясняется обычным чтением и намеренно **не** кэшируется: сетевой сбой не
+    должен снимать колонки со следующих 120 секунд отчётов.
     """
-    global _optional_columns_state, _optional_columns_checked_at
-
-    if (
-        _optional_columns_state is not None
-        and time.time() - _optional_columns_checked_at < _OPTIONAL_TTL_SECONDS
-    ):
-        return _optional_columns_state
-
     from sendToDataBase import rest_get
+
+    cached = globals().get(cache)
+
+    if cached is not None and time.time() - globals()[checked_at_key] < ttl:
+        return cached
 
     # `optional=True`: отсутствие колонок — ожидаемое состояние до миграции.
     rows = rest_get(
-        GLPC_TABLE,
-        {"select": ",".join(OPTIONAL_COLUMNS), "limit": "1"},
+        table,
+        {"select": ",".join(columns), "limit": "1"},
         optional=True,
     )
 
     if rows is None:
-        reachable = rest_get(GLPC_TABLE, {"select": "id", "limit": "1"}) is not None
+        reachable = rest_get(table, {"select": "id", "limit": "1"}) is not None
 
         if not reachable:
             # База недоступна: это не «колонок нет», и запоминать это нельзя.
             logger.warning(
-                "intake journal: could not check analytics columns in %s; "
-                "filing with the full row",
-                GLPC_TABLE,
+                "intake journal: could not check %s in %s; filing with the full row",
+                ", ".join(columns),
+                table,
             )
             return True
 
         logger.warning(
-            "intake journal: %s has no analytics columns yet (%s) — filing "
-            "reports without them",
-            GLPC_TABLE,
-            ", ".join(OPTIONAL_COLUMNS),
+            "intake journal: %s has no columns (%s) — filing reports without them",
+            table,
+            ", ".join(columns),
         )
-        _optional_columns_state = False
-        _optional_columns_checked_at = time.time()
+        _remember_columns(cache, checked_at_key, False)
 
         return False
 
-    _optional_columns_state = True
-    _optional_columns_checked_at = time.time()
+    _remember_columns(cache, checked_at_key, True)
 
     return True
+
+
+def _remember_columns(cache: str, checked_at_key: str, value: bool) -> None:
+    """Запомнить ответ проверки на короткий TTL (см. `_OPTIONAL_TTL_SECONDS`)."""
+    globals()[cache] = value
+    globals()[checked_at_key] = time.time()
+
+
+def _analytics_columns_available() -> bool:
+    """Есть ли **старый** набор аналитических колонок (миграции 0067–0075)."""
+    return _columns_available(
+        GLPC_TABLE,
+        OPTIONAL_COLUMNS,
+        "_optional_columns_state",
+        "_optional_columns_checked_at",
+    )
+
+
+def _split_columns_available() -> bool:
+    """Есть ли **новый** набор разложенных пунктов (миграция `0080`).
+
+    Отдельная проверка — и есть исправление дыры: пока это читалось вместе со
+    старыми колонками, одна неприменённая миграция снимала `cause` со всех
+    отчётов, и причина снова оставалась только в JSON `answers`.
+    """
+    return _columns_available(
+        GLPC_TABLE,
+        SPLIT_COLUMNS,
+        "_split_columns_state",
+        "_split_columns_checked_at",
+    )
+
 
 
 def reset_schema_cache() -> None:
     """Сброс памяти о колонках — только для тестов."""
     global _optional_columns_state, _optional_columns_checked_at
+    global _split_columns_state, _split_columns_checked_at
 
     _optional_columns_state = None
     _optional_columns_checked_at = 0.0
+    _split_columns_state = None
+    _split_columns_checked_at = 0.0
 
 
 def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> bool:
@@ -920,15 +1005,24 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
 
     Rollout safety: the analytics columns (`module`, `device_number`,
     `object_type`, `report_id`) arrive with a migration that may lag the deploy,
-    and PostgREST rejects a whole insert when one of them is unknown. Their
-    presence is checked up front (see `_analytics_columns_available`), so the
-    report is written once, with whatever columns actually exist, and the
+    and PostgREST rejects a whole insert when one of them is unknown. Each set is
+    checked up front (see `_analytics_columns_available` / `_split_columns_available`),
+    so the report is written once, with whatever columns actually exist, and the
     expected pre-migration state never reaches the logs as an error.
+
+    **Запись идемпотентна и не теряет строки разделения.** Отчёт `3545/314/141`
+    — это три строки с тремя своими `uniq_key`. Вставка массивом **без**
+    разрешения конфликта роняла **всю** пачку с `409`, если хотя бы один ключ
+    уже был в таблице, а `ignore_conflict` возвращал пустой список — то есть
+    писатель докладывал «сохранено», хотя две из трёх строк не попали. Теперь
+    пишем через upsert по `uniq_key`: каждая строка гарантированно
+    записывается или обновляется, и «половина отчёта» невозможна.
     """
     title = validate_warehouse(warehouse if warehouse is not None else result.get("warehouse"))
     include_optional = _analytics_columns_available()
+    include_split = _split_columns_available()
 
-    from sendToDataBase import rest_post
+    from sendToDataBase import rest_upsert
 
     # **Все строки уходят одним запросом.**
     #
@@ -944,28 +1038,45 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     # Это не мелочь: `rest_post` с массивом отвечает списком, и вся
     # существующая обработка ответа рассчитана на объект. Массив там, где
     # всегда был объект, — изменение ради изменения.
-    rows = build_rows(result, title, include_optional=include_optional)
+    rows = build_rows(
+        result, title, include_optional=include_optional, include_split=include_split
+    )
     # Номера устройств нужны для логов и переживают пересборку ниже.
     row_numbers = [str(row.get("device_number") or "?") for row in rows]
     payload = _wire_payload(rows)
-    saved = rest_post(GLPC_TABLE, payload, ignore_conflict=True)
+    saved = rest_upsert(GLPC_TABLE, payload, on_conflict="uniq_key")
 
-    if saved is None and include_optional:
-        # The probe just succeeded, so the database is reachable and the insert
-        # was most likely rejected over a column. Retrying without the analytics
-        # fields is cheap insurance against losing the report; the negative
-        # answer is remembered so the next reports skip the probe.
+    # **Откат по набору колонок, а не «по всем сразу».**
+    #
+    # Проверка схемы только что ответила «колонки есть» и база доступна —
+    # значит, отказ почти наверняка из-за колонки. Повтор без них дешёв и
+    # спасает отчёт; негативный ответ запоминается, чтобы следующие отчёты не
+    # платили за проверку. Наборы снимаются **по одному**: неприехавшая
+    # миграция `0080` не должна заодно стирать `cause` (именно это и дало
+    # 1663 пустые причины на живой базе).
+    if saved is None and (include_optional or include_split):
         logger.warning(
-            "Write to %s failed with the analytics columns; retrying without them",
+            "Write to %s failed with the analytics columns (%s); retrying without them",
             GLPC_TABLE,
+            "+".join(
+                name
+                for name, present in (("optional", include_optional), ("split", include_split))
+                if present
+            ),
         )
-        _optional_columns_state = False
-        _optional_columns_checked_at = time.time()
 
-        rows = build_rows(result, title, include_optional=False)
+        if include_optional:
+            _remember_columns("_optional_columns_state", "_optional_columns_checked_at", False)
+
+        if include_split:
+            _remember_columns("_split_columns_state", "_split_columns_checked_at", False)
+
+        rows = build_rows(
+            result, title, include_optional=False, include_split=False
+        )
         row_numbers = [str(row.get("device_number") or "?") for row in rows]
         payload = _wire_payload(rows)
-        saved = rest_post(GLPC_TABLE, payload, ignore_conflict=True)
+        saved = rest_upsert(GLPC_TABLE, payload, on_conflict="uniq_key")
 
     # Список устройств для логов. **Не** итерирую `payload`: у одного устройства
     # это объект, и перебор дал бы его ключи, а не строки.

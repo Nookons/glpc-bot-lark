@@ -117,35 +117,37 @@ class WarehouseGuardChecks(unittest.TestCase):
         """A refusal must not reach PostgREST at all."""
         for warehouse in ("", None, "PNT-A"):
             with self.subTest(warehouse=warehouse):
-                with mock.patch("sendToDataBase.rest_post") as post:
+                with mock.patch("sendToDataBase.rest_upsert") as upsert:
                     with self.assertRaises(rw.WarehouseError):
                         rw.write_exception(result(warehouse=warehouse), warehouse)
-                post.assert_not_called()
+                upsert.assert_not_called()
 
     def test_write_uses_explicit_argument_over_payload(self):
         """The caller's warehouse wins, so a stale payload cannot redirect it."""
         with mock.patch.object(rw, "write_exception", wraps=rw.write_exception):
-            with mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]) as post, \
+            with mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]) as upsert, \
                  mock.patch.object(rw, "canonical_type", return_value=None):
                 self.assertTrue(rw.write_exception(result("GLP-C"), "SMALL-P3"))
 
-        self.assertEqual(post.call_args.args[1]["warehouse"], "SMALL-P3")
+        self.assertEqual(upsert.call_args.args[1]["warehouse"], "SMALL-P3")
 
     def test_write_falls_back_to_payload_warehouse(self):
-        with mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]) as post, \
+        with mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]) as upsert, \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result("SMALL-P3")))
 
-        self.assertEqual(post.call_args.args[1]["warehouse"], "SMALL-P3")
+        self.assertEqual(upsert.call_args.args[1]["warehouse"], "SMALL-P3")
 
     def test_write_reports_failure_when_insert_fails(self):
-        with mock.patch("sendToDataBase.rest_post", return_value=None), \
+        with mock.patch("sendToDataBase.rest_upsert", return_value=None), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertFalse(rw.write_exception(result()))
 
     def test_write_never_raises_on_conflict(self):
         """A repeated delivery is success, not an error."""
-        with mock.patch("sendToDataBase.rest_post", return_value=[]), \
+        # Upsert отвечает пустым списком, когда строка уже существует (409 при
+        # вставке) — это «уже сохранено», а не сбой.
+        with mock.patch("sendToDataBase.rest_upsert", return_value=[]), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result()))
 
@@ -903,6 +905,23 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertEqual(row["warehouse"], "GLP-C")
         self.assertEqual(row["uniq_key"], "telegram-photo-bot:-100123:777")
 
+    def test_both_sets_can_be_dropped_together(self):
+        """Запасной путь на **прежней** схеме: нет ни одной новой колонки.
+
+        Это состояние базы, где не применена ни одна из миграций, — писатель
+        обязан работать и там, иначе отчёт теряется целиком.
+        """
+        with mock.patch.object(rw, "canonical_type", return_value=None):
+            row = rw.build_row(
+                result(), "GLP-C", include_optional=False, include_split=False
+            )
+
+        for column in rw.ALL_ANALYTICS_COLUMNS:
+            self.assertNotIn(column, row)
+
+        self.assertEqual(row["error_robot"], 3490)
+        self.assertEqual(row["warehouse"], "GLP-C")
+
     def test_write_works_before_the_migration(self):
         """The only successful insert must be the minimal row."""
         attempts = []
@@ -912,12 +931,12 @@ class AnalyticsColumnChecks(unittest.TestCase):
             # exactly the pre-migration state of a healthy database.
             return None if "module" in str(params.get("select")) else [{"id": 1}]
 
-        def fake_post(table, payload, ignore_conflict=False):
+        def fake_upsert(table, payload, on_conflict):
             attempts.append(payload)
             return [{"id": 1}]
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
-             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
@@ -928,12 +947,12 @@ class AnalyticsColumnChecks(unittest.TestCase):
     def test_write_uses_the_analytics_columns_once_they_exist(self):
         attempts = []
 
-        def fake_post(table, payload, ignore_conflict=False):
+        def fake_upsert(table, payload, on_conflict):
             attempts.append(payload)
             return [{"id": 1}]
 
         with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
-             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
@@ -946,14 +965,15 @@ class AnalyticsColumnChecks(unittest.TestCase):
             return None if "module" in str(params.get("select")) else [{"id": 1}]
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get) as get, \
-             mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             rw.write_exception(result(), "GLP-C")
             rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
 
-        # First call: the column probe + the reachability probe. The second call
-        # must not probe again.
-        self.assertEqual(get.call_count, 2)
+        # Первый отчёт: проба каждого из **двух** наборов колонок, и на каждый
+        # неудачный ответ — проверка доступности базы (2 + 2 = 4). Второй отчёт
+        # **не** пробует снова: негативный ответ запомнен.
+        self.assertEqual(get.call_count, 4)
 
     def test_unreachable_database_is_not_mistaken_for_missing_columns(self):
         """
@@ -962,13 +982,13 @@ class AnalyticsColumnChecks(unittest.TestCase):
         """
         attempts = []
 
-        def fake_post(table, payload, ignore_conflict=False):
+        def fake_upsert(table, payload, on_conflict):
             attempts.append(payload)
             return [{"id": 1}]
 
         # `None` for both the column probe and the reachability probe.
         with mock.patch("sendToDataBase.rest_get", return_value=None), \
-             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
@@ -984,7 +1004,7 @@ class AnalyticsColumnChecks(unittest.TestCase):
             return None
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
-             mock.patch("sendToDataBase.rest_post", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             rw.write_exception(result(), "GLP-C")
             probe_selects.clear()
@@ -1002,14 +1022,14 @@ class AnalyticsColumnChecks(unittest.TestCase):
             probes.append(params)
             return [{"id": 1}]  # the probe says the columns exist
 
-        def fake_post(table, payload, ignore_conflict=False):
+        def fake_upsert(table, payload, on_conflict):
             attempts.append(payload)
             if "module" in payload:
                 return None  # rejected over an unknown column
             return [{"id": 1}]
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
-             mock.patch("sendToDataBase.rest_post", side_effect=fake_post), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
@@ -1019,10 +1039,11 @@ class AnalyticsColumnChecks(unittest.TestCase):
 
     def test_a_real_duplicate_is_still_success_without_the_columns(self):
         """`ignore_conflict` semantics must survive the fallback path."""
+        # Первый ответ — отказ по колонке, второй — «строка уже есть».
         responses = iter([None, []])
 
         with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
-             mock.patch("sendToDataBase.rest_post", side_effect=lambda *a, **k: next(responses)), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=lambda *a, **k: next(responses)), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
@@ -2367,6 +2388,233 @@ class ZoneChecks(unittest.TestCase):
         with mock.patch.object(rw, "device_zone", return_value=None):
             row = self._zone("SMALL-P3", "6")
         self.assertEqual(row, "C2")
+
+
+class IndependentColumnSets(unittest.TestCase):
+    """**Два набора колонок проверяются ПООТДЕЛЬНОСТИ.**
+
+    Найденная на живой базе дыра 11.10.2026: `_analytics_columns_available`
+    читала одним запросом **все** аналитические колонки, включая новые
+    `reported_*`. PostgREST отвергает запрос целиком, если отсутствует **хотя
+    бы одна** колонка, поэтому неприехавшая миграция `0080` снимала заодно
+    `cause`, `module` и `object_type` — и причина снова оставалась только в
+    JSON `answers`. В журнале оказалось **1663** строк без `cause` из 2574.
+
+    Сторож падает, если наборы снова свяжут в одну проверку.
+    """
+
+    def setUp(self):
+        rw.reset_schema_cache()
+
+    def tearDown(self):
+        rw.reset_schema_cache()
+
+    def _probe(self, present):
+        """`present` — какое подмножество наборов реально есть в таблице."""
+        seen = []
+
+        def fake_get(table, params, optional=False):
+            select = str(params.get("select") or "")
+            seen.append(select)
+
+            for column in select.split(","):
+                # Отсутствовать может только **аналитическая** колонка;
+                # служебное `id` (проверка доступности базы) есть всегда.
+                if column in rw.ALL_ANALYTICS_COLUMNS and column not in present:
+                    return None  # PostgREST: колонки нет → 400 на весь запрос
+
+            return [{"id": 1}]
+
+        return seen, fake_get
+
+    def test_split_columns_missing_does_not_disable_the_old_set(self):
+        """Без миграции 0080 `cause` обязан продолжать писаться."""
+        # Есть **все** старые колонки и ни одной новой — состояние живой базы
+        # в момент, когда миграция `0080` ещё не применена.
+        present = set(rw.OPTIONAL_COLUMNS)
+        seen, fake_get = self._probe(present)
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get):
+            self.assertTrue(rw._analytics_columns_available(), "старый набор пропал")
+            self.assertFalse(rw._split_columns_available(), "новый набор найден зря")
+
+        # Старая проверка не спрашивает `reported_*` — иначе она упала бы вместе
+        # с ними на базе без миграции 0080. Сравниваю **целые имена колонок**:
+        # подстрока `module` входит в `module_text`, и проверка «по вхождению»
+        # прошла бы на верном коде (проверено негативно).
+        old_probe = next(select for select in seen if "unresolved_reason" in select)
+        old_columns = old_probe.split(",")
+        for column in rw.SPLIT_COLUMNS:
+            self.assertNotIn(column, old_columns, f"{column} попала в старую проверку")
+
+    def test_old_columns_missing_does_not_disable_the_new_set(self):
+        """Обратная сторона: старые колонки не снимают `reported_error`."""
+        present = set(rw.SPLIT_COLUMNS)
+        seen, fake_get = self._probe(present)
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get):
+            self.assertFalse(rw._analytics_columns_available())
+            self.assertTrue(rw._split_columns_available())
+
+        new_probe = next(select for select in seen if "reported_error" in select)
+        new_columns = new_probe.split(",")
+        for column in rw.OPTIONAL_COLUMNS:
+            self.assertNotIn(column, new_columns, f"{column} попала в новую проверку")
+
+    def test_cause_still_reaches_the_row_when_0080_is_missing(self):
+        """Поведенческая проверка дыры: `cause` заполняется без `reported_*`.
+
+        Это тот самый исход, ради которого наборы разведены: на базе без
+        миграции `0080` причина обязана остаться в колонке, а не исчезнуть
+        вместе с тремя новыми полями.
+        """
+        seen, fake_get = self._probe(set(rw.OPTIONAL_COLUMNS))
+        attempts = []
+
+        def fake_upsert(table, payload, on_conflict):
+            attempts.append(payload)
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake_get), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["cause"], "Software fault")
+        # Новые колонки при этом не пишутся — иначе вставка упала бы целиком.
+        for column in rw.SPLIT_COLUMNS:
+            self.assertNotIn(column, attempts[0])
+
+
+class EmptyAnswersAreNotFiled(unittest.TestCase):
+    """Отчёт без ответов оператора не записывается.
+
+    **Живая дыра:** в `telegram_equipment_reports` **9** записей с полностью
+    пустыми `answers`/`category`/`device_type`/`device_number`/`description`, но
+    с фотографией и `path = []` (id 146, 353, 375, 614, 678, 706, 717, 828,
+    862). Диалог не прошёл ни одного шага, а строка сохранилась — разобрать её
+    нельзя, зато метрики она искажает.
+    """
+
+    def test_missing_object_is_named(self):
+        from equipment_intake import integrations
+
+        self.assertIsNone(integrations._missing_answers({"answers": {"object": "Robot"}}))
+        self.assertTrue(integrations._missing_answers({"answers": {}}))
+        self.assertTrue(integrations._missing_answers({}))
+        # Пробельная строка — тоже отсутствие ответа, а не ответ.
+        self.assertTrue(integrations._missing_answers({"answers": {"object": "   "}}))
+
+    def test_detail_row_is_not_written_without_answers(self):
+        """`_save` обязан отказать **до** любой записи в базу."""
+        from equipment_intake import integrations
+
+        with mock.patch("sendToDataBase.rest_post") as post, \
+             mock.patch("sendToDataBase.rest_get") as get:
+            saved, queued, photo = integrations._save(
+                {"answers": {}, "warehouse": "GLP-C"}, ""
+            )
+
+        post.assert_not_called()
+        get.assert_not_called()
+        self.assertFalse(saved)
+        self.assertFalse(queued)
+
+    def test_persist_refuses_every_destination(self):
+        """Пустой отчёт — предусловие: ни базы, ни журнала, ни карточки."""
+        from equipment_intake import integrations
+
+        with mock.patch.object(integrations, "_save") as save, \
+             mock.patch.object(integrations, "_send") as send, \
+             mock.patch.object(rw, "write_exception") as write:
+            outcome = integrations.persist_and_send(
+                {"answers": {}, "warehouse": "GLP-C"}, "/tmp/p.jpg"
+            )
+
+        save.assert_not_called()
+        send.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse(outcome["database_saved"])
+        self.assertFalse(outcome["glpc_saved"])
+        self.assertFalse(outcome["lark_delivered"])
+        self.assertTrue(outcome["glpc_error"], "причина отказа не названа")
+
+
+class SplitReportIsNeverHalfWritten(unittest.TestCase):
+    """Отчёт `3545/314/141` записывается целиком, а не «частично».
+
+    **Дыра, найденная на живой базе 11.10.2026.** Писатель отправлял массив
+    строк через `rest_post(..., ignore_conflict=True)`. Если **хотя бы один**
+    `uniq_key` уже был в таблице (повторная доставка апдейта — штатный случай),
+    PostgREST отвечал `409` на **всю** пачку, а `ignore_conflict` возвращал
+    пустой список — то есть «успех». Две из трёх строк молча не попадали в
+    журнал, и ошибка числилась только у одного робота.
+
+    Проверено на живой схеме: массив с одним существующим ключом даёт `409`, и
+    **ни одна** строка не вставляется. Поэтому запись идёт upsert'ом по
+    `uniq_key` — тогда каждая строка либо записана, либо обновлена.
+    """
+
+    def setUp(self):
+        # Память о колонках — глобальная: отказ в соседнем тесте («вставим без
+        # аналитики») снял бы `device_number` и здесь, и проверка упала бы не по
+        # своей причине.
+        rw.reset_schema_cache()
+
+    def tearDown(self):
+        rw.reset_schema_cache()
+
+    def _numbers(self):
+        data = result()
+        data["answers"]["device_number"] = "3545/314/141"
+        return data
+
+    def test_three_numbers_produce_three_upserted_rows(self):
+        attempts = []
+
+        def fake_upsert(table, payload, on_conflict):
+            attempts.append((table, payload, on_conflict))
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(self._numbers(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 1)
+        _table, payload, on_conflict = attempts[0]
+        # **Один запрос** — одна транзакция: «половина отчёта» невозможна.
+        self.assertIsInstance(payload, list)
+        self.assertEqual(len(payload), 3)
+        self.assertEqual(on_conflict, "uniq_key")
+
+        self.assertEqual([row["error_robot"] for row in payload], [3545, 314, 141])
+        keys = [row["uniq_key"] for row in payload]
+        self.assertEqual(len(set(keys)), 3, "ключи должны различаться суффиксом")
+        for row in payload:
+            self.assertEqual(row["error_robot"], rw._robot_number(row["device_number"]))
+
+    def test_the_writer_does_not_use_a_plain_insert(self):
+        """`rest_post` не должен вернуться: он и есть источник потери строк.
+
+        Сторож именно про **поведение**: upsert вызывается, а вставка — нет.
+        """
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]) as upsert, \
+             mock.patch("sendToDataBase.rest_post") as post, \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            rw.write_exception(self._numbers(), "GLP-C")
+
+        upsert.assert_called_once()
+        post.assert_not_called()
+
+    def test_a_failed_upsert_is_reported_as_a_failure(self):
+        """Отказ upsert — это честный False, а не «сохранено»."""
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", return_value=None), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertFalse(rw.write_exception(self._numbers(), "GLP-C"))
 
 
 if __name__ == "__main__":
