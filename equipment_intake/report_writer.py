@@ -657,16 +657,37 @@ def build_rows(
     report_id = _report_id(result, answers)
     user_id = result.get("user_id")
 
-    details = [f"Reported error: {str(answers.get('description') or '').strip()}"]
+    # **Каждый пункт — в свою колонку, а не в склейку.**
+    #
+    # Требование владельца 11.10.2026: «чтобы ошибки которые отправляются через
+    # бота каждый пункт записи был в отдельном столбе на базе данных».
+    #
+    # Раньше здесь собирался многострочный текст:
+    #
+    #     Reported error: Wrong pick
+    #     Identifier: 3502
+    #     Reported type: K50H
+    #     Module: Lifting
+    #
+    # Проверено на живой базе: так выглядели **все 1819** записей бота. Три
+    # строки из четырёх **дублировали** колонки, которые уже есть
+    # (`device_number`, `device_type`, `module`), а четвёртая — единственный
+    # текст оператора — тонула в них. В выгрузке Excel это давало четыре строки
+    # в ячейке «问题描述» там, где нужна одна.
+    #
+    # `reported_type` — **как назвал оператор** (`K50H`), отдельно от
+    # `device_type` с кодом справочника (`RT_KUBOT_MINI_HAIFLEX`): это разные
+    # значения, и смешивать их нельзя.
+    # `module_text` — модуль из ответа, отдельно от `module`: тот заполняется
+    # подбором шаблона и может быть пуст.
+    reported_error = str(answers.get("description") or "").strip() or None
+    reported_type = label if (label and label != device_type) else None
+    module_text = module or None
 
-    if code:
-        details.append(f"Identifier: {code}")
-
-    if label and label != device_type:
-        details.append(f"Reported type: {label}")
-
-    if module:
-        details.append(f"Module: {module}")
+    # `issue_description` остаётся **сырым текстом оператора** — для истории и
+    # разбора. Склейку в него больше не пишем: значения уже в своих колонках, а
+    # повторять их здесь значило бы вернуть ту самую проблему.
+    details = [reported_error] if reported_error else []
 
     # `add_by` is the employee's `card_id`, which the caller already resolved
     # while looking the name up. It stays None when the account is not linked or
@@ -705,12 +726,20 @@ def build_rows(
     rows: list[Dict[str, Any]] = []
 
     for number in numbers:
-        # Описание получает номер устройства: строки в журнале выглядят
-        # самостоятельными записями, и по тексту видно, к какому роботу какая.
-        # У единственного устройства текст остаётся ровно таким, как был.
+        # **Номер устройства остаётся в `device_number`, а не в тексте.**
+        #
+        # Раньше при нескольких устройствах в описание вставлялась строка
+        # `Device: 3561` — это был единственный способ понять, к какому роботу
+        # относится строка. С 11.10.2026 номер лежит в **своей колонке**
+        # (`device_number` заполняется ниже, для каждой строки свой), и вторая
+        # копия в тексте — ровно тот дубль, который владелец просил убрать.
+        #
+        # Оставляем строку **только** в запасном пути без колонок
+        # (`include_optional=False`): там `device_number` не пишется, и без
+        # пометки две строки одного отчёта стали бы неразличимы.
         row_details = list(details)
 
-        if len(numbers) > 1:
+        if len(numbers) > 1 and not include_optional:
             row_details.insert(1, f"Device: {number}")
 
         row = {
@@ -725,7 +754,16 @@ def build_rows(
             # шаблоном: это единственное место, где видно, что именно написал
             # человек. То же описание дублируется в `telegram_equipment_reports`
             # (`description`), поэтому подбор ничего не теряет.
-            "issue_description": "\n".join(row_details),
+            #
+            # С 11.10.2026 склейки здесь **нет**: `reported_error` содержит текст
+            # оператора, а три остальных значения уехали в свои колонки
+            # (`reported_type`, `device_number`, `module_text`).
+            "issue_description": "\n".join(row_details) or None,
+            # **Каждый пункт — в своей колонке** (миграция
+            # `0080_error_columns_not_text.sql`).
+            "reported_error": reported_error,
+            "reported_type": reported_type,
+            "module_text": module_text,
             "issue_type": template_columns["issue_type"],
             "photo_url": result.get("photo_url") or None,
             "recovery_title": template_columns["recovery_title"],

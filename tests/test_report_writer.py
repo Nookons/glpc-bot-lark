@@ -440,23 +440,81 @@ class TruncateChecks(unittest.TestCase):
 
 
 class RowMappingChecks(unittest.TestCase):
+    def test_every_item_has_its_own_column(self):
+        """**Каждый пункт записи — в своей колонке.**
+
+        Требование владельца 11.10.2026, дословно: «чтобы ошибки которые
+        отправляются через бота каждый пункт записи был в отдельном столбе на
+        базе данных».
+
+        Проверяю **все четыре** значения сразу: до этой правки они склеивались
+        в `issue_description` переносами, и три из четырёх дублировали колонки,
+        которые уже были. Тест падает, если хоть одно значение вернётся в текст
+        или потеряется.
+        """
+        row = row_for(resolved="RT_KUBOT_MINI_HAIFLEX")
+
+        # Текст оператора — и отдельной колонкой, и (без метки) в описании.
+        self.assertTrue(row["reported_error"])
+        self.assertNotIn("Reported error:", row["issue_description"] or "")
+
+        # Тип оператора — своя колонка, в тексте метки нет.
+        self.assertEqual(row["reported_type"], "A42T C2")
+        self.assertNotIn("Reported type:", row["issue_description"] or "")
+
+        # Номер устройства — своя колонка, в тексте метки нет.
+        self.assertEqual(row["device_number"], "3490")
+        self.assertNotIn("Identifier:", row["issue_description"] or "")
+
+        # Модуль — своя колонка, в тексте метки нет.
+        self.assertTrue(row["module_text"])
+        self.assertNotIn("Module:", row["issue_description"] or "")
+
+    def test_description_never_contains_the_old_labels(self):
+        """Ни одна метка склейки не возвращается в текст.
+
+        Это сторож **против регресса**: склейка была неочевидна, и вернуть её
+        можно одной строкой, не заметив. Проверяю на всех формах ввода, включая
+        текстовый номер устройства.
+        """
+        for data in (
+            result(),
+            result(answers={"description": "x", "device_number": "H108/1834"}),
+        ):
+            row = rw.build_row(data, "GLP-C")
+
+            for marker in ("Reported error:", "Identifier:", "Reported type:", "Module:"):
+                self.assertNotIn(
+                    marker,
+                    row["issue_description"] or "",
+                    f"{marker!r} вернулось в текст описания",
+                )
+
     def test_canonical_type_replaces_the_label(self):
+        """Тип оператора (`K50H`) — в своей колонке, код справочника — в `device_type`.
+
+        Требование владельца 11.10.2026: «каждый пункт записи был в отдельном
+        столбе». До этого `Reported type:` вклеивался строкой в
+        `issue_description`, и одно и то же значение лежало в двух местах.
+        """
         row = row_for(resolved="RT_KUBOT_MINI_HAIFLEX")
 
         self.assertEqual(row["device_type"], "RT_KUBOT_MINI_HAIFLEX")
-        self.assertIn("Reported type: A42T C2", row["issue_description"])
+        self.assertEqual(row["reported_type"], "A42T C2")
+        self.assertNotIn("Reported type", row["issue_description"] or "")
 
     def test_label_is_kept_when_type_is_unknown(self):
+        """Совпал с типом — отдельная колонка не нужна, значение не теряется."""
         row = row_for(resolved=None)
 
         self.assertEqual(row["device_type"], "A42T C2")
-        self.assertNotIn("Reported type", row["issue_description"])
+        self.assertIsNone(row["reported_type"])
 
     def test_label_is_not_repeated_when_it_equals_the_type(self):
         row = row_for(resolved="A42T C2")
 
         self.assertEqual(row["device_type"], "A42T C2")
-        self.assertNotIn("Reported type", row["issue_description"])
+        self.assertIsNone(row["reported_type"])
 
     def test_numeric_identity_fills_error_robot(self):
         self.assertEqual(row_for()["error_robot"], 3490)
@@ -469,13 +527,17 @@ class RowMappingChecks(unittest.TestCase):
             row = rw.build_row(data, "GLP-C")
 
         self.assertIsNone(row["error_robot"])
-        self.assertIn("Shelf-3938-3002-20", row["issue_description"])
+        # Текстовый номер остаётся в **своей** колонке, а не в описании:
+        # в `issue_description` ему больше не место.
+        self.assertEqual(row["device_number"], "Shelf-3938-3002-20")
+        self.assertNotIn("Identifier:", row["issue_description"] or "")
 
     def test_module_is_preserved_in_second_column_and_details(self):
         row = row_for(resolved=None)
 
         self.assertEqual(row["second_column"], "Lifting")
-        self.assertIn("Module: Lifting", row["issue_description"])
+        self.assertEqual(row["module_text"], "Lifting")
+        self.assertNotIn("Module:", row["issue_description"] or "")
 
     def test_missing_module_falls_back_to_device_type(self):
         data = result()
@@ -2197,7 +2259,10 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("driver component exception")
 
-        self.assertIn("Reported error: driver component exception", row["issue_description"])
+        # Текст оператора лежит в `reported_error` **и** в `issue_description`,
+        # но уже без метки «Reported error: » — она была частью склейки.
+        self.assertEqual(row["reported_error"], "driver component exception")
+        self.assertIn("driver component exception", row["issue_description"])
 
     def test_solving_time_is_coerced_to_int(self):
         """Справочник может вернуть строку или мусор — запись не должна падать."""

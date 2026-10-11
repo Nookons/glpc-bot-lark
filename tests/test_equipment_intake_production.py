@@ -197,8 +197,11 @@ class CanonicalTypeChecks(unittest.TestCase):
             row = report_writer.build_row(_result(), "GLP-C")
 
         self.assertEqual(row["device_type"], "RT_KUBOT_MINI_HAIFLEX")
-        # The operator's label is preserved, not lost.
-        self.assertIn("Reported type: A42T C2", row["issue_description"])
+        # The operator's label is preserved, not lost — and lives in its **own**
+        # column since 11.10.2026 (owner: "каждый пункт записи был в отдельном
+        # столбе"). Before that it was glued into `issue_description`.
+        self.assertEqual(row["reported_type"], "A42T C2")
+        self.assertNotIn("Reported type", row["issue_description"] or "")
 
     def test_label_is_used_when_type_is_unknown(self):
         with patch.object(report_writer, "canonical_type", return_value=None):
@@ -239,7 +242,9 @@ class RowMappingChecks(unittest.TestCase):
             row = report_writer.build_row(result, "GLP-C")
 
         self.assertIsNone(row["error_robot"])
-        self.assertIn("Shelf-3938-3002-20", row["issue_description"])
+        # Идентификатор — в своей колонке, а не в тексте описания.
+        self.assertEqual(row["device_number"], "Shelf-3938-3002-20")
+        self.assertNotIn("Identifier:", row["issue_description"] or "")
 
     def test_qr_floor_shape_is_supported(self):
         result = _result()
@@ -249,7 +254,10 @@ class RowMappingChecks(unittest.TestCase):
         with patch.object(report_writer, "canonical_type", return_value=None):
             row = report_writer.build_row(result, "GLP-C")
 
-        self.assertIn("X=162; Y=382; Zone=30", row["issue_description"])
+        # QR-координаты — это **идентификатор устройства**, и с 11.10.2026 он
+        # лежит в своей колонке; `error_robot` пуст, потому что это не робот.
+        self.assertEqual(row["device_number"], "X=162; Y=382; Zone=30")
+        self.assertNotIn("Identifier:", row["issue_description"] or "")
         self.assertIsNone(row["error_robot"])
 
     def test_uniq_key_uses_telegram_coordinates(self):
