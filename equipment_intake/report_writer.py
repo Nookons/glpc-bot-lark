@@ -57,6 +57,18 @@ OPTIONAL_COLUMNS = (
     # «ошибки по причинам» был невозможен: SQL-агрегат по JSON никто не
     # напишет. Колонка добавлена миграцией `0075`.
     "cause",
+    # **Разложенные пункты записи** (миграция `0080_error_columns_not_text.sql`).
+    #
+    # Здесь они ��бязательны: пока миграция не применена, вставка с этими
+    # колонками падала бы, и **отчёт терялся бы целиком** — а писатель обязан
+    # пережить расхождение схемы и кода (тот же принцип, что у `cause` выше).
+    #
+    # Требование владельца 11.10.2026: «каждый пункт записи был в отдельном
+    # столбе». До этого текст ошибки, тип и модуль склеивались в
+    # `issue_description` четырьмя строками.
+    "reported_error",
+    "reported_type",
+    "module_text",
 )
 
 # How long the "columns are missing" answer is remembered. Short TTL, same
@@ -759,11 +771,6 @@ def build_rows(
             # оператора, а три остальных значения уехали в свои колонки
             # (`reported_type`, `device_number`, `module_text`).
             "issue_description": "\n".join(row_details) or None,
-            # **Каждый пункт — в своей колонке** (миграция
-            # `0080_error_columns_not_text.sql`).
-            "reported_error": reported_error,
-            "reported_type": reported_type,
-            "module_text": module_text,
             "issue_type": template_columns["issue_type"],
             "photo_url": result.get("photo_url") or None,
             "recovery_title": template_columns["recovery_title"],
@@ -794,6 +801,18 @@ def build_rows(
             # `device_number` — своё у каждой строки, а не общая строка с косой
             # чертой: иначе поиск по номеру робота не нашёл бы ни одну из них.
             row["device_number"] = number or None
+
+            # **Каждый пункт — в своей колонке** (миграция
+            # `0080_error_columns_not_text.sql`).
+            #
+            # Здесь, а **не в основном словаре**: колонки новые, и на базе без
+            # миграции вставка с ними упала бы — отчёт потерялся бы целиком.
+            # Запасной путь (`include_optional=False`) обязан работать на
+            # прежней схеме, поэтому эти поля идут вместе с остальными
+            # аналитическими.
+            row["reported_error"] = reported_error
+            row["reported_type"] = reported_type
+            row["module_text"] = module_text
 
         rows.append(row)
 
