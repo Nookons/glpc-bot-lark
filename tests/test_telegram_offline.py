@@ -279,38 +279,11 @@ def fake_shift_stats(shift_date, shift_name):
 
 COUNTS = {}
 
-tg.send_message = fake_send_message
-tg.send_chat_action = fake_send_chat_action
-tg.delete_message = fake_delete_message
-tg.edit_message_text = fake_edit_message_text
-tg.answer_callback_query = fake_answer_callback_query
-tg.get_file = fake_get_file
-tg.download_file = fake_download_file
-
-bot.get_employee_name = fake_get_employee_name
-bot.get_employee = fake_get_employee
-robot_status.find_robot = fake_find_robot
-robot_status.find_robot_by_id = fake_find_robot_by_id
-bot.resolve_employee_name = fake_resolve_employee_name
-bot.link_user = fake_link_user
-bot.unlink_user = fake_unlink_user
-bot.send_to_data_base = fake_send_to_data_base
-bot.queue_missing_robot = fake_queue_missing_robot
-
 # По умолчанию похожих номеров нет: тесты про подсказку подменяют это сами,
 # иначе каждый «неизвестный робот» ходил бы в базу за списком номеров.
 import robot_card as robot_card_module  # noqa: E402
 
 REAL_SUGGEST_ROBOT_NUMBERS = robot_card_module.suggest_robot_numbers
-robot_card_module.suggest_robot_numbers = lambda *args, **kwargs: []
-
-# Offset Telegram в тестах не читаем и не пишем в настоящий Storage.
-bot.load_saved_offset = lambda: None
-bot.save_offset = lambda offset: True
-bot.count_robot_errors_in_shift = fake_count_robot_errors_in_shift
-bot.forward_error = fake_forward_error
-bot.handle_incoming_photo = fake_handle_incoming_photo
-bot.shift_stats = fake_shift_stats
 
 import sendToDataBase as stdb  # noqa: E402
 
@@ -320,7 +293,66 @@ def notifier(chat_id, text):
     return bot._send(chat_id, text)
 
 
-stdb.set_notifier(notifier)
+def _install_test_stubs() -> None:
+    """Ставит заглушки Telegram, БД и Lark. **Вызывается перед каждым тестом.**
+
+    🔴 **Почему установщик, а не разовые присваивания на импорте.**
+
+    Дефект, найденный 12.10.2026. `test_live_test_harness` поднимает
+    `BotEnvIsolation`, которая перезагружает модули бота
+    (`bot_config_isolation.reload_bot_modules`). Перезагрузка выполняется **в
+    том же объекте модуля** и заново исполняет код модуля, поэтому все функции
+    возвращаются к **настоящим**: `tg.send_message`, `bot.get_employee_name`,
+    `bot.send_to_data_base` и остальные. Заглушки, поставленные здесь один раз
+    на импорте, к моменту запуска тестов этого файла оказывались **стёртыми**.
+
+    **Как это выглядело.** Бот не отправлял ни одного сообщения (`sent == []`),
+    и шесть тестов падали с `IndexError: list index out of range` на `sent[0]`.
+    По отдельности файл проходил, поэтому падение списывали на «проблему
+    порядка тестов» — и тем самым **скрывали**, что команды `/offline`,
+    `/online` и флоу статуса в этих тестах **не проверялись вообще**.
+
+    Ставить заглушки **перед каждым тестом** — единственный способ, не
+    зависящий от того, какие наборы уже успели перезагрузить модули.
+    """
+    tg.send_message = fake_send_message
+    tg.send_chat_action = fake_send_chat_action
+    tg.delete_message = fake_delete_message
+    tg.edit_message_text = fake_edit_message_text
+    tg.answer_callback_query = fake_answer_callback_query
+    tg.get_file = fake_get_file
+    tg.download_file = fake_download_file
+
+    bot.get_employee_name = fake_get_employee_name
+    bot.get_employee = fake_get_employee
+    robot_status.find_robot = fake_find_robot
+    robot_status.find_robot_by_id = fake_find_robot_by_id
+    bot.resolve_employee_name = fake_resolve_employee_name
+    bot.link_user = fake_link_user
+    bot.unlink_user = fake_unlink_user
+    bot.send_to_data_base = fake_send_to_data_base
+    bot.queue_missing_robot = fake_queue_missing_robot
+
+    robot_card_module.suggest_robot_numbers = lambda *args, **kwargs: []
+
+    # Offset Telegram в тестах не читаем и не пишем в настоящий Storage.
+    bot.load_saved_offset = lambda: None
+    bot.save_offset = lambda offset: True
+    bot.count_robot_errors_in_shift = fake_count_robot_errors_in_shift
+    bot.forward_error = fake_forward_error
+    bot.handle_incoming_photo = fake_handle_incoming_photo
+    bot.shift_stats = fake_shift_stats
+
+    bot.console = DummyConsole()
+    bot.BOT_USERNAME = "TestBot"
+
+    stdb.set_notifier(notifier)
+
+
+# Ставим сразу — файл обязан работать и сам по себе (`python3 tests/...`).
+# Конфигурацию топиков трогать здесь нельзя: `_restore_test_config` определена
+# ниже, а на импорте окружение уже выставлено `tests/conftest.py`.
+_install_test_stubs()
 
 
 MESSAGE_SEQ = [1000]
@@ -405,6 +437,92 @@ def make_callback(data, user_id=100, chat_id=-500, message_id=1, thread_id=2):
             "data": data,
         },
     }
+
+
+def _restore_test_config() -> None:
+    """Возвращает конфигурацию бота к тестовой. **Вызывается перед каждым тестом.**
+
+    🔴 **Зачем это нужно, и почему без этого 6 тестов молча не проверялись.**
+
+    Дефект, найденный 12.10.2026. Файл выставляет окружение **один раз, на
+    уровне модуля** (`TELEGRAM_ALLOWED_CHAT_IDS = ""`). Но другой набор тестов
+    (`test_live_test_harness`) поднимает `BotEnvIsolation`, которая **меняет
+    окружение и перезагружает модули бота**. Перезагрузка заново исполняет код
+    модуля, поэтому `telegram_bot.TOPIC_RAW` перечитывается из окружения — а
+    `test_equipment_intake_production` (идёт по алфавиту раньше офлайн-набора)
+    импортировал `telegram_bot` с **боевыми** значениями `.env`
+    (`TELEGRAM_TOPIC_ERROR_GLPC=2`, `..._SP3=318`). Итог — карта топиков
+    `[2, 318]`, отправка в тестовый топик отклоняется:
+
+        Отправка отклонена: топик None не обслуживается (chat=-500, allowed=[2, 318])
+
+    Бот молчит, и тесты падают с `IndexError: list index out of range` на
+    `sent[0]`. **Почему это было незаметно.** Каждый файл по отдельности
+    проходил, поэтому падение списывали на «проблему порядка тестов». На деле
+    команды `/offline`, `/online` и флоу статуса в этих тестах **не проверялись
+    вообще**.
+
+    **Где именно это применяется.** Перезагрузка конфигурации выполняется
+    **в начале каждого теста** (`tests/conftest.py`), а НЕ внутри `run()`.
+    Сброс внутри `run()` был бы дефектом: тесты намеренно выставляют
+    `bot.ALLOWED_CHAT_IDS`, `bot.TOPIC_RAW`, `bot._topic_names` и
+    `bot._hinted_threads` **перед** `run()`, и такой сброс затирал бы эти
+    настройки — сообщение обрабатывалось бы по чужому фильтру, а проверка
+    «чужой топик молчит» перестала бы проверять то, что заявлено.
+    """
+    os.environ["TELEGRAM_ALLOWED_CHAT_IDS"] = ""
+    os.environ["TELEGRAM_TOPIC_ID"] = ""
+    os.environ["TELEGRAM_TOPIC_NAME"] = ""
+    # 🔴 **Топики складов и общих лент — тоже обнуляем.**
+    #
+    # Файл делает это **один раз, при импорте** (см. цикл выше). Но изоляция
+    # другого набора тестов восстанавливает окружение, каким оно было до неё, —
+    # то есть **боевыми** значениями из `.env` (`TELEGRAM_TOPIC_ERROR_SP3=318`,
+    # `..._GLPC=2`). После этого карта топиков снова содержит `[2, 318]`, и
+    # отправка в тестовый топик отклоняется: «Отправка отклонена: топик None не
+    # обслуживается (chat=-500, allowed=[2, 318])» — бот молчит, тест падает.
+    for _key in ("GLPC", "SP3"):
+        os.environ[f"TELEGRAM_TOPIC_ERROR_{_key}"] = ""
+    for _key in ("STATUS", "STATS", "SERVICE"):
+        os.environ[f"TELEGRAM_TOPIC_{_key}"] = ""
+    # 🔴 **Карту топиков перечитываем из окружения.**
+    #
+    # `TOPIC_RAW` — обычный словарь, собранный на импорте и **не привязанный к
+    # окружению**. Пока был тестовым он и остаётся, но после перезагрузки
+    # модулей другим набором (`BotEnvIsolation`) он снова боевой. Поэтому
+    # пересобираем его здесь — это и есть единственный источник для
+    # `allowed_output_topics()`.
+    bot.TOPIC_RAW.clear()
+    bot.TOPIC_RAW.update({
+        "error": os.environ.get("TELEGRAM_TOPIC_ID", "").strip(),
+        "status": os.environ.get("TELEGRAM_TOPIC_STATUS", "").strip(),
+        "stats": os.environ.get("TELEGRAM_TOPIC_STATS", "").strip(),
+        "service": os.environ.get("TELEGRAM_TOPIC_SERVICE", "").strip(),
+    })
+
+    for _key, _title in bot.WAREHOUSES.items():
+        _raw = os.environ.get(f"TELEGRAM_TOPIC_ERROR_{_key.upper()}", "").strip()
+
+        if _raw:
+            bot.TOPIC_RAW[f"error:{_title}"] = _raw
+
+    bot.TELEGRAM_TOPIC_ID = bot._env_int_opt("TELEGRAM_TOPIC_ID")
+    bot.TELEGRAM_TOPIC_NAME = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
+    bot.ALLOWED_CHAT_IDS = {
+        int(part)
+        for part in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").replace(" ", "").split(",")
+        if part
+    }
+    # 🔴 **Кэш разрешённых топиков тоже пересчитываем.**
+    #
+    # `allowed_output_topics()` кэширует множество топиков в глобальной
+    # переменной и **никогда его не пересчитывает** (`if _ALLOWED_OUTPUT_TOPICS:
+    # return`). Пока кэш держит прошлое значение, `_output_topic_allowed()`
+    # отклоняет отправку в тестовый топик, и бот молчит.
+    bot._ALLOWED_OUTPUT_TOPICS = set()
+    bot._topic_names.clear()
+    bot._routes.clear()
+    bot._hinted_threads.clear()
 
 
 def run(update):
@@ -4397,7 +4515,18 @@ def test_bucket_public_flag_updates_existing_bucket():
     try:
         real_error = storage.ensure_bucket_named("bot-photos", public=False)
     finally:
-        storage.requests.post = fake_post
+        # 🔴 **`original_post`, а не `fake_post`.**
+        #
+        # Дефект, найденный 12.10.2026. `storage.requests` — это **общий** модуль
+        # `requests`, поэтому присваивание здесь меняет `requests.post` для всего
+        # процесса. Возврат к `fake_post` оставлял заглушку живой после теста, и
+        # следующий набор (`test_live_test_harness`) получал ответ без
+        # `raise_for_status()`:
+        # `AttributeError: 'FakeResponse' object has no attribute 'raise_for_status'`.
+        #
+        # Сам по себе файл это не ловил, потому что офлайн-тесты идут последними
+        # по алфавиту, — поэтому утечка видна только в обратном порядке.
+        storage.requests.post = original_post
         storage._buckets_ok.clear()
 
     check("bucket M2: настоящая 400 — это ошибка", real_error is False, real_error)
@@ -7900,6 +8029,16 @@ def main():
 
     for test in tests:
         print(f"\n--- {test.__name__} ---")
+
+        # 🔴 **То же, что делает фикстура `tests/conftest.py` для pytest.**
+        #
+        # Файл запускается и напрямую (`python3 tests/test_telegram_offline.py`),
+        # тогда conftest не исполняется. Перезагрузка модулей другим набором
+        # (`test_live_test_harness`) стирает заглушки и возвращает боевые топики
+        # из `.env`, поэтому состояние надо восстановить здесь — иначе тесты
+        # будут зависеть от того, что успело выполниться до них.
+        _restore_test_config()
+        _install_test_stubs()
 
         # T5: состояние одного теста не должно влиять на другой — иначе
         # «дубль» из старого теста глушит сообщение в новом.

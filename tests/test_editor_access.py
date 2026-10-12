@@ -33,6 +33,17 @@ class AccessTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._saved_env = os.environ.get("TELEGRAM_ADMIN_USER_IDS")
         self._saved_cache = dict(editor._LEADER_CACHE)
+        # 🔴 **Запоминаем настоящий `telegram_store` до подмены.**
+        #
+        # Дефект, найденный 12.10.2026: `_fake_store` кладёт в `sys.modules`
+        # самодельный модуль и **не убирает его**. Заглушка живёт до конца
+        # процесса, поэтому следующие файлы ломались на импорте:
+        # `ImportError: cannot import name 'StoreUnavailable' from
+        # 'telegram_store' (unknown location)` — у заглушки этого имени нет.
+        #
+        # Это тот же класс, что и утечка `sendToDataBase`: «известные падения
+        # из-за порядка тестов» скрывали, что часть команд не тестируется.
+        self._saved_store = sys.modules.get("telegram_store")
         editor._LEADER_CACHE.clear()
         os.environ.pop("TELEGRAM_ADMIN_USER_IDS", None)
         self.addCleanup(self._restore)
@@ -44,6 +55,11 @@ class AccessTestCase(unittest.TestCase):
             os.environ["TELEGRAM_ADMIN_USER_IDS"] = self._saved_env
         editor._LEADER_CACHE.clear()
         editor._LEADER_CACHE.update(self._saved_cache)
+        # Возвращаем настоящий модуль (или убираем заглушку, если его не было).
+        if self._saved_store is None:
+            sys.modules.pop("telegram_store", None)
+        else:
+            sys.modules["telegram_store"] = self._saved_store
 
     def _fake_store(self, employee, *, boom: bool = False) -> None:
         module = types.ModuleType("telegram_store")
