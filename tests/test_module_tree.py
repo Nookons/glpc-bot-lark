@@ -202,16 +202,43 @@ class TestErrorLayer:
 
             assert targets == {f"robot_errors_{module_id}"}, module_id
 
-    def test_error_is_asked_before_the_device_number(self) -> None:
-        """После ошибки идёт номер устройства, потом описание и причина."""
+    def test_error_is_asked_after_the_device_number(self) -> None:
+        """**Новый порядок 12.10.2026:** номер сразу после категории, затем модель,
+        модуль и ошибка.
+
+        Схема владельца: «Ask device number» стоит **сразу после** выбора
+        категории, «Check device number on server» — **между** номером и моделью.
+        Владелец, дословно: «после фото **не спрашивает сразу номер робота**».
+
+        Прежний тест кодировал обратный порядок (ошибка → номер) и требовал
+        `next_node == "ask_number"` от ошибок. Ожидание **обновлено осмысленно**:
+        оно противоречило новой схеме, а не подтверждало её.
+        """
+        # Корень робота спрашивает номер ПЕРВЫМ шагом.
+        assert DEFAULT_TREE.node("root").option("robot").next_node == "ask_number"
+
+        # После номера — модель, а не описание: проверка на сервере стоит между.
+        assert DEFAULT_TREE.node("ask_number").next_node == "robot_type"
+
+        # Ошибка ведёт сразу к причине: номер уже введён в начале пути.
         for module in MODULE_ERRORS:
             node = DEFAULT_TREE.node(error_node_id(module))
 
             for option in node.options:
-                assert option.next_node == "ask_number"
+                assert option.next_node == "ask_cause"
 
-        assert DEFAULT_TREE.node("ask_number").next_node == "ask_description"
-        assert DEFAULT_TREE.node("ask_description").next_node == "ask_cause"
+    def test_qr_branch_skips_the_robot_model(self) -> None:
+        """У QR модели/модуля нет: код места/полки — уже всё, что известно.
+
+        Ветка QR тоже идёт через `ask_number` (он один на дерево), но после
+        номера — сразу причина. Без развилки `next_node_by_kind` оператор после
+        кода полки выбирал бы модель робота.
+        """
+        node = DEFAULT_TREE.node("ask_number")
+        kinds = dict(node.next_node_by_kind)
+
+        assert kinds.get("qr_floor") == "ask_cause"
+        assert kinds.get("qr_shelf") == "ask_cause"
 
     def test_error_answer_is_recorded_under_its_own_key(self) -> None:
         """Ответ об ошибке попадает в результат с ключом `error`."""
@@ -221,16 +248,24 @@ class TestErrorLayer:
         assert node.summary_label == "Error"
 
     def test_full_walk_records_module_and_error(self) -> None:
-        """Сквозной проход: модель → модуль → ошибка → номер → описание → причина."""
+        """Сквозной проход: **номер → модель → модуль → ошибка → причина**.
+
+        **Порядок изменился 12.10.2026** (схема владельца): номер спрашивается
+        сразу после категории, а не после ошибки. Прежний проход начинался с
+        модели (`robot → a42t → tray → …`) и на новом дереве падал уже на втором
+        шаге: `a42t` — это вариант **модели**, а после `robot` бот спрашивает
+        номер. Ожидание обновлено вслед за деревом.
+        """
         from equipment_intake.engine import Session
 
         session = Session(tree=DEFAULT_TREE)
 
-        for step in ("robot", "a42t", "tray", "tray_cant_extend"):
+        session.select("robot")
+        session.submit_text("3780")
+
+        for step in ("a42t", "tray", "tray_cant_extend"):
             session.select(step)
 
-        session.submit_text("3780")
-        session.submit_text("tray does not extend")
         session.select("obstacle")
 
         assert session.is_completed
@@ -241,6 +276,8 @@ class TestErrorLayer:
         assert answers["error"] == "Can't extend/expand the tray"
         assert answers["device_number"] == "3780"
         assert answers["cause"] == "Obstacle on the path"
+        # Описание на обычном пути не спрашивается — оно только для `Other`.
+        assert "description" not in answers
 
 
 class TestKeyboardColumns:
@@ -284,36 +321,70 @@ class TestKeyboardColumns:
         assert shown == len(_labels("robot_module_a42t"))
 
     def test_safety_stays_on_one_screen(self) -> None:
-        """Четыре ошибки Safety влезают в один ряд — листать не нужно."""
+        """Четыре ошибки Safety видны **без листания** — и читаемы целиком.
+
+        **Ожидание изменилось 12.10.2026.** Раньше здесь было `len == 1`: все
+        четыре ошибки помещались в **один ряд из шести** колонок. Но владелец
+        прислал скриншот живого бота, где причины показывались как `Huma…`,
+        `Obsta…`, `Softw…` — **прочитать выбор было невозможно**: у Safety
+        подписи до **33 символов** («Front emergency button is trigger»), а в
+        шести колонках влезает ≈ 7 знаков.
+
+        Подписи длиннее 12 символов теперь идут **по три в ряд** (`keyboards.py`,
+        `SINGLE_LINE_LABEL_LIMIT`), поэтому четыре ошибки занимают **два ряда**.
+        🔴 **Требование владельца не нарушено:** «два ряда» и было его условием —
+        важно, что **листать не нужно**, а не число рядов.
+        """
         rows = node_keyboard(_Session("robot_errors_safety"))["inline_keyboard"]
         option_rows = [row for row in rows if "Cancel" not in row[0]["text"]]
 
-        assert len(option_rows) == 1
-        assert len(option_rows[0]) == 4
+        # Помещаются на один экран: два ряда вариантов + Cancel, без пейджера.
+        assert len(option_rows) == 2
+        assert sum(len(row) for row in option_rows) == 4
+
         labels = [button["text"] for row in rows for button in row]
 
         assert not any("Next" in text or "Back" in text for text in labels)
 
+        # 🔴 **Главное — подписи читаемы.** Ровно это и сломалось в проде:
+        # обрезка превращала выбор в `Huma…`, и оператор выбирал вслепую.
+        texts = [button["text"] for row in option_rows for button in row]
 
-class TestCauseQuestion:
-    def test_cause_is_asked_after_the_description(self) -> None:
-        """Причина спрашивается **после** описания проблемы.
-
-        Владелец: «добавить причину ошибки как ещё один вопрос». Описание
-        отвечает «что не так», причина — «почему»; это разные вещи.
-        """
-        nodes = DEFAULT_TREE.to_dict()["nodes"]
-        description = nodes["ask_description"]
-
-        assert description["next_node"] == "ask_cause", (
-            "после описания должен идти вопрос о причине"
+        assert all("…" not in text for text in texts), (
+            "подпись обрезана — оператор не прочитает, что выбирает"
         )
 
-    def test_cause_has_options_and_leads_to_summary(self) -> None:
+
+class TestCauseQuestion:
+    def test_description_is_only_reached_through_other(self) -> None:
+        """Описание спрашивается **только** при причине `Other`.
+
+        **Владелец 12.10.2026, дословно:** «убери вопросы об описание ошибки оно
+        нужно **только если other выберет**». Обычная причина ведёт сразу к
+        итогу, и только `other` открывает свободный текст.
+
+        Узел `ask_description` при этом **не удалён**: он ведёт к `summary`.
+        """
+        options = {option.id: option for option in DEFAULT_TREE.node("ask_cause").options}
+
+        assert options["other"].next_node == "ask_description", (
+            "Other обязан вести на описание — иначе вопрос пропал бы совсем"
+        )
+
+        for option_id, option in options.items():
+            if option_id == "other":
+                continue
+            assert option.next_node == "summary", (
+                f"причина {option_id} должна вести сразу к итогу"
+            )
+
+        # Описание из дерева не выброшено: оно завершает ветку `Other`.
+        assert DEFAULT_TREE.node("ask_description").next_node == "summary"
+
+    def test_cause_has_options(self) -> None:
         options = DEFAULT_TREE.node("ask_cause").options
 
         assert len(options) >= 4, "список причин пуст или слишком короткий"
-        assert all(option.next_node == "summary" for option in options)
         # «Other» обязателен: закрытый список без него заставляет выбирать
         # неточное и портит статистику.
         assert any(option.id == "other" for option in options)

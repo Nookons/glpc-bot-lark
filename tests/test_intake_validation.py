@@ -108,12 +108,13 @@ class BranchDependentHintChecks(unittest.TestCase):
     def test_robot_branch_still_hints_a_robot_number(self):
         """Ветка робота не должна потерять свой пример — проверка обеих сторон.
 
-        **Путь изменился 12.10.2026:** между модулем и номером появился выбор
-        **ошибки**, поэтому модель и модуль теперь надо отвечать вместе с ней.
-        Прежний `["robot", "a42t", "lifting"]` останавливался на узле ошибок, и
-        `text_example()` был пуст.
+        **Путь изменился 12.10.2026.** Номер теперь спрашивается **сразу после**
+        категории (схема владельца: «Ask device number» перед моделью), поэтому
+        после `robot` бот уже стоит на `ask_number`. Прежний проход
+        `["robot", "a42t", "lifting", "lift_cant_lift"]` на новом дереве падал:
+        `a42t` — это вариант **модели**, а не шаг номера.
         """
-        hint = self.hint(["robot", "a42t", "lifting", "lift_cant_lift"])
+        hint = self.hint(["robot"])
 
         self.assertIn("3780", hint)
         self.assertIn("H108/1834", hint)
@@ -140,15 +141,18 @@ class BranchDependentHintChecks(unittest.TestCase):
     def test_every_branch_has_its_own_kind(self):
         """Вид номера различается по веткам — иначе подсказка снова станет общей.
 
-        **Ожидание изменилось 12.10.2026.** Ветки рабочей станции и зарядки
-        закрыты владельцем, поэтому номер по ним не вводится: проверять на них
-        «вид номера» больше нечего. Зарядная ветка осталась в карте кода (она
-        вернётся), и её вид проверяется **напрямую** по карте, а не через дерево.
+        **Ожидание изменилось 12.10.2026 (дважды).** Ветки рабочей станции и
+        зарядки закрыты владельцем, поэтому номер по ним не вводится: проверять
+        на них «вид номера» больше нечего. Зарядная ветка осталась в карте кода
+        (она вернётся), и её вид проверяется **напрямую** по карте, а не через
+        дерево.
+
+        **Порядок шагов тоже изменился:** номер спрашивается сразу после
+        категории, поэтому после `robot` сессия уже на `ask_number` — прежний
+        проход `("robot", "a42t")` падал на выборе модели.
         """
         cases = {
-            ("robot", "a42t"): v.KIND_ROBOT,
-            ("robot", "k50h", "safety", "safety_bumper"): v.KIND_ROBOT,
-            ("robot", "a42t_c2", "tray", "tray_cant_extend"): v.KIND_ROBOT,
+            ("robot",): v.KIND_ROBOT,
             ("qr", "qr_floor"): v.KIND_QR_FLOOR,
             ("qr", "qr_shelf"): v.KIND_QR_SHELF,
         }
@@ -161,6 +165,25 @@ class BranchDependentHintChecks(unittest.TestCase):
                     session.select(option)
 
                 self.assertEqual(session.answer_kind(), expected)
+
+    def test_kind_survives_the_model_and_error_steps(self):
+        """Вид робота не теряется, когда путь идёт дальше номера.
+
+        Вид номера ищется от последнего шага пути к первому, поэтому модель,
+        модуль и ошибка **не должны** перебивать `robot`: иначе подсказка на
+        следующих шагах стала бы чужой.
+        """
+        session = Session(tree=DEFAULT_TREE)
+
+        session.select("robot")
+        self.assertEqual(session.answer_kind(), v.KIND_ROBOT)
+
+        session.submit_text("3780")
+
+        for option in ("k50h", "safety", "safety_bumper"):
+            session.select(option)
+
+        self.assertEqual(session.answer_kind(), v.KIND_ROBOT)
 
     def test_error_step_keeps_the_robot_number_kind(self):
         """Ошибка модуля — самый глубокий шаг, и номер на ней остаётся робочим.
@@ -301,17 +324,45 @@ class FormatValidationChecks(unittest.TestCase):
         self.assertEqual(session.answers()["device_number"], "SS512-020118-0101")
 
     def test_description_step_is_not_format_checked(self):
-        """Свободный текст описания проверять нельзя — иначе отчёт не сдать."""
+        """Свободный текст описания проверять нельзя — иначе отчёт не сдать.
+
+        **Путь изменился 12.10.2026.** Номер идёт первым (после категории), а
+        описание спрашивается **только** при причине `Other`: обычная причина
+        ведёт сразу к итогу. Здесь описание достаётся именно через `Other`, и в
+        него кладётся текст, который формату номера заведомо не соответствует.
+        """
         session = Session(tree=DEFAULT_TREE)
 
-        # Путь изменился 12.10.2026: между модулем и номером стоит выбор ошибки.
-        for option in ("robot", "k50h", "safety", "safety_front_button"):
+        session.select("robot")
+        session.submit_text("3780")
+
+        for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.submit_text("3780")
+        self.assertIsNone(session.text_error("Unable to drive: safety. 3780"))
+
+        session.select("other")
         session.submit_text("Unable to drive: safety. 3780")
 
         self.assertIn("Unable to drive", session.answers()["description"])
+
+    def test_a_regular_cause_skips_the_description(self):
+        """Обычная причина ведёт **сразу** к итогу, описания в ответах нет.
+
+        Владелец 12.10.2026: «убери вопросы об описание ошибки оно нужно
+        **только если other выберет**». Прежний тест шёл по описанию всегда —
+        ожидание обновлено по решению владельца.
+        """
+        session = Session(tree=DEFAULT_TREE)
+
+        session.select("robot")
+        session.submit_text("3780")
+
+        for option in ("k50h", "safety", "safety_front_button", "obstacle"):
+            session.select(option)
+
+        self.assertTrue(session.is_completed)
+        self.assertNotIn("description", session.answers())
 
 
 # ============================================================
@@ -651,12 +702,13 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
-        for option in ("robot", "k50h", "safety", "safety_front_button"):
+        # Порядок 12.10.2026: номер первым, затем модель, модуль, ошибка, причина.
+        session.select("robot")
+        session.submit_text("3780")
+
+        for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.submit_text("3780")
-        session.submit_text("Lift reports an error")
         session.select("obstacle")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
@@ -681,12 +733,13 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
-        for option in ("robot", "k50h", "safety", "safety_front_button"):
+        # Порядок 12.10.2026: номер первым, затем модель, модуль, ошибка, причина.
+        session.select("robot")
+        session.submit_text("9999")
+
+        for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.submit_text("9999")
-        session.submit_text("Lift reports an error")
         session.select("obstacle")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
@@ -714,12 +767,13 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
-        for option in ("robot", "k50h", "safety", "safety_front_button"):
+        # Порядок 12.10.2026: номер первым, затем модель, модуль, ошибка, причина.
+        session.select("robot")
+        session.submit_text("9999")
+
+        for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.submit_text("9999")
-        session.submit_text("Lift reports an error")
         session.select("obstacle")
         session.data.update({
             "warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5,
@@ -746,6 +800,103 @@ class ReviewMarkingChecks(unittest.TestCase):
             intake_flow._confirm(-100, {"id": 1}, session, 5)
 
         self.assertIn("Robot 9999", sent.get("review_reason", ""))
+
+    def test_warning_appears_right_after_the_number(self):
+        """Проверка справочника стоит **сразу после ввода номера**, не в конце.
+
+        Владелец, дословно: «после фото **не спрашивает сразу номер робота** и
+        потом **не проверяет его наличие на сервере**». Схема: номер → проверка →
+        модель. Поэтому `handle_text` на шаге номера обязан показать
+        предупреждение, не уводя оператора на модель.
+        """
+        from equipment_intake import flow as intake_flow
+
+        intake_flow.reset_state()
+        session = Session(tree=DEFAULT_TREE)
+        session.select("robot")
+        session.data.update(
+            {"warehouse": "GLP-C", "image": "/tmp/x.jpg", "menu_message_id": 5}
+        )
+        intake_flow.put_session(-100, 1, session)
+        captions = []
+
+        with mock.patch.object(intake_flow, "_bot", return_value=mock.Mock(
+                _delete_user_message=lambda *a: True)), \
+             mock.patch.object(intake_flow, "unregistered_numbers",
+                               return_value=["Robot 9999"]), \
+             mock.patch.object(intake_flow, "edit_caption",
+                               side_effect=lambda *a, **k: captions.append(a[2])):
+            self.assertTrue(intake_flow.handle_text(-100, {"id": 1}, "9999", 901))
+
+        # Предупреждение накрыло шаг модели: сессия уже на `robot_type`, но
+        # диалог стоит и ждёт решения оператора.
+        self.assertEqual(session.current_id, "robot_type")
+        self.assertTrue(session.data.get("review_pending"))
+        self.assertTrue(captions)
+        self.assertIn("Not in the registry", captions[-1])
+        intake_flow.reset_state()
+
+    def test_text_is_refused_while_the_warning_is_shown(self):
+        """Пока висит предупреждение, текст не уходит в следующий шаг.
+
+        Иначе оператор, не глядя на кнопки, печатал бы модель, и ответ попал бы
+        в поле номера — ровно тот класс дефекта, из-за которого в QR-строках
+        оказались номера роботов.
+        """
+        from equipment_intake import flow as intake_flow
+
+        intake_flow.reset_state()
+        session = Session(tree=DEFAULT_TREE)
+        session.select("robot")
+        session.submit_text("9999")
+        session.data.update(
+            {"review_pending": True, "menu_message_id": 5, "warehouse": "GLP-C"}
+        )
+        intake_flow.put_session(-100, 1, session)
+        sent = []
+
+        with mock.patch.object(intake_flow, "_bot", return_value=mock.Mock(
+                _send=lambda *a, **k: sent.append(a))), \
+             mock.patch.object(intake_flow, "edit_caption"):
+            self.assertTrue(intake_flow.handle_text(-100, {"id": 1}, "A42T", 902))
+
+        # Путь не продвинулся: модель не записана, шаг прежний.
+        self.assertEqual(session.current_id, "robot_type")
+        self.assertNotIn("device_type", session.answers())
+        self.assertTrue(sent, "оператору нужно сказать, что сначала кнопки")
+        intake_flow.reset_state()
+
+    def test_confirm_on_the_warning_continues_instead_of_finishing(self):
+        """Confirm на предупреждении — согласие сохранить, а **не** запись строки.
+
+        Предупреждение появляется, когда путь ещё не пройден (следующий шаг —
+        модель), поэтому уходить в `_confirm` нельзя: он справедливо откажет
+        «сначала закончите шаг». Согласие запоминается, и диалог идёт дальше.
+        """
+        from equipment_intake import flow as intake_flow
+        import telegram_api as tg
+
+        intake_flow.reset_state()
+        session = Session(tree=DEFAULT_TREE)
+        session.select("robot")
+        session.submit_text("9999")
+        session.data.update({"review_pending": True, "menu_message_id": 5})
+        intake_flow.put_session(-100, 1, session)
+
+        with mock.patch.object(intake_flow, "edit_caption"), \
+             mock.patch.object(tg, "answer_callback_query"), \
+             mock.patch.object(intake_flow, "_confirm") as confirm:
+            self.assertTrue(
+                intake_flow.handle_callback(-100, {"id": 1}, ["dt", "k"], 5, "cb")
+            )
+
+        confirm.assert_not_called()
+        self.assertFalse(session.data.get("review_pending"))
+        self.assertTrue(session.data.get("review_ack"))
+        # Согласие не пишет строку и не заканчивает путь: следующий шаг — модель.
+        self.assertEqual(session.current_id, "robot_type")
+        self.assertFalse(session.is_completed)
+        intake_flow.reset_state()
 
 
 if __name__ == "__main__":

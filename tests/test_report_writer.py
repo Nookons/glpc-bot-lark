@@ -2002,15 +2002,16 @@ class ConfirmationTextChecks(unittest.TestCase):
         # незавершённой сессии: раньше он писал что есть, и в базу уходили
         # строки с пустым описанием и без устройства — таких нашли 11 с 04.10.
         # Тест подтверждает **завершённый** путь, поэтому его и проходим.
+        #
+        # **Порядок изменился 12.10.2026** (схема владельца): номер спрашивается
+        # сразу после категории, затем модель → модуль → ошибка → причина.
+        # Описание на обычном пути не спрашивается вовсе: оно только для `Other`.
         session.select("robot")
-        session.select("k50h")
-        session.select("safety")
-        # **Слой ошибок 12.10.2026.** Между модулем и номером выбирается
-        # ошибка; без неё путь не завершается (`Confirm` справедливо откажет),
-        # потому что сессия останется на узле `robot_errors_safety`.
-        session.select("safety_front_button")
         session.submit_text("3780")
-        session.submit_text("Lift reports an error")
+
+        for step in ("k50h", "safety", "safety_front_button"):
+            session.select(step)
+
         session.select("obstacle")
         session.data.update(
             {"warehouse": warehouse, "image": "/tmp/p.jpg", "message_id": 5}
@@ -2093,10 +2094,9 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
-        # Сессию доводит до конца сам тест ниже: у него свои шаги, и добавленные
-        # здесь дублировали бы их (`summary` не принимает выбор варианта).
-        # Первый помощник сессию завершает сам — `_confirm` теперь не пишет
-        # незавершённый путь.
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина. Описание на обычном пути не спрашивается (только для `Other`),
+        # поэтому его здесь нет.
         session.data.update(
             {
                 "warehouse": warehouse,
@@ -2105,15 +2105,15 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
                 "thread_id": 318,
             }
         )
-        for step in ("robot", "a42t_c2", "lifting", "lift_cant_lift"):
+        session.select("robot")
+        session.submit_text("3490")
+
+        for step in ("a42t_c2", "lifting", "lift_cant_lift"):
             session.select(step)
 
-        session.submit_text("3490")
-        session.submit_text("Lift reports an error")
         # Причина — последний шаг: без него сессия не завершена, и `_confirm`
         # справедливо откажет (защита от записи неполного пути).
         session.select("obstacle")
-
         calls = []
         lookup = context or (lambda _: ("Smoke User", {"card_id": 60072001}))
 
@@ -2735,7 +2735,11 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина. Прежний проход `robot → k50h` падал: после `robot` бот ждёт
+        # номер, и `k50h` туда не принимается.
         session.select("robot")
+        session.submit_text("3780")
         session.select("k50h")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
         sent = []
@@ -2758,10 +2762,14 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety", "safety_front_button"):
-            session.select(step)
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина. Описание на обычном пути не спрашивается (только для `Other`).
+        session.select("robot")
         session.submit_text("3780")
-        session.submit_text("Lift reports an error")
+
+        for step in ("k50h", "safety", "safety_front_button"):
+            session.select(step)
+
         session.select("obstacle")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
@@ -2969,10 +2977,14 @@ class ConfirmShowsProgress(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety", "safety_front_button"):
-            session.select(step)
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина. Описание на обычном пути не спрашивается (только для `Other`).
+        session.select("robot")
         session.submit_text("3780")
-        session.submit_text("Lift reports an error")
+
+        for step in ("k50h", "safety", "safety_front_button"):
+            session.select(step)
+
         session.select("obstacle")
         session.data.update(
             {

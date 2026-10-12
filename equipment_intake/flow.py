@@ -485,12 +485,25 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             _bot()._delete_quiet(chat_id, message_id)
             return True
         elif action == CB_CONFIRM:
-            # Прогресс показывает сам `_confirm` — и только после проверки,
-            # что путь пройден до конца. Иначе при отказе («сначала закончите
-            # шаг») на экране на миг появлялось бы «Saving…», а затем сообщение
-            # об ошибке: два противоречащих сигнала подряд.
-            _confirm(chat_id, sender, session, message_id, callback_id)
-            return True
+            # **Подтверждение предупреждения «нет в справочнике» — не финал.**
+            #
+            # Схема владельца 12.10.2026: номер проверяется **сразу после ввода**,
+            # поэтому предупреждение «Save anyway?» появляется, когда путь ещё не
+            # пройден (следующий шаг — модель). Отправлять такой Confirm в
+            # `_confirm` нельзя: он справедливо откажет («сначала закончите шаг»).
+            # Здесь это и есть согласие сохранить номер — оно запоминается, а
+            # диалог идёт дальше. Так же ведёт себя повторный Confirm на финальном
+            # экране: там путь закончен, и `_confirm` пишет строку.
+            if session.data.get("review_pending") and not session.is_completed:
+                session.data.pop("review_pending", None)
+                session.data["review_ack"] = True
+            else:
+                # Прогресс показывает сам `_confirm` — и только после проверки,
+                # что путь пройден до конца. Иначе при отказе («сначала закончите
+                # шаг») на экране на миг появлялось бы «Saving…», а затем сообщение
+                # об ошибке: два противоречащих сигнала подряд.
+                _confirm(chat_id, sender, session, message_id, callback_id)
+                return True
     except EngineError as error:
         if callback_id:
             tg.answer_callback_query(callback_id, str(error)[:200])
@@ -517,7 +530,28 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     """
     session = get_session(chat_id, sender.get("id"))
 
-    if session is None or not session.is_text_step():
+    if session is None:
+        return False
+
+    # **Пока висит предупреждение о номере — текста не принимаем.**
+    #
+    # Схема владельца 12.10.2026: номер проверяется на сервере **сразу**, между
+    # номером и моделью. Пока оператор не нажал Confirm или Edit number,
+    # следующая реплика не должна уходить дальше: она попала бы в поле номера
+    # или в модель, и путь поехал бы не туда.
+    #
+    # Проверка стоит **до** `is_text_step()`: после ввода номера текущий узел —
+    # уже модель (`CHOICE`), и по типу это не текстовый шаг.
+    if session.data.get("review_pending"):
+        _bot()._send(
+            chat_id,
+            "⚠️ Check the number first: tap Confirm or Edit number.",
+            reply_to_message_id=message_id,
+            delete_after=10,
+        )
+        return True
+
+    if not session.is_text_step():
         return False
 
     if text.strip() == CANCEL_LABEL:
@@ -537,7 +571,44 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
         return True
 
     _bot()._delete_user_message(chat_id, message_id)
+
+    # **Проверка номера на сервере — сразу после ввода.**
+    #
+    # Владелец: «после фото не спрашивает сразу номер робота и потом не проверяет
+    # его наличие на сервере». Поэтому номер спрашивается первым шагом, и здесь же
+    # идёт проверка по справочнику (`validation.lookup`): найден — идём дальше
+    # (робот — к модели, QR — к причине); не найден — предупреждаем и ждём
+    # согласия. Справочник недоступен — «неизвестно», и это не повод тормозить.
+    if _paused_for_registry_review(chat_id, session):
+        return True
+
     _redraw(chat_id, session, session.data.get("menu_message_id"))
+    return True
+
+
+def _paused_for_registry_review(chat_id, session: Session) -> bool:
+    """
+    Показать предупреждение «нет в справочнике» и остановить шаг — или `False`.
+
+    Возвращает `True`, если предупреждение показано и диалог ждёт решения
+    оператора (Confirm / Edit number). Тогда обычная перерисовка следующего шага
+    не делается: иначе предупреждение тут же сменилось бы вопросом о модели.
+    """
+    prompt = soft_review_prompt(session)
+
+    if not prompt:
+        return False
+
+    text, keyboard = prompt
+    session.data["review_pending"] = True
+    edit_caption(
+        chat_id,
+        session.data.get("menu_message_id"),
+        text,
+        session,
+        reply_markup=keyboard,
+    )
+
     return True
 
 

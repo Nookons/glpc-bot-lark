@@ -341,26 +341,35 @@ class IntegrationChecks(unittest.TestCase):
                  get_employee_name=lambda _: "Smoke User")}):
             self.assertTrue(flow.start(-100123, sender, "/tmp/photo.jpg", 777, warehouse="GLP-C"))
 
-            # Путь: робот → модель → модуль → **ошибка** → номер → описание →
-            # причина.
+            # **Путь изменился 12.10.2026 — схема владельца.**
             #
-            # **Слой ошибок добавлен 12.10.2026.** До него модуль вёл прямо на
-            # номер, и «что сломалось» оператор описывал только текстом. Теперь
-            # между модулем и номером стоит выбор ошибки, и без него путь не
-            # заканчивается: сессия осталась бы на `robot_errors_lift`.
+            # Было: робот → модель → модуль → ошибка → номер → описание → причина.
+            # Стало: робот → **номер** → модель → модуль → ошибка → причина.
             #
-            # **Порядок важен:** причина спрашивается **после** описания. Первая
-            # версия этого теста отвечала причину перед номером, и сессия не
-            # завершалась — шаг причины оставался неотвеченным.
-            for option in ("robot", "a42t_c2", "lifting", "lift_cant_lift"):
-                self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", option], 900, "cb"))
+            # Владелец, дословно: «после фото **не спрашивает сразу номер
+            # робота** и потом **не проверяет его наличие на сервере**». На его
+            # схеме «Ask device number» стоит сразу после категории, а «Check
+            # device number on server» — между номером и моделью.
+            #
+            # **Описание убрано с обычного пути** (владелец: «оно нужно только
+            # если other выберет»): обычная причина ведёт сразу к итогу.
+            self.assertTrue(
+                flow.handle_callback(-100123, sender, ["dt", "s", "robot"], 900, "cb")
+            )
 
             # Номер робота — формат ветки: только цифры (или `H`+цифры).
             # Прежний `ROBOT-SMOKE-9182` теперь **отвергается по формату** —
             # это и есть требование владельца 12.10.2026 «данные не должны быть
             # битые». Проверка самого отказа — в сторожах validation/intake.
+            #
+            # Справочник в тесте недоступен (`supabase.invalid`), поэтому
+            # `lookup` даёт `None` — «неизвестно»: предупреждения нет, и диалог
+            # идёт дальше, к модели.
             self.assertTrue(flow.handle_text(-100123, sender, "9182", 901))
-            self.assertTrue(flow.handle_text(-100123, sender, "Lift reports an error", 902))
+
+            for option in ("a42t_c2", "lifting", "lift_cant_lift"):
+                self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", option], 900, "cb"))
+
             # Причина — отдельный вопрос, поэтому ответ на него идёт последним.
             self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", "obstacle"], 903, "cb"))
 
@@ -372,7 +381,7 @@ class IntegrationChecks(unittest.TestCase):
                 # строился слой: раньше её не было, и «что сломалось» жило только
                 # в свободном тексте.
                 "error": "Can't lift up/down the fork",
-                "device_number": "9182", "description": "Lift reports an error",
+                "device_number": "9182",
                 "cause": "Obstacle on the path"})
 
             flow._confirm(-100123, sender, session, 900)
@@ -480,10 +489,15 @@ class IntegrationChecks(unittest.TestCase):
         session = Session(tree=DEFAULT_TREE)
         # Путь до конца: `_confirm` не пишет незавершённую сессию — иначе в базу
         # уходили строки с пустым описанием (11 таких нашли с 04.10).
-        for step in ("robot", "k50h", "safety", "safety_front_button"):
-            session.select(step)
+        #
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина. Описание на обычном пути не спрашивается (только `Other`).
+        session.select("robot")
         session.submit_text("3780")
-        session.submit_text("Lift reports an error")
+
+        for step in ("k50h", "safety", "safety_front_button"):
+            session.select(step)
+
         session.select("obstacle")
         session.data.update({"warehouse": "", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
@@ -508,10 +522,14 @@ class IntegrationChecks(unittest.TestCase):
     def test_confirm_message_reports_success(self):
         sender = {"id": 1, "username": "u"}
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety", "safety_front_button"):
-            session.select(step)
+        # **Порядок 12.10.2026:** номер первым, затем модель → модуль → ошибка →
+        # причина; описание спрашивается только для `Other`.
+        session.select("robot")
         session.submit_text("3780")
-        session.submit_text("Lift reports an error")
+
+        for step in ("k50h", "safety", "safety_front_button"):
+            session.select(step)
+
         session.select("obstacle")
         session.data.update({"warehouse": "SMALL-P3", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []

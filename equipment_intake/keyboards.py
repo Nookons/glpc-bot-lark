@@ -49,7 +49,7 @@ CB_CANCEL = "x"     # закрыть меню
 # РАСКЛАДКА: СЕТКА 6 × 2 НА СТРАНИЦУ
 # ============================================================
 
-#: Сколько кнопок в одном ряду.
+#: Сколько кнопок в одном ряду — **когда подписи короткие**.
 OPTIONS_PER_ROW = 6
 
 #: Сколько рядов вариантов помещается на одну страницу.
@@ -57,6 +57,38 @@ OPTION_ROWS_PER_PAGE = 2
 
 #: Сколько вариантов на странице: 6 × 2 = 12.
 OPTIONS_PER_PAGE = OPTIONS_PER_ROW * OPTION_ROWS_PER_PAGE
+
+#: 🔴 **Предел длины подписи, при котором ряд из шести ещё читается.**
+#:
+#: Дефект, найденный 12.10.2026 на скриншоте **живого прода**: причины ошибок
+#: показывались как `Huma…`, `Obsta…`, `Dirty …`, `Softw…` — оператор **не мог
+#: прочитать, что выбирает**. Причина: подписи причин длиной до **33 символов**
+#: («Wrong container position on robot»), а в ряд из **6 кнопок** влезает
+#: примерно 6–8 знаков.
+#:
+#: **Замерено на живых данных:** подписи причин — 5…33 символа, подписи модулей
+#: и моделей — 4…16 (`Chassis`, `Rotation`, `A42T C2`).
+#:
+#: **Почему именно 12.** Ширина кнопки при шести колонках ≈ 1/6 экрана: в неё
+#: влезает ≈ 7 знаков **в одну строку**, но Telegram **переносит** текст, и
+#: 8–12 знаков дают **две читаемые строки** — это нормально.
+#:
+#: **Замерено на жив��х узлах:** модули и модели — **4…8** символов
+#: (, , ), то есть остаются **по шесть**, как просил
+#: владелец. Причины ошибок — **5…33** (), и они
+#: уходят на три колонки: там 33 знака в шести колонках превращаются в 5 строк
+#: и обрезаются в , что и было на скриншоте.
+#:
+#: **Предел выбран между двух замеров (8 и 21)** — так «два ряда по 6» работает
+#: там, где владелец его и просил (модули), и не ломает читаемость причин.
+SINGLE_LINE_LABEL_LIMIT = 12
+
+#: Сколько колонок ставить, когда подписи **длиннее** предела.
+#:
+#: Три колонки дают кнопке треть ширины экрана: «Dirty or damaged floor code»
+#: переносится на две строки, но **читается полностью**. Читаемость важнее
+#: того, чтобы уложить все причины в один ряд.
+WIDE_LABEL_COLUMNS = 3
 
 #: Ключ в `session.data`, где лежит страница вариантов **каждого узла**.
 #: Словарь `{node_id: page}`, а не одно число: тогда возврат по breadcrumb
@@ -108,22 +140,53 @@ def _cancel_button() -> Dict[str, str]:
     return {"text": CANCEL_LABEL, "callback_data": callback(CB_CANCEL)}
 
 
+def _columns_for(options: List) -> int:
+    """Сколько кнопок ставить в ряд — **по длине подписей**.
+
+    🔴 **Зачем, и почему нельзя всегда по шесть.**
+
+    Требование владельца 12.10.2026 — «два ряда по 6» — рассчитано на
+    **короткие** подписи (модули: `Chassis`, `Lifting`, `QR Code`). Но на шаге
+    причин подписи доходят до **33 символов**, и при шести колонках оператор
+    видел `Huma…`, `Obsta…`, `Softw…` — **прочитать выбор невозможно**.
+
+    **Правило:** если **хотя бы одна** подпись длиннее предела, ряд расширяется
+    до `WIDE_LABEL_COLUMNS` (три колонки → ≈ 14–16 знаков: длинная подпись
+    переносится, но читается целиком). Иначе — по шесть, как просил владелец.
+
+    **Почему «хотя бы одна», а не «все».** В смешанном ряду длинная подпись при
+    шести колонках обрежется всё равно; выравнивать по худшей — единственный
+    способ гарантировать, что **все** варианты читаемы.
+    """
+    widest = max((len(str(option.label or "")) for option in options), default=0)
+    return WIDE_LABEL_COLUMNS if widest > SINGLE_LINE_LABEL_LIMIT else OPTIONS_PER_ROW
+
+
+def _options_per_page(options: List) -> int:
+    """Сколько вариантов помещается на страницу при текущей ширине ряда."""
+    return _columns_for(options) * OPTION_ROWS_PER_PAGE
+
+
 def _option_rows(
     node: Node,
     options: List,
     selected: Set[str],
 ) -> List[list]:
     """
-    Сетка вариантов: по 6 кнопок в ряд.
+    Сетка вариантов: до **6 кнопок в ряд**, до **2 рядов** на страницу.
 
-    Если вариантов шесть и меньше — один ряд (не растягиваем пустоту);
-    если 7–12 — два ряда. Больше на страницу не попадает: остальное
-    отдаётся следующей странице (см. `_pager_row`).
+    Ширина ряда **зависит от подписей** (`_columns_for`): короткие (модули,
+    модели) идут по шесть, как просил владелец; длинные (причины) — по три,
+    иначе текст обрезается и выбор становится нечитаемым.
+
+    Если вариантов меньше ширины ряда — один ряд (не растягиваем пустоту).
+    Больше страницы не попадает: остальное отдаётся следующей (см. `_pager_row`).
     """
     rows: List[list] = []
+    per_row = _columns_for(options)
 
-    for index in range(0, len(options), OPTIONS_PER_ROW):
-        chunk = options[index : index + OPTIONS_PER_ROW]
+    for index in range(0, len(options), per_row):
+        chunk = options[index : index + per_row]
 
         rows.append([
             _button(node, option, option.id in selected) for option in chunk
@@ -154,16 +217,24 @@ def _option_pages(session: Session) -> Dict[str, int]:
     return pages
 
 
-def total_option_pages(count: int) -> int:
-    """Сколько страниц нужно для `count` вариантов (минимум одна)."""
+def total_option_pages(count: int, options: List | None = None) -> int:
+    """Сколько страниц нужно для `count` вариантов (минимум одна).
+
+    **`options` нужен, потому что размер страницы теперь зависит от подписей:**
+    длинные подписи идут по три в ряд (6 на страницу), короткие — по шесть
+    (12 на страницу). Без списка берётся прежний максимум — так работают
+    вызовы, где список недоступен.
+    """
     if count <= 0:
         return 1
 
-    return (count + OPTIONS_PER_PAGE - 1) // OPTIONS_PER_PAGE
+    per_page = _options_per_page(options) if options else OPTIONS_PER_PAGE
+
+    return (count + per_page - 1) // per_page
 
 
 def option_page(session: Session, node: Node) -> int:
-    """Номер текущей страницы вариантов для узла (с приведением к диапазону)."""
+    """Номер текущей страницы вариантов для узла (с пр��ведением к диапазону)."""
     pages = _option_pages(session)
     raw = pages.get(node.id, 0)
 
@@ -172,7 +243,9 @@ def option_page(session: Session, node: Node) -> int:
     except (TypeError, ValueError):
         page = 0
 
-    return max(0, min(page, total_option_pages(len(session.visible_options(node))) - 1))
+    visible = session.visible_options(node)
+
+    return max(0, min(page, total_option_pages(len(visible), visible) - 1))
 
 
 def set_option_page(session: Session, page: int) -> None:
@@ -248,10 +321,15 @@ def node_keyboard(session: Session) -> Dict[str, list]:
         visible = session.visible_options(node)
 
         page = option_page(session, node)
-        total = total_option_pages(len(visible))
+        # Размер страницы — **от ширины ряда**: длинные подписи идут по три,
+        # поэтому на страницу помещается 6, а не 12. Считать по константе
+        # значило бы показать на первой странице меньше вариантов, чем влезает,
+        # и потерять часть из них между страницами.
+        per_page = _options_per_page(visible)
+        total = total_option_pages(len(visible), visible)
 
-        start = page * OPTIONS_PER_PAGE
-        page_options = visible[start : start + OPTIONS_PER_PAGE]
+        start = page * per_page
+        page_options = visible[start : start + per_page]
 
         selected = set(session.draft or ())
 
