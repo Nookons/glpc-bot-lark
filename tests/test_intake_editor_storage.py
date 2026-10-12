@@ -74,6 +74,22 @@ class FakeDB:
         return bool(removed)
 
 
+#: 🔴 Прежний `sendToDataBase` из `sys.modules` — чтобы вернуть его после теста.
+#:
+#: Дефект, найденный 12.10.2026. `_install` подменяет модуль `sendToDataBase`
+#: урезанной заглушкой и **не убирает её**. Заглушка живёт в `sys.modules` до
+#: конца процесса, поэтому **следующие файлы тестов** получали модуль без
+#: `warehouse_id` и падали с `AttributeError` — а `test_telegram_offline.py`
+#: вообще переста��ал получать сообщения (`IndexError: list index out of range`
+#: в шести тестах).
+#:
+#: **Как это выглядело.** Каждый файл по отдельности проходил, а полный прогон
+#: давал «6 failed». Это списывали на «проблему порядка тестов», которую можно не
+#: чинить, — и тем самым **скрывали**, что команды `/offline` и `/online` в этих
+#: тестах не проверялись вообще.
+_ORIGINAL_SEND_TO_DB = sys.modules.get("sendToDataBase")
+
+
 def _install(db: FakeDB) -> None:
     module = types.ModuleType("sendToDataBase")
     module.rest_get = db.rest_get
@@ -93,11 +109,26 @@ def _install(db: FakeDB) -> None:
     storage._v2_checked_at = float("inf")
 
 
+def _uninstall() -> None:
+    """Возвращает настоящий `sendToDataBase` — без этого течёт состояние.
+
+    `None` значит, что модуль до теста **не был импортирован**: тогда е��о надо
+    **удалить** из `sys.modules`, а не оставить заглушку.
+    """
+    if _ORIGINAL_SEND_TO_DB is None:
+        sys.modules.pop("sendToDataBase", None)
+    else:
+        sys.modules["sendToDataBase"] = _ORIGINAL_SEND_TO_DB
+
+
 class EditorStorageTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.db = FakeDB()
         _install(self.db)
         self.addCleanup(storage.reset_capability_cache)
+        # Возвращаем настоящий модуль сразу после теста — иначе заглушка утечёт
+        # в следующие файлы (см. объяснение у `_ORIGINAL_SEND_TO_DB`).
+        self.addCleanup(_uninstall)
 
     def _node_with_options(self):
         """Узел с вариантами, который **можно скрыть**.
@@ -325,6 +356,9 @@ class EditorStorageTestCase(unittest.TestCase):
         module.rest_delete = lambda *a, **k: False
         module.rest_post = lambda *a, **k: [{}]
         sys.modules["sendToDataBase"] = module
+        # Возвращаем настоящий модуль после теста: без этого заглушка
+        # утекает в следующие файлы (см. `_ORIGINAL_SEND_TO_DB`).
+        self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
         for _ in range(5):
@@ -352,6 +386,9 @@ class EditorStorageTestCase(unittest.TestCase):
         module.rest_delete = lambda *a, **k: False
         module.rest_post = lambda *a, **k: [{}]
         sys.modules["sendToDataBase"] = module
+        # Возвращаем настоящий модуль после теста: без этого заглушка
+        # утекает в следующие файлы (см. `_ORIGINAL_SEND_TO_DB`).
+        self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
         for _ in range(5):
@@ -408,6 +445,9 @@ class MissingMigrationNoiseTests(unittest.TestCase):
         module.rest_delete = lambda *a, **k: False
         module.rest_post = lambda *a, **k: [{}]
         sys.modules["sendToDataBase"] = module
+        # Возвращаем настоящий модуль после теста: без этого заглушка
+        # утекает в следующие файлы (см. `_ORIGINAL_SEND_TO_DB`).
+        self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
         self.assertFalse(storage.overlay_supported())
@@ -438,6 +478,9 @@ class MissingMigrationNoiseTests(unittest.TestCase):
         module.rest_delete = lambda *a, **k: False
         module.rest_post = lambda *a, **k: [{}]
         sys.modules["sendToDataBase"] = module
+        # Возвращаем настоящий модуль после теста: без этого заглушка
+        # утекает в следующие файлы (см. `_ORIGINAL_SEND_TO_DB`).
+        self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
         storage.overlay_supported()

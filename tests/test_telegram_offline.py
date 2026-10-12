@@ -1442,6 +1442,22 @@ def reset_topics(topic_id=None, topic_name=""):
     bot._routes.clear()
     bot._hinted_threads.clear()
     bot._chat_types.clear()
+    # 🔴 **Кэш разрешённых топиков обязан сбрасываться вместе с остальным.**
+    #
+    # Дефект, найденный 12.10.2026. `_allowed_output_topics()` кэширует множество
+    # разрешённых топиков в глобальной переменной и **никогда его не пересчитывает**
+    # (`if _ALLOWED_OUTPUT_TOPICS: return`). Тест, выставивший `topic_id=555`,
+    # оставлял кэш `{555}`, и **все следующие тесты** получали молчаливый отказ
+    # отправки: «топик 2 не обслуживается (allowed=[555])».
+    #
+    # **Как это выглядело.** Четыре теста (`test_offline_command_validation`,
+    # `test_status_flow_end_to_end`, `test_status_flow_cancel_and_fallbacks`,
+    # `test_error_menu_photo_flow`) падали с `IndexError: list index out of range`
+    # — бот **не отправлял ни одного сообщения**. По отдельности каждый проходил,
+    # и это списывали на «проблему порядка тестов», которую можно не чинить.
+    # На деле маскировалась **реальная поломка**: команды `/offline` и `/online`
+    # в этих тестах не проверялись вообще.
+    bot._ALLOWED_OUTPUT_TOPICS = set()
     # origin-топик переживает тест (thread-local): без сброса следующий тест
     # получил бы топик предыдущего и проверял бы не то, что заявлено.
     bot._origin_thread.value = None
