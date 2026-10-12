@@ -85,9 +85,16 @@ class WarehouseRoutingChecks(unittest.TestCase):
                 report_writer.validate_warehouse(value)
 
     def test_row_keeps_the_topic_warehouse(self):
-        for warehouse in ("GLP-C", "SMALL-P3"):
-            row = report_writer.build_row(_result(warehouse), warehouse)
-            self.assertEqual(row["warehouse"], warehouse)
+        """Склад из топика доезжает до строки **числовым id**.
+
+        В единой таблице `exceptions.warehouse` — ссылка на `warehouses`, а не
+        название: `GLP-C` → 1, `SMALL-P3` → 3. Проверка по id, потому что
+        сравнение с названием проходило бы только на legacy-схеме.
+        """
+        for warehouse, warehouse_id in (("GLP-C", 1), ("SMALL-P3", 3)):
+            with patch("sendToDataBase.warehouse_id", return_value=warehouse_id):
+                row = report_writer.build_row(_result(warehouse), warehouse)
+            self.assertEqual(row["warehouse"], warehouse_id)
 
     def test_write_refuses_missing_warehouse(self):
         with patch("sendToDataBase.rest_post") as post:
@@ -201,14 +208,14 @@ class CanonicalTypeChecks(unittest.TestCase):
         # column since 11.10.2026 (owner: "каждый пункт записи был в отдельном
         # столбе"). Before that it was glued into `issue_description`.
         self.assertEqual(row["reported_type"], "A42T C2")
-        self.assertNotIn("Reported type", row["issue_description"] or "")
+        self.assertNotIn("Reported type", row["raw_description"] or "")
 
     def test_label_is_used_when_type_is_unknown(self):
         with patch.object(report_writer, "canonical_type", return_value=None):
             row = report_writer.build_row(_result(), "GLP-C")
 
         self.assertEqual(row["device_type"], "A42T C2")
-        self.assertNotIn("Reported type", row["issue_description"])
+        self.assertNotIn("Reported type", row["raw_description"])
 
     def test_type_lookup_is_category_aware(self):
         """SMALL-P3 code 13 is both a robot and a charging station."""
@@ -232,7 +239,7 @@ class RowMappingChecks(unittest.TestCase):
     def test_numeric_number_goes_to_error_robot(self):
         with patch.object(report_writer, "canonical_type", return_value=None):
             row = report_writer.build_row(_result(), "GLP-C")
-        self.assertEqual(row["error_robot"], 3490)
+        self.assertEqual(row["robot_number"], 3490)
 
     def test_non_numeric_identifier_stays_in_description(self):
         result = _result()
@@ -241,10 +248,10 @@ class RowMappingChecks(unittest.TestCase):
         with patch.object(report_writer, "canonical_type", return_value=None):
             row = report_writer.build_row(result, "GLP-C")
 
-        self.assertIsNone(row["error_robot"])
+        self.assertIsNone(row["robot_number"])
         # Идентификатор — в своей колонке, а не в тексте описания.
         self.assertEqual(row["device_number"], "Shelf-3938-3002-20")
-        self.assertNotIn("Identifier:", row["issue_description"] or "")
+        self.assertNotIn("Identifier:", row["raw_description"] or "")
 
     def test_qr_floor_shape_is_supported(self):
         result = _result()
@@ -257,8 +264,8 @@ class RowMappingChecks(unittest.TestCase):
         # QR-координаты — это **идентификатор устройства**, и с 11.10.2026 он
         # лежит в своей колонке; `error_robot` пуст, потому что это не робот.
         self.assertEqual(row["device_number"], "X=162; Y=382; Zone=30")
-        self.assertNotIn("Identifier:", row["issue_description"] or "")
-        self.assertIsNone(row["error_robot"])
+        self.assertNotIn("Identifier:", row["raw_description"] or "")
+        self.assertIsNone(row["robot_number"])
 
     def test_uniq_key_uses_telegram_coordinates(self):
         """
@@ -288,16 +295,24 @@ class RowMappingChecks(unittest.TestCase):
             with patch.object(report_writer, "canonical_type", return_value=None):
                 row = report_writer.build_row(result, "GLP-C")
 
-            self.assertEqual(row["issue_data"], expected_date, received)
+            self.assertEqual(row["operating_day"], expected_date, received)
             self.assertEqual(row["shift_type"], expected_shift, received)
 
     def test_row_carries_both_warehouses_independently(self):
-        with patch.object(report_writer, "canonical_type", return_value=None):
+        """Склады не смешиваются: проверено и по id, и по зоне.
+
+        Зона различает их нагляднее всего: у GLP-C это `C2`, у SMALL-P3 зона
+        выводится из устройства (`D`/`E`), а `C2` там недопустима.
+        """
+        with patch.object(report_writer, "canonical_type", return_value=None), \
+             patch("sendToDataBase.warehouse_id",
+                   side_effect=lambda title, fallback=None: {"GLP-C": 1, "SMALL-P3": 3}.get(title)):
             glpc = report_writer.build_row(_result("GLP-C"), "GLP-C")
             sp3 = report_writer.build_row(_result("SMALL-P3"), "SMALL-P3")
 
-        self.assertEqual(glpc["warehouse"], "GLP-C")
-        self.assertEqual(sp3["warehouse"], "SMALL-P3")
+        self.assertEqual(glpc["warehouse"], 1)
+        self.assertEqual(sp3["warehouse"], 3)
+        self.assertEqual(glpc["zone"], "C2")
 
 
 class IntegrationChecks(unittest.TestCase):
@@ -336,7 +351,11 @@ class IntegrationChecks(unittest.TestCase):
             for option in ("robot", "a42t_c2", "lifting"):
                 self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", option], 900, "cb"))
 
-            self.assertTrue(flow.handle_text(-100123, sender, "ROBOT-SMOKE-9182", 901))
+            # Номер робота — формат ветки: только цифры (или `H`+цифры).
+            # Прежний `ROBOT-SMOKE-9182` теперь **отвергается по формату** —
+            # это и есть требование владельца 12.10.2026 «данные не должны быть
+            # битые». Проверка самого отказа — в сторожах validation/intake.
+            self.assertTrue(flow.handle_text(-100123, sender, "9182", 901))
             self.assertTrue(flow.handle_text(-100123, sender, "Lift reports an error", 902))
             # Причина — отдельный вопрос, поэтому ответ на него идёт последним.
             self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", "obstacle"], 903, "cb"))
@@ -345,7 +364,7 @@ class IntegrationChecks(unittest.TestCase):
             self.assertTrue(session.is_completed)
             self.assertEqual(session.result()["answers"], {
                 "object": "Robot", "device_type": "A42T C2", "module": "Lifting",
-                "device_number": "ROBOT-SMOKE-9182", "description": "Lift reports an error",
+                "device_number": "9182", "description": "Lift reports an error",
                 "cause": "Obstacle on the path"})
 
             flow._confirm(-100123, sender, session, 900)

@@ -9,11 +9,16 @@
 column "exception_id" of relation "exceptions" does not exist
 ```
 
-**Почему это было незаметно.** Запись идёт **в две таблицы**: в `exceptions`
+**Почему это было незаметно.** Запись шла **в две таблицы**: в `exceptions`
 (новая схема) и в `exceptions_glpc` (legacy). Вторая проходила, поэтому
 инциденты не терялись и ошибок в интерфейсе не было. А `exceptions` стояла на
 **7 строках**, хотя бот писал в неё при каждом приёме, — расхождение видно
 только сверкой таблиц.
+
+**12.10.2026 переход завершён:** дублирующая запись в `exceptions_glpc` убрана,
+`exceptions` — единственный источник. Поэтому проверка изменилась: раньше она
+требовала, чтобы второй payload остался нетронутым; теперь второго payload нет
+вовсе, и это надо сторожить.
 """
 
 from __future__ import annotations
@@ -59,13 +64,23 @@ class TestIntakePayloadColumns:
         for field in ("robot_id", "handle_by", "start_time", "warehouse"):
             assert f'"{field}"' in block, f"payload потерял {field}"
 
-    def test_legacy_payload_is_untouched(self) -> None:
-        """Правка не должна была тронуть второй payload.
+    def test_duplicate_legacy_write_is_gone(self) -> None:
+        """Дублирующей записи в архив **нет** — иначе две таблицы разойдутся.
 
-        `old_obj` пишется в `exceptions_glpc`, где колонки **старые** —
-        переименование `0068` касается только `exceptions`.
+        До 12.10.2026 функция писала дважды: новую схему в `exceptions` и старую
+        в `exceptions_glpc`. После перехода `exceptions` — единственный источник,
+        а `exceptions_glpc` — архив только для чтения. Оставленная вторая запись
+        пополняла бы архив, и его расхождение с `exceptions` мы приняли бы за
+        дефект данных.
+
+        **Негативная проверка:** вернуть `_rest_post("exceptions_glpc", ...)` —
+        тест обязан упасть.
         """
         code = SOURCE.read_text(encoding="utf-8")
 
-        assert '"error_robot"' in code
-        assert '"error_start_time"' in code
+        assert "old_obj" not in code, "второй payload вернулся"
+        # Ищем именно **аргумент вызова**, а не упоминание в комментарии:
+        # пояснение, почему запись убрана, обязано остаться.
+        assert '\n        "exceptions_glpc",' not in code, (
+            "функция снова пишет в архив отдельной вставкой"
+        )

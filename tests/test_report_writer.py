@@ -71,9 +71,21 @@ def result(warehouse="GLP-C", **overrides):
     return data
 
 
+#: Склад → числовой id, как в живой базе (проверено 12.10.2026).
+#: `exceptions.warehouse` — ссылка на `warehouses`, а не название, поэтому
+#: писатель переводит название в id через `sendToDataBase.warehouse_id`.
+WAREHOUSE_IDS = {"GLP-C": 1, "SMALL-P3": 3}
+
+
+def fake_warehouse_id(title, fallback=None):
+    """Офлайновая замена `warehouse_id`: без сети, детерминированно."""
+    return WAREHOUSE_IDS.get(str(title or "").strip(), fallback)
+
+
 def row_for(warehouse="GLP-C", resolved=None, **overrides):
     """Build a row with the type lookup stubbed to a known answer."""
-    with mock.patch.object(rw, "canonical_type", return_value=resolved):
+    with mock.patch.object(rw, "canonical_type", return_value=resolved), \
+         mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id):
         return rw.build_row(result(warehouse, **overrides), warehouse)
 
 
@@ -126,17 +138,19 @@ class WarehouseGuardChecks(unittest.TestCase):
         """The caller's warehouse wins, so a stale payload cannot redirect it."""
         with mock.patch.object(rw, "write_exception", wraps=rw.write_exception):
             with mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]) as upsert, \
+                 mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id), \
                  mock.patch.object(rw, "canonical_type", return_value=None):
                 self.assertTrue(rw.write_exception(result("GLP-C"), "SMALL-P3"))
 
-        self.assertEqual(upsert.call_args.args[1]["warehouse"], "SMALL-P3")
+        self.assertEqual(upsert.call_args.args[1]["warehouse"], 3)
 
     def test_write_falls_back_to_payload_warehouse(self):
         with mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]) as upsert, \
+             mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result("SMALL-P3")))
 
-        self.assertEqual(upsert.call_args.args[1]["warehouse"], "SMALL-P3")
+        self.assertEqual(upsert.call_args.args[1]["warehouse"], 3)
 
     def test_write_reports_failure_when_insert_fails(self):
         with mock.patch("sendToDataBase.rest_upsert", return_value=None), \
@@ -458,19 +472,19 @@ class RowMappingChecks(unittest.TestCase):
 
         # Текст оператора — и отдельной колонкой, и (без метки) в описании.
         self.assertTrue(row["reported_error"])
-        self.assertNotIn("Reported error:", row["issue_description"] or "")
+        self.assertNotIn("Reported error:", row["raw_description"] or "")
 
         # Тип оператора — своя колонка, в тексте метки нет.
         self.assertEqual(row["reported_type"], "A42T C2")
-        self.assertNotIn("Reported type:", row["issue_description"] or "")
+        self.assertNotIn("Reported type:", row["raw_description"] or "")
 
         # Номер устройства — своя колонка, в тексте метки нет.
         self.assertEqual(row["device_number"], "3490")
-        self.assertNotIn("Identifier:", row["issue_description"] or "")
+        self.assertNotIn("Identifier:", row["raw_description"] or "")
 
         # Модуль — своя колонка, в тексте метки нет.
         self.assertTrue(row["module_text"])
-        self.assertNotIn("Module:", row["issue_description"] or "")
+        self.assertNotIn("Module:", row["raw_description"] or "")
 
     def test_description_never_contains_the_old_labels(self):
         """Ни одна метка склейки не возвращается в текст.
@@ -488,7 +502,7 @@ class RowMappingChecks(unittest.TestCase):
             for marker in ("Reported error:", "Identifier:", "Reported type:", "Module:"):
                 self.assertNotIn(
                     marker,
-                    row["issue_description"] or "",
+                    row["raw_description"] or "",
                     f"{marker!r} вернулось в текст описания",
                 )
 
@@ -503,7 +517,7 @@ class RowMappingChecks(unittest.TestCase):
 
         self.assertEqual(row["device_type"], "RT_KUBOT_MINI_HAIFLEX")
         self.assertEqual(row["reported_type"], "A42T C2")
-        self.assertNotIn("Reported type", row["issue_description"] or "")
+        self.assertNotIn("Reported type", row["raw_description"] or "")
 
     def test_label_is_kept_when_type_is_unknown(self):
         """Совпал с типом — отдельная колонка не нужна, значение не теряется."""
@@ -519,7 +533,7 @@ class RowMappingChecks(unittest.TestCase):
         self.assertIsNone(row["reported_type"])
 
     def test_numeric_identity_fills_error_robot(self):
-        self.assertEqual(row_for()["error_robot"], 3490)
+        self.assertEqual(row_for()["robot_number"], 3490)
 
     def test_textual_identity_keeps_the_number_column_null(self):
         data = result()
@@ -528,18 +542,18 @@ class RowMappingChecks(unittest.TestCase):
         with mock.patch.object(rw, "canonical_type", return_value=None):
             row = rw.build_row(data, "GLP-C")
 
-        self.assertIsNone(row["error_robot"])
+        self.assertIsNone(row["robot_number"])
         # Текстовый номер остаётся в **своей** колонке, а не в описании:
         # в `issue_description` ему больше не место.
         self.assertEqual(row["device_number"], "Shelf-3938-3002-20")
-        self.assertNotIn("Identifier:", row["issue_description"] or "")
+        self.assertNotIn("Identifier:", row["raw_description"] or "")
 
     def test_module_is_preserved_in_second_column_and_details(self):
         row = row_for(resolved=None)
 
-        self.assertEqual(row["second_column"], "Lifting")
+        self.assertEqual(row["raw_template_title"], "Lifting")
         self.assertEqual(row["module_text"], "Lifting")
-        self.assertNotIn("Module:", row["issue_description"] or "")
+        self.assertNotIn("Module:", row["raw_description"] or "")
 
     def test_missing_module_falls_back_to_device_type(self):
         data = result()
@@ -548,8 +562,8 @@ class RowMappingChecks(unittest.TestCase):
         with mock.patch.object(rw, "canonical_type", return_value=None):
             row = rw.build_row(data, "GLP-C")
 
-        self.assertEqual(row["second_column"], "A42T C2")
-        self.assertNotIn("Module:", row["issue_description"])
+        self.assertEqual(row["raw_template_title"], "A42T C2")
+        self.assertNotIn("Module:", row["raw_description"])
 
     def test_end_time_follows_the_table_convention(self):
         """
@@ -559,28 +573,28 @@ class RowMappingChecks(unittest.TestCase):
         """
         row = row_for(resolved=None)
 
-        self.assertEqual(row["solving_time"], 0)
-        self.assertTrue(row["error_start_time"])
-        self.assertEqual(row["error_end_time"], row["error_start_time"])
+        self.assertEqual(row["raw_solving_time"], 0)
+        self.assertTrue(row["start_time"])
+        self.assertEqual(row["end_time"], row["start_time"])
 
     def test_end_time_tracks_the_report_time_not_the_server_clock(self):
         """The derived value must follow the report's own timestamp."""
         row = row_for(resolved=None, received_at="2026-10-02T04:00:00+00:00")
 
-        self.assertEqual(row["error_end_time"], row["error_start_time"])
+        self.assertEqual(row["end_time"], row["start_time"])
         self.assertEqual(
-            datetime.fromisoformat(row["error_end_time"]).astimezone(timezone.utc),
+            datetime.fromisoformat(row["end_time"]).astimezone(timezone.utc),
             datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
         )
 
     def test_warehouse_column_matches_the_argument(self):
         for warehouse in ("GLP-C", "SMALL-P3"):
             with self.subTest(warehouse=warehouse):
-                self.assertEqual(row_for(warehouse=warehouse)["warehouse"], warehouse)
+                self.assertEqual(row_for(warehouse=warehouse)["warehouse"], WAREHOUSE_IDS[warehouse])
 
     def test_legacy_issue_warehouse_constant_is_unchanged(self):
         """Kept for parity with existing rows; changing it is a separate call."""
-        self.assertEqual(row_for()["issue_warehouse"], "C2")
+        self.assertEqual(row_for()["zone"], "C2")
 
     def test_employee_prefers_the_linked_name(self):
         self.assertEqual(row_for()["employee"], "Smoke User")
@@ -597,7 +611,7 @@ class RowMappingChecks(unittest.TestCase):
             row = rw.build_row({"warehouse": "GLP-C", "user_id": 1}, "GLP-C")
 
         self.assertEqual(row["device_type"], "")
-        self.assertIsNone(row["error_robot"])
+        self.assertIsNone(row["robot_number"])
 
 
 class EmployeeCardChecks(unittest.TestCase):
@@ -606,23 +620,23 @@ class EmployeeCardChecks(unittest.TestCase):
     def test_card_id_from_the_result_reaches_add_by(self):
         row = row_for(resolved=None, employee_card_id="CARD-1")
 
-        self.assertEqual(row["add_by"], "CARD-1")
+        self.assertEqual(row["handle_by"], "CARD-1")
 
     def test_numeric_card_id_is_preserved(self):
         row = row_for(resolved=None, employee_card_id=60072001)
 
-        self.assertEqual(row["add_by"], 60072001)
+        self.assertEqual(row["handle_by"], 60072001)
 
     def test_unlinked_employee_leaves_add_by_empty(self):
         """A missing card must not stop the report — same rule as `employee`."""
         row = row_for(resolved=None, employee_card_id=None)
 
-        self.assertIsNone(row["add_by"])
+        self.assertIsNone(row["handle_by"])
 
     def test_blank_card_id_is_not_written_as_an_empty_string(self):
         for value in ("", "   ", None):
             with self.subTest(value=value):
-                self.assertIsNone(row_for(resolved=None, employee_card_id=value)["add_by"])
+                self.assertIsNone(row_for(resolved=None, employee_card_id=value)["handle_by"])
 
     def test_missing_key_does_not_raise(self):
         """Legacy callers that never pass the key still get a valid row."""
@@ -632,7 +646,7 @@ class EmployeeCardChecks(unittest.TestCase):
         with mock.patch.object(rw, "canonical_type", return_value=None):
             row = rw.build_row(data, "GLP-C")
 
-        self.assertIsNone(row["add_by"])
+        self.assertIsNone(row["handle_by"])
 
 
 class PhotoUrlChecks(unittest.TestCase):
@@ -696,7 +710,7 @@ class DeviceSplitChecks(unittest.TestCase):
         rows = self.rows_for("3561/3528")
 
         self.assertEqual(len(rows), 2)
-        self.assertEqual([r["error_robot"] for r in rows], [3561, 3528])
+        self.assertEqual([r["robot_number"] for r in rows], [3561, 3528])
         self.assertEqual([r["device_number"] for r in rows], ["3561", "3528"])
 
     def test_keys_differ_so_the_second_row_survives(self):
@@ -737,19 +751,25 @@ class DeviceSplitChecks(unittest.TestCase):
         rows = self.rows_for("3452/3707/H156")
 
         self.assertEqual(len(rows), 3)
-        self.assertEqual([r["error_robot"] for r in rows], [3452, 3707, None])
+        self.assertEqual([r["robot_number"] for r in rows], [3452, 3707, None])
 
     def test_zone_is_computed_per_device(self):
         """Зона считается **по своему** номеру, а не одна на отчёт.
 
-        У `3561/3528` зоны могут различаться (например `C2` и `C1`). Одна общая
-        зона была бы неверна для второго робота, а зона — это то, по чему
-        строятся отчёты «ошибки по зонам склада».
+        У `3561/3528` зоны могут различаться (например `D` и `E` на SMALL-P3).
+        Одна общая зона была бы неверна для второго робота, а зона — это то, по
+        чему строятся отчёты «ошибки по зонам склада».
+
+        Проверяется и **валидация пары**: `C1` у GLP-C в справочнике
+        `warehouse_zones` нет (там только `C2`), поэтому такая зона обязана
+        превратиться в `NULL`, а не уронить вставку составным внешним ключом.
+        Для этого берём SMALL-P3, где допустимы `D` и `E`.
         """
         with mock.patch.object(rw, "canonical_type", return_value=None), \
+             mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id), \
              mock.patch.object(
                  rw, "device_zone",
-                 side_effect=lambda warehouse, code: {"3561": "C2", "3528": "C1"}.get(code),
+                 side_effect=lambda warehouse, code: {"3561": "D", "3528": "E"}.get(code),
              ), \
              mock.patch.object(rw, "match_template", return_value=None), \
              mock.patch.object(rw, "load_templates", return_value=[]):
@@ -758,12 +778,24 @@ class DeviceSplitChecks(unittest.TestCase):
                     "object": "Robot", "device_type": "A42T", "module": "Lifting",
                     "device_number": "3561/3528", "description": "x",
                 },
-                "warehouse": "GLP-C", "employee": "U", "employee_card_id": 1,
+                "warehouse": "SMALL-P3", "employee": "U", "employee_card_id": 1,
                 "photo_url": None, "user_id": 1, "chat_id": -100, "message_id": 1,
             }
-            rows = rw.build_rows(res, "GLP-C")
+            rows = rw.build_rows(res, "SMALL-P3")
 
-        self.assertEqual([r["issue_warehouse"] for r in rows], ["C2", "C1"])
+        self.assertEqual([r["zone"] for r in rows], ["D", "E"])
+
+    def test_zone_not_in_the_catalogue_becomes_null(self):
+        """Зона чужого склада не пишется: составной FK её отвергнет.
+
+        `C1` у GLP-C в `warehouse_zones` нет (там только `C2`) — значит это
+        «зона неизвестна» (`NULL`), а не догадка. Раньше бот писал константу, и
+        у SMALL-P3 в базе осталось 9 строк с зоной GLP-C.
+        """
+        self.assertIsNone(rw._allowed_zone("GLP-C", "C1"))
+        self.assertEqual(rw._allowed_zone("GLP-C", "C2"), "C2")
+        self.assertIsNone(rw._allowed_zone("SMALL-P3", "C2"))
+        self.assertEqual(rw._allowed_zone("SMALL-P3", "D"), "D")
 
     def test_repeated_number_is_not_duplicated(self):
         """Повтор номера (`3561/3561`) даёт **одну** строку.
@@ -894,33 +926,42 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertNotIn("cause", old_row)
 
     def test_optional_columns_can_be_dropped(self):
-        with mock.patch.object(rw, "canonical_type", return_value=None):
+        with mock.patch.object(rw, "canonical_type", return_value=None), \
+             mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id):
             row = rw.build_row(result(), "GLP-C", include_optional=False)
 
         for column in rw.OPTIONAL_COLUMNS:
             self.assertNotIn(column, row)
 
         # Everything else is identical, so no report data is lost.
-        self.assertEqual(row["error_robot"], 3490)
-        self.assertEqual(row["warehouse"], "GLP-C")
+        self.assertEqual(row["robot_number"], 3490)
+        # Склад — числовой id (ссылка на `warehouses`), а не название.
+        self.assertEqual(row["warehouse"], 1)
         self.assertEqual(row["uniq_key"], "telegram-photo-bot:-100123:777")
 
-    def test_both_sets_can_be_dropped_together(self):
+    def test_all_sets_can_be_dropped_together(self):
         """Запасной путь на **прежней** схеме: нет ни одной новой колонки.
 
         Это состояние базы, где не применена ни одна из миграций, — писатель
         обязан работать и там, иначе отчёт теряется целиком.
+
+        Наборов теперь **три**: старые аналитические (`0067`–`0075`),
+        разложенные пункты (`0080`) и пометка «на разбор» (`needs_review` /
+        `review_reason`, которых в единой таблице пока нет). Отключаются они
+        по отдельности — и вместе тоже.
         """
-        with mock.patch.object(rw, "canonical_type", return_value=None):
+        with mock.patch.object(rw, "canonical_type", return_value=None), \
+             mock.patch("sendToDataBase.warehouse_id", side_effect=fake_warehouse_id):
             row = rw.build_row(
-                result(), "GLP-C", include_optional=False, include_split=False
+                result(), "GLP-C",
+                include_optional=False, include_split=False, include_review=False,
             )
 
         for column in rw.ALL_ANALYTICS_COLUMNS:
             self.assertNotIn(column, row)
 
-        self.assertEqual(row["error_robot"], 3490)
-        self.assertEqual(row["warehouse"], "GLP-C")
+        self.assertEqual(row["robot_number"], 3490)
+        self.assertEqual(row["warehouse"], 1)
 
     def test_write_works_before_the_migration(self):
         """The only successful insert must be the minimal row."""
@@ -960,9 +1001,20 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertEqual(attempts[0]["module"], "Lifting")
 
     def test_missing_columns_are_remembered_not_probed_per_report(self):
-        """Otherwise every report pays for two requests and logs an error."""
+        """Otherwise every report pays for extra requests and logs an error.
+
+        Наборов колонок теперь **три** (см. `test_all_sets_can_be_dropped_together`),
+        поэтому и проб три. На каждый неудачный ответ идёт ещё проверка
+        доступности базы — итого 6 запросов на первый отчёт. Второй отчёт
+        **не** пробует снова: негативный ответ запомнен.
+        """
         def fake_get(table, params, optional=False):
-            return None if "module" in str(params.get("select")) else [{"id": 1}]
+            select = str(params.get("select"))
+
+            if any(name in select for name in rw.ALL_ANALYTICS_COLUMNS):
+                return None  # ни одного набора колонок в таблице
+
+            return [{"id": 1}]
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get) as get, \
              mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]), \
@@ -970,10 +1022,8 @@ class AnalyticsColumnChecks(unittest.TestCase):
             rw.write_exception(result(), "GLP-C")
             rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
 
-        # Первый отчёт: проба каждого из **двух** наборов колонок, и на каждый
-        # неудачный ответ — проверка доступности базы (2 + 2 = 4). Второй отчёт
-        # **не** пробует снова: негативный ответ запомнен.
-        self.assertEqual(get.call_count, 4)
+        # 3 набора × (неудачная проба + проверка доступности базы) = 6.
+        self.assertEqual(get.call_count, 6)
 
     def test_unreachable_database_is_not_mistaken_for_missing_columns(self):
         """
@@ -1114,24 +1164,24 @@ class ShiftTimestampChecks(unittest.TestCase):
     def test_day_shift_starts_at_0600_warsaw(self):
         # 04:00 UTC == 06:00 Warsaw (summer).
         row = self.shift_of(received_at="2026-10-02T04:00:00+00:00")
-        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "day"))
+        self.assertEqual((row["operating_day"], row["shift_type"]), ("2026-10-02", "day"))
 
     def test_just_before_0600_is_night_of_the_previous_day(self):
         row = self.shift_of(received_at="2026-10-02T03:59:00+00:00")
-        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-01", "night"))
+        self.assertEqual((row["operating_day"], row["shift_type"]), ("2026-10-01", "night"))
 
     def test_night_shift_starts_at_1800_warsaw(self):
         row = self.shift_of(received_at="2026-10-02T16:00:00+00:00")
-        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "night"))
+        self.assertEqual((row["operating_day"], row["shift_type"]), ("2026-10-02", "night"))
 
     def test_just_before_1800_is_still_day(self):
         row = self.shift_of(received_at="2026-10-02T15:59:00+00:00")
-        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-02", "day"))
+        self.assertEqual((row["operating_day"], row["shift_type"]), ("2026-10-02", "day"))
 
     def test_after_midnight_utc_belongs_to_the_previous_shift_date(self):
         # 00:30 UTC on the 2nd == 02:30 Warsaw on the 2nd, night of the 1st.
         row = self.shift_of(received_at="2026-10-02T00:30:00+00:00")
-        self.assertEqual((row["issue_data"], row["shift_type"]), ("2026-10-01", "night"))
+        self.assertEqual((row["operating_day"], row["shift_type"]), ("2026-10-01", "night"))
 
     def test_z_suffix_is_parsed(self):
         row = self.shift_of(received_at="2026-10-02T04:00:00Z")
@@ -1140,7 +1190,7 @@ class ShiftTimestampChecks(unittest.TestCase):
     def test_result_timestamp_is_preserved_exactly(self):
         row = self.shift_of(received_at="2026-10-02T04:00:00+00:00")
         self.assertEqual(
-            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            datetime.fromisoformat(row["start_time"]).astimezone(timezone.utc),
             datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
         )
 
@@ -1156,7 +1206,7 @@ class ShiftTimestampChecks(unittest.TestCase):
 
         row = self.shift_of(created_at=naive)
         self.assertEqual(
-            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            datetime.fromisoformat(row["start_time"]).astimezone(timezone.utc),
             expected.astimezone(timezone.utc),
         )
 
@@ -1167,7 +1217,7 @@ class ShiftTimestampChecks(unittest.TestCase):
         """
         row = self.shift_of(created_at="2026-10-02T04:00:00+00:00")
         self.assertEqual(
-            datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc),
+            datetime.fromisoformat(row["start_time"]).astimezone(timezone.utc),
             datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc),
         )
 
@@ -1176,14 +1226,14 @@ class ShiftTimestampChecks(unittest.TestCase):
             received_at="2026-10-02T04:00:00+00:00",
             created_at="2020-01-01T00:00:00+00:00",
         )
-        self.assertEqual(row["issue_data"], "2026-10-02")
+        self.assertEqual(row["operating_day"], "2026-10-02")
 
     def test_unparseable_timestamp_falls_back_to_now(self):
         before = datetime.now(timezone.utc) - timedelta(seconds=5)
         row = self.shift_of(received_at="not-a-timestamp")
         after = datetime.now(timezone.utc) + timedelta(seconds=5)
 
-        stamp = datetime.fromisoformat(row["error_start_time"]).astimezone(timezone.utc)
+        stamp = datetime.fromisoformat(row["start_time"]).astimezone(timezone.utc)
         self.assertLessEqual(before, stamp)
         self.assertLessEqual(stamp, after)
 
@@ -1236,8 +1286,8 @@ class CategoryChecks(unittest.TestCase):
                 data["answers"]["object"] = label
                 with mock.patch.object(rw, "canonical_type", return_value=None):
                     row = rw.build_row(data, "GLP-C")
-                self.assertEqual(row["first_column"], expected)
-                self.assertEqual(row["issue_type"], expected)
+                self.assertEqual(row["raw_fault"], expected)
+                self.assertEqual(row["equipment_category"], expected)
 
 
 class SessionHygieneChecks(unittest.TestCase):
@@ -2175,7 +2225,12 @@ class TemplateMatchingChecks(unittest.TestCase):
     базе 05.10.2026: так выглядели все 246 строк бота.
     """
 
+    #: Строка справочника `issue_templates` **как она есть в базе**.
+    #: Имена её колонок не менялись переходом: переименование касалось только
+    #: таблицы инцидентов. Поэтому `id`, `issue_type`, `recovery_title` и
+    #: `solving_time` — правильные имена, а не «старые».
     TEMPLATE = {
+        "id": 10,
         "employee_title": "Driver component exception",
         "issue_sub_type": "Driver component exception",
         "issue_type": "Unable to drive",
@@ -2207,11 +2262,13 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("driver component exception")
 
-        self.assertEqual(row["first_column"], "Driver component exception")
-        self.assertEqual(row["issue_type"], "Unable to drive")
-        self.assertEqual(row["second_column"], "Driver component exception")
-        self.assertEqual(row["recovery_title"], "Move on QR Code robot then recovery robot")
-        self.assertEqual(row["solving_time"], 6)
+        self.assertEqual(row["raw_fault"], "Driver component exception")
+        self.assertEqual(row["equipment_category"], "Unable to drive")
+        # Ссылка на справочник проставлена: единая таблица хранит её, а не текст.
+        self.assertEqual(row["template_id"], 10)
+        self.assertEqual(row["raw_template_title"], "Driver component exception")
+        self.assertEqual(row["raw_recovery"], "Move on QR Code robot then recovery robot")
+        self.assertEqual(row["raw_solving_time"], 6)
 
     def test_end_time_is_start_plus_solving_time(self):
         """Конвенция журнала: `error_end_time = error_start_time + solving_time`.
@@ -2225,8 +2282,8 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("driver component exception")
 
-        start = datetime.fromisoformat(row["error_start_time"])
-        end = datetime.fromisoformat(row["error_end_time"])
+        start = datetime.fromisoformat(row["start_time"])
+        end = datetime.fromisoformat(row["end_time"])
 
         self.assertEqual(end - start, timedelta(minutes=6))
 
@@ -2241,11 +2298,11 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("totally unrelated wording xyz")
 
-        self.assertEqual(row["first_column"], "robot")
-        self.assertEqual(row["issue_type"], "robot")
-        self.assertEqual(row["second_column"], "Lifting")   # модуль из answers()
-        self.assertIsNone(row["recovery_title"])
-        self.assertEqual(row["solving_time"], 0)
+        self.assertEqual(row["raw_fault"], "robot")
+        self.assertEqual(row["equipment_category"], "robot")
+        self.assertEqual(row["raw_template_title"], "Lifting")   # модуль из answers()
+        self.assertIsNone(row["raw_recovery"])
+        self.assertEqual(row["raw_solving_time"], 0)
 
     def test_no_match_keeps_end_equal_to_start(self):
         from datetime import datetime
@@ -2254,7 +2311,7 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("totally unrelated wording xyz")
 
-        self.assertEqual(row["error_end_time"], row["error_start_time"])
+        self.assertEqual(row["end_time"], row["start_time"])
 
     def test_database_failure_still_files_the_report(self):
         """Сбой справочника не теряет отчёт.
@@ -2265,10 +2322,11 @@ class TemplateMatchingChecks(unittest.TestCase):
         with mock.patch.object(rw, "load_templates", return_value=[]):
             row = self._row("driver component exception")
 
-        self.assertEqual(row["issue_type"], "robot")
-        self.assertEqual(row["solving_time"], 0)
+        self.assertEqual(row["equipment_category"], "robot")
+        self.assertEqual(row["raw_solving_time"], 0)
+        self.assertIsNone(row["template_id"])
         # Самое важное: отчёт состоялся и сырой текст на месте.
-        self.assertIn("driver component exception", row["issue_description"])
+        self.assertIn("driver component exception", row["raw_description"])
 
     def test_raw_operator_text_is_never_lost(self):
         """Подбор заполняет колонки, но сырой текст остаётся в журнале.
@@ -2283,22 +2341,23 @@ class TemplateMatchingChecks(unittest.TestCase):
         # Текст оператора лежит в `reported_error` **и** в `issue_description`,
         # но уже без метки «Reported error: » — она была частью склейки.
         self.assertEqual(row["reported_error"], "driver component exception")
-        self.assertIn("driver component exception", row["issue_description"])
+        self.assertIn("driver component exception", row["raw_description"])
 
     def test_solving_time_is_coerced_to_int(self):
         """Справочник может вернуть строку или мусор — запись не должна падать."""
         self._with_templates([dict(self.TEMPLATE, solving_time="8")])
-        self.assertEqual(self._row("driver component exception")["solving_time"], 8)
+        self.assertEqual(self._row("driver component exception")["raw_solving_time"], 8)
 
         self._with_templates([dict(self.TEMPLATE, solving_time=None)])
-        self.assertEqual(self._row("driver component exception")["solving_time"], 0)
+        self.assertEqual(self._row("driver component exception")["raw_solving_time"], 0)
 
         self._with_templates([dict(self.TEMPLATE, solving_time="abc")])
-        self.assertEqual(self._row("driver component exception")["solving_time"], 0)
+        self.assertEqual(self._row("driver component exception")["raw_solving_time"], 0)
 
     def test_template_without_sub_type_does_not_leave_first_column_empty(self):
         """У шаблона id 122 `issue_sub_type` пуст — колонка не должна опустеть."""
         self._with_templates([{
+            "id": 122,
             "employee_title": "Security module failure",
             "issue_sub_type": "",
             "issue_type": "Unable to drive",
@@ -2307,8 +2366,8 @@ class TemplateMatchingChecks(unittest.TestCase):
 
         row = self._row("security module failure")
 
-        self.assertEqual(row["first_column"], "Security module failure")
-        self.assertEqual(row["issue_type"], "Unable to drive")
+        self.assertEqual(row["raw_fault"], "Security module failure")
+        self.assertEqual(row["equipment_category"], "Unable to drive")
 
 
 class ZoneChecks(unittest.TestCase):
@@ -2334,17 +2393,23 @@ class ZoneChecks(unittest.TestCase):
                 warehouse,
                 answers=answers(device_number=str(number)),
             )
-        return row["issue_warehouse"]
+        return row["zone"]
 
     def test_glp_c_keeps_the_default_zone(self):
         """GLP-C: разбиения на зоны нет, значение по умолчанию."""
         self.assertEqual(self._zone("GLP-C", "3452"), "C2")
 
-    def test_warehouse_without_zones_keeps_the_default(self):
-        """PNT-A и прочие склады без зон — тоже значение по умолчанию."""
+    def test_warehouse_without_zones_has_no_zone(self):
+        """PNT-A и прочие склады без зон — зона **неизвестна** (`None`).
+
+        Раньше здесь стояло `C2` — значение GLP-C. После 12.10.2026 зона
+        пишется только если пара (склад, зона) есть в `warehouse_zones`, иначе
+        получается `NULL`. Приписать `C2` складу без зон значило бы нарушить
+        составной внешний ключ `(warehouse, zone)` и соврать в метрике.
+        """
         for warehouse in ("PNT-A", "P3-DC-1", "P3-DC-3"):
             with self.subTest(warehouse=warehouse):
-                self.assertEqual(self._zone(warehouse, "100"), "C2")
+                self.assertIsNone(self._zone(warehouse, "100"))
 
     def test_small_p3_zone_comes_from_the_robot(self):
         """SMALL-P3: зона из `sub_warehouse` устройства, а не константа."""
@@ -2354,14 +2419,16 @@ class ZoneChecks(unittest.TestCase):
         with mock.patch.object(rw, "device_zone", return_value="D"):
             self.assertEqual(self._zone("SMALL-P3", "6"), "D")
 
-    def test_unknown_device_falls_back_to_the_default(self):
-        """Устройство не найдено — зона неизвестна, но отчёт не теряется.
+    def test_unknown_device_leaves_the_zone_unknown(self):
+        """Устройство не найдено — зона неизвестна, отчёт не теряется.
 
-        Подставлять чужую зону нельзя, поэтому остаётся значение по умолчанию,
-        а не догадка.
+        Раньше здесь подставлялось `C2` (зона GLP-C), и у SMALL-P3 в базе
+        накопились такие строки. Теперь для SMALL-P3 допустимы только `D` и `E`,
+        поэтому неизвестное устройство даёт `None`: подставлять чужую зону
+        нельзя, а `NULL` честно говорит «зона не определена».
         """
         with mock.patch.object(rw, "device_zone", return_value=None):
-            self.assertEqual(self._zone("SMALL-P3", "999999"), "C2")
+            self.assertIsNone(self._zone("SMALL-P3", "999999"))
 
     def test_non_numeric_code_gives_no_zone(self):
         """Составной номер (`H108/1834`) в справочнике роботов не лежит."""
@@ -2387,7 +2454,8 @@ class ZoneChecks(unittest.TestCase):
 
         with mock.patch.object(rw, "device_zone", return_value=None):
             row = self._zone("SMALL-P3", "6")
-        self.assertEqual(row, "C2")
+        # Зона неизвестна — не подставляем чужую: см. пояснение выше.
+        self.assertIsNone(row)
 
 
 class IndependentColumnSets(unittest.TestCase):
@@ -2589,11 +2657,11 @@ class SplitReportIsNeverHalfWritten(unittest.TestCase):
         self.assertEqual(len(payload), 3)
         self.assertEqual(on_conflict, "uniq_key")
 
-        self.assertEqual([row["error_robot"] for row in payload], [3545, 314, 141])
+        self.assertEqual([row["robot_number"] for row in payload], [3545, 314, 141])
         keys = [row["uniq_key"] for row in payload]
         self.assertEqual(len(set(keys)), 3, "ключи должны различаться суффиксом")
         for row in payload:
-            self.assertEqual(row["error_robot"], rw._robot_number(row["device_number"]))
+            self.assertEqual(row["robot_number"], rw._robot_number(row["device_number"]))
 
     def test_the_writer_does_not_use_a_plain_insert(self):
         """`rest_post` не должен вернуться: он и есть источник потери строк.

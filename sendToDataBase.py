@@ -13,6 +13,7 @@ from lark_send import send_text_message
 from shift import get_current_shift
 from logging_config import setup_logging
 from text_utils import to_int
+import journal
 
 
 logger = setup_logging(__name__)
@@ -506,19 +507,34 @@ def get_shift_exceptions(
     limit: int = 1000,
 ):
     """
-    Список исключений за смену из таблицы exceptions_glpc.
+    Список исключений за смену из **единого** журнала `exceptions`.
 
-    Возвращает None, если запрос не удался.
+    Возвращает None, если запрос не удался. Строки приводятся к исторической
+    форме (`journal.legacy_rows`), поэтому потребители ниже (`shift_stats`,
+    `shift_report_data`) читают те же поля, что и раньше.
+
+    **Фильтр — по новым колонкам**: операционные сутки называются
+    `operating_day` (было `issue_data`), момент — `start_time` (было
+    `error_start_time`), склад — числовой id (`journal.warehouse_id`).
+    Название в `warehouse` вернуло бы пусто: колонка ссылается на `warehouses`.
     """
-    return _rest_get(
-        "exceptions_glpc",
-        params={
-            "issue_data": f"eq.{shift_date}",
-            "shift_type": f"eq.{shift_name}",
-            "warehouse": f"eq.{warehouse}",
-            "order": "error_start_time.desc",
-            "limit": str(limit),
-        },
+    warehouse_key = journal.warehouse_id(warehouse)
+
+    if warehouse_key is None:
+        logger.warning("get_shift_exceptions: неизвестный склад %r", warehouse)
+        return None
+
+    return journal.legacy_rows(
+        _rest_get(
+            journal.EXCEPTIONS_TABLE,
+            params={
+                "operating_day": f"eq.{shift_date}",
+                "shift_type": f"eq.{shift_name}",
+                "warehouse": f"eq.{warehouse_key}",
+                "order": "start_time.desc",
+                "limit": str(limit),
+            },
+        )
     )
 
 
@@ -531,18 +547,26 @@ def count_robot_errors_in_shift(
     """
     Количество сохранённых исключений робота за смену.
 
-    Считаем по таблице exceptions_glpc (источник для отчётов). Берём только
-    номер робота, чтобы не тянуть текстовые поля на каждое сообщение.
+    Считаем по единому журналу `exceptions` (источник для отчётов). Берём
+    только номер робота, чтобы не тянуть текстовые поля на каждое сообщение.
+
+    Номер робота в новой таблице — `robot_number` (было `error_robot`), склад —
+    числовой id.
     """
     robot_str = str(robot).strip()
+    warehouse_key = journal.warehouse_id(warehouse)
+
+    if warehouse_key is None:
+        logger.warning("count_robot_errors_in_shift: неизвестный склад %r", warehouse)
+        return 0
 
     total = rest_count(
-        "exceptions_glpc",
+        journal.EXCEPTIONS_TABLE,
         params={
-            "issue_data": f"eq.{shift_date}",
+            "operating_day": f"eq.{shift_date}",
             "shift_type": f"eq.{shift_name}",
-            "warehouse": f"eq.{warehouse}",
-            "error_robot": f"eq.{robot_str}",
+            "warehouse": f"eq.{warehouse_key}",
+            "robot_number": f"eq.{robot_str}",
         },
     )
 
@@ -561,7 +585,8 @@ def count_robot_errors_in_shift(
 def shift_stats(shift_date: str, shift_name: str):
     """
     Возвращает (total, {robot: count}, {issue_type: count})
-    за смену из exceptions_glpc.
+    за смену — из единого журнала `exceptions` (через `get_shift_exceptions`,
+    который приводит строки к исторической форме).
     """
     data = get_shift_exceptions(shift_date, shift_name)
 
@@ -738,7 +763,10 @@ def warehouse_id(title: str, fallback=None):
     now = time.time()
 
     if not _warehouse_ids["map"] or now - _warehouse_ids["at"] > 600:
-        rows = _rest_get("warehouses", params={"select": "id,title", "limit": "50"})
+        # Публичный `rest_get`, а не приватный `_rest_get`: тесты и другие
+        # модули патчат именно его, и приватный вызов обходил бы подмену —
+        # проверка «склад доехал до строки» становилась бы зависимой от сети.
+        rows = rest_get("warehouses", params={"select": "id,title", "limit": "50"})
 
         if rows is not None:
             _warehouse_ids["map"] = {
@@ -807,7 +835,17 @@ def send_to_data_base(
     warehouse: str = None,
 ):
     """
-    Записывает исключение в Supabase (exceptions + exceptions_glpc).
+    Записывает исключение в Supabase — **в единый журнал `exceptions`**.
+
+    До 12.10.2026 функция писала **дважды**: новую схему в `exceptions` и
+    старую в `exceptions_glpc`. После перехода (`0069` + перевод читателей)
+    `exceptions` — единственный источник, а `exceptions_glpc` — архив только для
+    чтения. Вторая запись убрана: она создавала бы расхождение двух таблиц,
+    которое мы потом приняли бы за дефект данных.
+
+    Возвращает dict с id созданной строки при успехе, иначе **None**. Раньше
+    статус «saved» возвращался безусловно, даже когда ни одна строка не
+    записалась: оператор читал «сохранено», а ошибки в отчёте не было.
 
     Возвращает результат POST /exceptions (список созданных строк)
     при успехе, иначе None. Сообщения об ошибках отправляет в чат.
@@ -1055,50 +1093,40 @@ def send_to_data_base(
             warehouse,
             fallback=employee.get("home_warehouse"),
         ),
-    }
 
-    # ========================================================
-    # OLD EXCEPTION OBJECT (таблица exceptions_glpc)
-    # ========================================================
-
-    old_obj = {
-        "error_robot": robot.get("robot_number"),
-
-        "add_by": employee.get("card_id"),
-
-        "device_type": robot.get("robot_type"),
-
+        # ─── Колонки, которые до перехода уезжали только в `exceptions_glpc` ──
+        #
+        # `exceptions_glpc` больше не пополняется, поэтому всё, что раньше
+        # попадало исключительно туда, обязано приехать сюда — иначе отчёт
+        # потеряет эти значения, а расхождение заметят не сразу.
+        #
+        # Текст пишется **снимком** `raw_*` (как делает перенос `0069` и ручка
+        # API): читатель предпочитает снимок, а `template_id` остаётся ссылкой
+        # на справочник. Так правка шаблона не переписывает прошлые отчёты.
+        "raw_fault": best_match.get("issue_sub_type"),
+        "raw_template_title": best_match.get("employee_title"),
+        "raw_description": best_match.get("issue_description"),
+        "raw_recovery": best_match.get("recovery_title"),
+        "raw_solving_time": int(best_match.get("solving_time") or 0),
+        "equipment_category": best_match.get("issue_type"),
+        "operating_day": shift_date,
         "employee": employee.get("user_name"),
-
-        "error_end_time": end_time_iso,
-
-        "error_start_time": now_iso,
-
-        "first_column": best_match.get("issue_sub_type"),
-
-        "issue_description": best_match.get("issue_description"),
-
-        "issue_type": best_match.get("issue_type"),
-
-        "recovery_title": best_match.get("recovery_title"),
-
-        "second_column": best_match.get("issue_sub_type"),
-
-        "solving_time": int(best_match.get("solving_time") or 0),
-
+        "device_type": robot.get("robot_type"),
+        "robot_number": robot.get("robot_number"),
+        # Зона: пара (склад, зона) обязана быть в `warehouse_zones`, иначе FK
+        # отвергнет строку. `C2` — зона GLP-C; у SMALL-P3 допустимы `D`/`E`.
+        "zone": journal.allowed_zone(warehouse, "C2"),
+        # Ключ дедупликации. Раньше жил только в legacy-объекте; теперь он
+        # нужен здесь — на нём стоит уникальный индекс, и повторная доставка
+        # того же сообщения не создаст вторую строку.
         "uniq_key": (
             f"{employee.get('user_name')}."
             f"{robot.get('robot_number')}."
             f"{now_iso}"
         ),
-
-        "shift_type": shift_name,
-
-        "warehouse": warehouse,
-
-        "issue_data": shift_date,
-
-        "issue_warehouse": "C2",
+        # Источник записи: классический текстовый флоу, в отличие от приёма
+        # оборудования (`intake_bot`) и ручки API (`api`).
+        "source": "legacy",
     }
 
     # ========================================================
@@ -1111,22 +1139,14 @@ def send_to_data_base(
     )
 
     # ========================================================
-    # SAVE OLD EXCEPTION
-    # ========================================================
-
-    # ignore_conflict: при уникальном индексе по uniq_key повторная доставка
-    # апдейта даёт 409 — это «уже сохранено», а не ошибка.
-    saved_old = _rest_post(
-        "exceptions_glpc",
-        old_obj,
-        ignore_conflict=True,
-    )
-
-    # ========================================================
     # CHECK RESULT
     # ========================================================
 
-    if not saved:
+    # **Честная проверка записи.** `_dry_run()` возвращает пустой список как
+    # «записано» (тестовый бот), поэтому пустой ответ — успех только в прогоне
+    # без базы; в проде `None` означает сбой, и оператор обязан узнать об этом,
+    # а не прочитать «сохранено».
+    if saved is None:
 
         logger.error("Failed to save exception")
 
@@ -1137,12 +1157,6 @@ def send_to_data_base(
         )
 
         return None
-
-    if not saved_old:
-        logger.warning(
-            "Запись в exceptions_glpc не добавлена "
-            "(уже есть или сбой) — отчёты по этой смене могут недосчитать её"
-        )
 
     logger.info(
         "Exception saved: robot=%s time=%s shift=%s",
@@ -1160,7 +1174,8 @@ def send_to_data_base(
     return {
         "status": "saved",
         "rows": saved,
-        "glpc_id": _row_id(saved_old),
+        # Единственная строка журнала — в `exceptions`; `glpc_id` больше нет,
+        # потому что дублирующей записи в архиве не делается.
         "exception_id": _row_id(saved),
         "robot": str(table_lines.get("robot")),
     }

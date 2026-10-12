@@ -176,10 +176,17 @@ class HarnessTestCase(unittest.TestCase):
         self.assertEqual(rows[0]["robot_number"], "3490")
 
     def test_stub_enforces_unique_key(self):
-        _request("POST", "/rest/v1/exceptions_glpc", {"uniq_key": "k1"})
+        """Стенд повторяет уникальность `uniq_key` **единого** журнала.
+
+        Проверка идёт по `exceptions`: там теперь стоит уникальный индекс, и
+        туда пишут оба пути (классический флоу и приём). На архивном
+        `exceptions_glpc` ограничение осталось исторически, но никто в него не
+        пишет, — держать проверку на нём значило бы сторожить мёртвый путь.
+        """
+        _request("POST", "/rest/v1/exceptions", {"uniq_key": "k1"})
         status, _ = _request(
             "POST",
-            "/rest/v1/exceptions_glpc",
+            "/rest/v1/exceptions",
             {"uniq_key": "k1"},
             {"Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates"},
         )
@@ -597,14 +604,18 @@ class BotFlowTestCase(unittest.TestCase):
         self._run("Unable to drive: Security module failure. 3780")
 
         _, dump = _request("GET", "/__dump")
-        glpc = dump["tables"].get("exceptions_glpc") or []
+        # **Единый журнал.** До 12.10.2026 писалось дважды (`exceptions` +
+        # `exceptions_glpc`); теперь источник один, и проверять надо его —
+        # иначе тест сторожил бы таблицу, в которую никто не пишет.
+        rows = dump["tables"].get("exceptions") or []
 
         self.assertTrue(
-            glpc,
+            rows,
             f"бот не записал ошибку в локальный стенд. Отправлено: {self.sent}",
         )
-        self.assertEqual(glpc[0]["error_robot"], "3780")
-        self.assertEqual(glpc[0]["warehouse"], "GLP-C")
+        self.assertEqual(str(rows[0]["robot_number"]), "3780")
+        # Склад хранится числовым id (1 = GLP-C), а не названием.
+        self.assertEqual(str(rows[0]["warehouse"]), "1")
         # Карточка ушла в Lark-заглушку, а не в боевой вебхук.
         self.assertTrue(dump["lark"], "карточка не дошла до Lark-заглушки")
 

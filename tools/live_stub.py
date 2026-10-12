@@ -139,7 +139,10 @@ class Store:
 
     # Уникальные ограничения из sql/: повторная вставка даёт 409.
     UNIQUE = {
-        "exceptions_glpc": ("uniq_key",),
+        # Уникальный ключ дедупликации переехал в единый журнал (`exceptions`):
+        # после перехода 12.10.2026 туда пишут и приём, и классический флоу.
+        # Запись в `exceptions_glpc` больше не делается.
+        "exceptions": ("uniq_key",),
         "telegram_equipment_reports": ("telegram_chat_id", "source_message_id"),
         "telegram_devices_to_add": (
             "category",

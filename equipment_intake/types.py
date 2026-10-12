@@ -85,6 +85,17 @@ class Node:
     final_action: str = ""      # для FINAL: что сделать на Confirm
     summary_title: str = ""     # для FINAL: заголовок итогового экрана
     summary_label: str = ""     # наглядное имя поля в итоговом экране
+    # **Вариант подсказки этого шага** (`robot`, `station`, `qr_floor`…):
+    # узел ввода номера один на всё дерево, а формат вводимого значения
+    # зависит от ветки. Обычный текстовый узел подсказать это не может —
+    # `placeholder` у него один, и именно из-за этого на ветке QR показывался
+    # пример номера робота (см. `equipment_intake/validation.py`).
+    answer_kind: str = ""
+    # **Разный следующий шаг для разных веток.** У узла номера он один, но на
+    # зарядной ветке после станции надо спросить робота (`ask_charging_robot`),
+    # а у робота/QR — сразу описание. Ключ — вид номера (`answer_kind`),
+    # значение — id узла. Пустая карта — обычное поведение по `next_node`.
+    next_node_by_kind: Tuple[Tuple[str, str], ...] = ()
     # Черновая ветка: узла/вариантов ещё нет, но место под них заведено.
     # Нужна, чтобы дерево можно было пустить в работу СРАЗУ и наполнять
     # по частям, не переписывая структуру. Такой узел показывается как
@@ -180,6 +191,8 @@ class DecisionTree:
                     "final_action": node.final_action,
                     "summary_title": node.summary_title,
                     "summary_label": node.summary_label,
+                    "answer_kind": node.answer_kind,
+                    "next_node_by_kind": dict(node.next_node_by_kind),
                     "is_stub": node.is_stub,
                     "stub_hint": node.stub_hint,
                     "options": [
@@ -234,6 +247,11 @@ class DecisionTree:
                 final_action=raw.get("final_action", ""),
                 summary_title=raw.get("summary_title", ""),
                 summary_label=raw.get("summary_label", ""),
+                answer_kind=raw.get("answer_kind", ""),
+                next_node_by_kind=tuple(
+                    (str(key), str(value))
+                    for key, value in (raw.get("next_node_by_kind") or {}).items()
+                ),
                 is_stub=bool(raw.get("is_stub", False)),
                 stub_hint=raw.get("stub_hint", ""),
             )
@@ -288,6 +306,11 @@ class DecisionTree:
             for option in node.options:
                 targets.append(option.next_node)
 
+            # Разные следующие шаги по веткам — такие же ссылки, и проверять
+            # их надо наравне с `next_node`: висячая цель сломала бы ветку.
+            for _kind, target in node.next_node_by_kind:
+                targets.append(target)
+
             for target in targets:
                 if target is not None and target not in self.nodes:
                     raise ValueError(
@@ -326,6 +349,10 @@ class DecisionTree:
             for option in node.options:
                 if option.next_node:
                     stack.append(option.next_node)
+
+            for _kind, target in node.next_node_by_kind:
+                if target:
+                    stack.append(target)
 
         unreachable = set(self.nodes) - reachable
 

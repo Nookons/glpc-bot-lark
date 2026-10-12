@@ -39,6 +39,7 @@ from logging_config import setup_logging
 import analytics
 import bot_lease
 import digests
+import journal
 import robot_card
 from env_utils import env_bool, env_int
 from robot_queue import start_queue_autoclose
@@ -2847,9 +2848,12 @@ def remember_last_error(chat_id, user_id, saved, parsed, table_lines):
     if not isinstance(saved, dict):
         return
 
-    glpc_id = saved.get("glpc_id")
+    # После перехода запись одна — в `exceptions`, поэтому запоминаем её id.
+    # Раньше здесь лежал `glpc_id` legacy-копии; копии больше нет, и хранить
+    # нечего: фото привязывается к единственной строке журнала.
+    exception_id = saved.get("exception_id")
 
-    if not glpc_id:
+    if not exception_id:
         return
 
     with _photo_lock:
@@ -2857,7 +2861,7 @@ def remember_last_error(chat_id, user_id, saved, parsed, table_lines):
             _last_error,
             _photo_key(chat_id, user_id),
             {
-                "glpc_id": glpc_id,
+                "exception_id": exception_id,
                 "parsed": parsed,
                 "table_lines": table_lines,
                 "at": time.time(),
@@ -2892,11 +2896,9 @@ def store_photo_for_record(saved, photo_path):
         logger.error("Не удалось сохранить фото для записи: %s", photo_path)
         return None
 
-    if saved.get("glpc_id"):
-        set_exception_photo("exceptions_glpc", saved["glpc_id"], url)
-
+    # Запись одна — единый журнал `exceptions` (см. `send_to_data_base`).
     if saved.get("exception_id"):
-        set_exception_photo("exceptions", saved["exception_id"], url)
+        set_exception_photo(journal.EXCEPTIONS_TABLE, saved["exception_id"], url)
 
     return url
 
@@ -4469,8 +4471,8 @@ def attach_photo_to_last_error(chat_id, sender, recent, photo_path, message_id):
         warehouse=current_warehouse(),
     )
 
-    if result.get("url") and recent.get("glpc_id"):
-        set_exception_photo("exceptions_glpc", recent["glpc_id"], result["url"])
+    if result.get("url") and recent.get("exception_id"):
+        set_exception_photo(journal.EXCEPTIONS_TABLE, recent["exception_id"], result["url"])
 
     logger.info(
         "Фото прикреплено к последней ошибке робота %s (режим %s)",

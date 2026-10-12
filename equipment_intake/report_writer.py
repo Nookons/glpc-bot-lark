@@ -1,12 +1,13 @@
 """
-Warehouse-aware write of a completed intake report to `exceptions_glpc`.
+Warehouse-aware write of a completed intake report to `exceptions`.
 
 Why this module exists
 ----------------------
 The legacy text flow (`sendToDataBase.send_to_data_base`) writes the journal.
 The guided photo flow used to stop at `telegram_equipment_reports`. The
-integration plan unifies both, so this writer feeds `exceptions_glpc` from the
-guided flow.
+integration plan unifies both, so this writer feeds `exceptions` from the
+guided flow. The table was renamed from `exceptions_glpc` on 12.10.2026 — see
+`EXCEPTIONS_TABLE`.
 
 Two rules are enforced here on purpose:
 
@@ -41,7 +42,17 @@ from warehouses import WAREHOUSES
 
 logger = logging.getLogger(__name__)
 
-GLPC_TABLE = "exceptions_glpc"
+#: **Единый журнал инцидентов.** До 12.10.2026 здесь стояло `exceptions_glpc`:
+#: существовали две таблицы, и бот писал в legacy, а читатели API — в новую.
+#: Переход завершён (`tk-assist-api`, миграция `0069` + перевод читателей),
+#: поэтому источник один. `exceptions_glpc` остаётся архивом только для
+#: чтения и не удаляется.
+EXCEPTIONS_TABLE = "exceptions"
+
+#: Старое имя оставлено как псевдоним: на него смотрят внешние проверки и
+#: документация, и молчаливое исчезновение имени сломало бы их без причины.
+#: Использовать в новом коде `EXCEPTIONS_TABLE`.
+GLPC_TABLE = EXCEPTIONS_TABLE
 
 # Columns that arrive with the intake-analytics migration. They may be missing
 # from the live table while the bot is already deployed, so the write must work
@@ -79,8 +90,25 @@ SPLIT_COLUMNS = (
     "module_text",
 )
 
+#: **Пометка «на разбор»** (`needs_review` + `review_reason`).
+#:
+#: Решение владельца 12.10.2026: номер, которого нет в справочнике, сохраняется,
+#: но запись **помечается**, «чтобы было видно, что её надо проверить».
+#:
+#: **Почему отдельный набор и почему он может отсутствовать.** В единой таблице
+#: `exceptions` этих колонок пока **нет** (проверено на живой базе 12.10.2026 —
+#: они есть у `equipment`, но не у `exceptions`). Схему `exceptions` эта работа
+#: не меняет (решение владельца: колонки уже приведены в порядок миграцией
+#: `0100`), поэтому писатель **проверяет их наличие** и заполняет только если
+#: они приехали. Так требование выполняется без риска уронить вставку на живой
+#: базе: `PostgREST` отвергает запрос целиком из-за одной неизвестной колонки.
+REVIEW_COLUMNS = (
+    "needs_review",
+    "review_reason",
+)
+
 #: Оба набора — для читаемости и для мест, которым нужен полный список.
-ALL_ANALYTICS_COLUMNS = OPTIONAL_COLUMNS + SPLIT_COLUMNS
+ALL_ANALYTICS_COLUMNS = OPTIONAL_COLUMNS + SPLIT_COLUMNS + REVIEW_COLUMNS
 
 # How long the "columns are missing" answer is remembered. Short TTL, same
 # reasoning as the intake editor's schema cache: after the migration is applied
@@ -93,6 +121,8 @@ _optional_columns_state: Optional[bool] = None
 _optional_columns_checked_at: float = 0.0
 _split_columns_state: Optional[bool] = None
 _split_columns_checked_at: float = 0.0
+_review_columns_state: Optional[bool] = None
+_review_columns_checked_at: float = 0.0
 
 #: Зона по умолчанию — для складов, у которых разбиения на зоны нет.
 #:
@@ -145,6 +175,10 @@ TEMPLATES_TABLE = "issue_templates"
 
 #: Поля шаблона, нужные для подбора и заполнения колонок.
 TEMPLATE_COLUMNS = (
+    # `id` нужен с 12.10.2026: единая таблица хранит **ссылку** на шаблон
+    # (`template_id`), а не его текст. Без `id` в выборке ссылку не проставить,
+    # и строки бота остались бы без типа ошибки.
+    "id",
     "employee_title",
     "issue_sub_type",
     "issue_type",
@@ -343,6 +377,40 @@ def device_zone(warehouse: str, code: str) -> Optional[str]:
     return zone or None
 
 
+#: Зоны, которые справочник `warehouse_zones` знает по складам.
+#:
+#: Проверено на живой базе 12.10.2026: у GLP-C (id 1) — `C2`, у SMALL-P3 (id 3)
+#: — `D` и `E`. Держим карту здесь, а не спрашиваем справочник на каждый отчёт:
+#: он меняется раз в жизни, а обращение к базе на каждой записи — лишняя
+#: задержка приёма.
+#:
+#: **Зачем проверка вообще.** На `exceptions` есть составной внешний ключ
+#: `(warehouse, zone)` → `warehouse_zones`. Зона, которой у склада нет,
+#: **уронит вставку** — а до 05.10.2026 бот писал всем складам константу `C2`,
+#: и у SMALL-P3 осталось 9 таких строк. Неизвестная пара обязана давать `NULL`:
+#: приписать ошибку зоне, где её не было, хуже, чем не знать зону.
+KNOWN_ZONES: Dict[str, tuple] = {
+    "GLP-C": ("C2",),
+    "SMALL-P3": ("D", "E"),
+}
+
+
+def _allowed_zone(warehouse: str, zone: Optional[str]) -> Optional[str]:
+    """Зона, если пара (склад, зона) допустима; иначе `None`.
+
+    `None` — это «зона неизвестна», а не «зоны нет»: `NULL` в составном ключе
+    `MATCH SIMPLE` не проверяется, поэтому вставка проходит, а факт остаётся
+    честным. Догадка (`D` или `E` для SMALL-P3) запрещена: она связала бы
+    ошибку с зоной, где её не было.
+    """
+    allowed = KNOWN_ZONES.get(str(warehouse or "").strip())
+
+    if not allowed or not zone:
+        return None
+
+    return zone if zone in allowed else None
+
+
 def _received_at(result: Dict[str, Any]) -> datetime:
     """
     When the report arrived, as an aware datetime.
@@ -374,7 +442,7 @@ def _received_at(result: Dict[str, Any]) -> datetime:
 
 def _robot_number(code: str) -> Optional[int]:
     """
-    `error_robot` is bigint; non-numeric identities live in the description.
+    `robot_number` is bigint; non-numeric identities live in the description.
 
     Only ASCII digits count. `str.isdecimal()` also accepts non-ASCII digits
     (e.g. Arabic-Indic '١٢٣'), which would silently turn a mis-typed identifier
@@ -390,8 +458,11 @@ def _robot_number(code: str) -> Optional[int]:
     return value if value <= 9_223_372_036_854_775_807 else None
 
 
-def device_numbers(code: str) -> list[str]:
+def device_numbers(code: str, category: str = "") -> list[str]:
     """Номера устройств из того, что ввёл оператор.
+
+    **`category` обязателен для QR.** Для остальных категорий он не меняет
+    поведения и оставлен необязательным ради существующих вызовов.
 
     **Требование владельца 08.10.2026, дословно:** «номера девайсов делятся
     через `/`, если `4305/435` то это два отдельных девайса, и одна ошибка
@@ -424,6 +495,19 @@ def device_numbers(code: str) -> list[str]:
 
     if not text:
         return []
+
+    # **Для QR кода слэш — ошибка оператора, а не второе устройство.**
+    #
+    # Решение владельца 12.10.2026: «для QR деление по `/` ЗАПРЕЩЕНО: код
+    # места/полки содержит дефисы, а не слэши, и слэш там означал бы ошибку
+    # оператора». Поэтому запись **не делится**, а значение остаётся как введено
+    # — его разберёт человек: молча создать из опечатки вторую строку журнала
+    # значило бы выдумать устройство, которого нет.
+    #
+    # Формат при этом проверяется на вводе (`validation.validate_format`), и до
+    # записи такой код доходит только через API — там он тоже не делится.
+    if str(category or "").strip().casefold() == "qr_code":
+        return [text]
 
     parts: list[str] = []
     seen: set[str] = set()
@@ -519,6 +603,16 @@ def _optional_fields(
     }
 
 
+def _review_marked(result: Dict[str, Any]) -> bool:
+    """Помечена ли запись на разбор («номер не найден в справочнике»).
+
+    Решение владельца 12.10.2026: такой отчёт **сохраняется**, но помечается,
+    «чтобы было видно, что его надо проверить». Отдельный помощник, потому что
+    от этого зависят и колонки пометки, и текст `unresolved_reason`.
+    """
+    return bool(str(result.get("review_reason") or "").strip())
+
+
 def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
     """
     Чего не хватило в записи — одной строкой через запятую.
@@ -549,6 +643,11 @@ def _unresolved_reason(card_id: Any, result: Dict[str, Any]) -> Optional[str]:
     if not str(result.get("photo_url") or "").strip():
         # Фото к ошибке не привязано (загрузка не удалась).
         reasons.append("no_photo")
+
+    if _review_marked(result) and not _review_columns_available():
+        # Колонок пометки в таблице ещё нет — но факт терять нельзя: он
+        # уезжает в `unresolved_reason`, который читается и сегодня.
+        reasons.append("number_not_in_registry")
 
     return ", ".join(reasons) or None
 
@@ -606,24 +705,33 @@ def _template_values(template: Optional[Dict[str, Any]], category: str, module: 
     оборудования и модуль. Это честный откат, а не догадка — пустая колонка
     лучше ошибки, отнесённой не к тому типу.
     """
+    # **Имена колонок единой таблицы `exceptions`** (до 12.10.2026 —
+    # `exceptions_glpc`). Текст пишется снимком в `raw_*`, а справочник
+    # подключается ссылкой `template_id`: читатель предпочитает снимок, а
+    # шаблон берёт запасным путём. Так правка шаблона не переписывает
+    # исторические отчёты задним числом.
     if not template:
         return {
-            "first_column": category,
-            "issue_type": category,
-            "second_column": module or device_type,
-            "recovery_title": None,
-            "solving_time": 0,
+            "raw_fault": category,
+            "equipment_category": category,
+            "raw_template_title": module or device_type,
+            "raw_recovery": None,
+            "raw_solving_time": 0,
+            "template_id": None,
         }
 
     return {
         # `issue_sub_type` — «подтип» ошибки, именно он лежит в `first_column` у
         # классических строк. Если у шаблона он пуст (такие есть: id 122),
         # берём название, чтобы колонка не осталась пустой.
-        "first_column": template.get("issue_sub_type") or template.get("employee_title"),
-        "issue_type": template.get("issue_type"),
-        "second_column": template.get("employee_title"),
-        "recovery_title": template.get("recovery_title") or None,
-        "solving_time": _solving_time(template.get("solving_time")),
+        "raw_fault": template.get("issue_sub_type") or template.get("employee_title"),
+        "equipment_category": template.get("issue_type"),
+        "raw_template_title": template.get("employee_title"),
+        "raw_recovery": template.get("recovery_title") or None,
+        "raw_solving_time": _solving_time(template.get("solving_time")),
+        # Ссылка на справочник. `id` есть у каждого шаблона; при его отсутствии
+        # (усечённый SELECT) остаётся `None` — ссылку не выдумываем.
+        "template_id": template.get("id"),
     }
 
 
@@ -646,6 +754,7 @@ def build_row(
     warehouse: str,
     include_optional: bool = True,
     include_split: bool = True,
+    include_review: bool = True,
 ) -> Dict[str, Any]:
     """Первая (и обычно единственная) строка журнала для отчёта.
 
@@ -655,7 +764,10 @@ def build_row(
     потеряв остальные.
     """
     rows = build_rows(
-        result, warehouse, include_optional=include_optional, include_split=include_split
+        result, warehouse,
+        include_optional=include_optional,
+        include_split=include_split,
+        include_review=include_review,
     )
 
     return rows[0] if rows else {}
@@ -666,9 +778,10 @@ def build_rows(
     warehouse: str,
     include_optional: bool = True,
     include_split: bool = True,
+    include_review: bool = True,
 ) -> list[Dict[str, Any]]:
     """
-    Map an intake result onto the legacy journal columns.
+    Map an intake result onto the columns of the unified journal (`exceptions`).
 
     **Возвращается список: по строке на каждое устройство в номере.**
     Требование владельца 08.10.2026, дословно: «номера девайсов делятся через
@@ -698,6 +811,11 @@ def build_rows(
     which `flow._confirm` fills while it already has the employee row at hand —
     so the writer never issues a second lookup for data the caller knows.
     """
+    # Импорт внутри функции — как у остальных обращений к `sendToDataBase`:
+    # на уровне модуля это создало бы цикл (`sendToDataBase` импортирует части
+    # приёма).
+    from sendToDataBase import warehouse_id
+
     answers = result.get("answers") or {}
     category = intake_category(answers.get("object"))
     code = identifier(answers)
@@ -774,7 +892,7 @@ def build_rows(
     # журнала (`error_end_time = error_start_time + solving_time`), проверенной
     # на 23 384 из 23 400 строк. Без шаблона `solving_time = 0`, и конец равен
     # началу — как было раньше.
-    solving_time = template_columns["solving_time"]
+    solving_time = template_columns["raw_solving_time"]
     error_end = received + timedelta(minutes=solving_time)
 
     # **Разделение номеров: по строке на каждое устройство.**
@@ -783,7 +901,21 @@ def build_rows(
     # своя строка журнала: со своим `error_robot`, своей зоной и своим
     # `uniq_key`. Без суффикса в ключе вторая строка была бы отброшена
     # уникальным индексом как дубликат — молча и без ошибки.
-    numbers = device_numbers(code) or [""]
+    numbers = device_numbers(code, category) or [""]
+
+    # **Зарядка: в записи ДВА устройства — станция и робот.**
+    #
+    # Решение владельца 12.10.2026: «если зарядка то сначала спрашиваем зарядку
+    # потом номер робота и храним данные на сервере корректно». Станция — это
+    # `device_number` (что именно сломалось), робот — `robot_number`
+    # (историческое `error_robot`, кто стоял на станции). Без второго поля
+    # ошибка зарядки не связана ни с одним роботом и не попадает в метрики по
+    # устройству.
+    charging_robot = (
+        str(answers.get("error_robot") or "").strip()
+        if category == "charging"
+        else ""
+    )
 
     rows: list[Dict[str, Any]] = []
 
@@ -804,14 +936,28 @@ def build_rows(
         if len(numbers) > 1 and not include_optional:
             row_details.insert(1, f"Device: {number}")
 
+        # ─── Имена колонок единой таблицы `exceptions` ───────────────────────
+        #
+        # До 12.10.2026 строка собиралась под `exceptions_glpc`
+        # (`error_robot`, `add_by`, `error_start_time`, `issue_data`,
+        # `issue_warehouse`, `warehouse` названием). После перехода таблица
+        # одна, и имена у неё другие — писать старые значило бы получить
+        # `column ... does not exist` и потерять отчёт (именно так возникали
+        # те 8 мусорных строк: старая схема уходила в новую таблицу).
+        #
+        # «Склад» здесь — **числовой id** (`warehouse_id(title)`), а не
+        # название: в единой таблице это внешний ключ на `warehouses`.
         row = {
-            "error_robot": _robot_number(number),
-            "add_by": card_id,
+            # **Робот зарядки важнее станции** в этом поле: `robot_number` —
+            # числовой номер робота. Если робота не спросили (старый путь или
+            # API), остаётся прежнее поведение — разбор номера станции.
+            "robot_number": _robot_number(charging_robot or number),
+            "handle_by": card_id,
             "device_type": device_type,
             "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",
-            "error_end_time": error_end.isoformat(),
-            "error_start_time": received.isoformat(),
-            "first_column": template_columns["first_column"],
+            "end_time": error_end.isoformat(),
+            "start_time": received.isoformat(),
+            "raw_fault": template_columns["raw_fault"],
             # Сырой текст оператора остаётся здесь целиком и **не** подменяется
             # шаблоном: это единственное место, где видно, что именно написал
             # человек. То же описание дублируется в `telegram_equipment_reports`
@@ -820,26 +966,37 @@ def build_rows(
             # С 11.10.2026 склейки здесь **нет**: `reported_error` содержит текст
             # оператора, а три остальных значения уехали в свои колонки
             # (`reported_type`, `device_number`, `module_text`).
-            "issue_description": "\n".join(row_details) or None,
-            "issue_type": template_columns["issue_type"],
+            "raw_description": "\n".join(row_details) or None,
+            "equipment_category": template_columns["equipment_category"],
+            "template_id": template_columns["template_id"],
             "photo_url": result.get("photo_url") or None,
-            "recovery_title": template_columns["recovery_title"],
-            "second_column": template_columns["second_column"],
-            "solving_time": solving_time,
+            "raw_recovery": template_columns["raw_recovery"],
+            "raw_template_title": template_columns["raw_template_title"],
+            "raw_solving_time": solving_time,
             # Суффикс только при нескольких устройствах: у обычного отчёта ключ
             # остаётся прежним, и уже записанные строки не теряют идентичность.
             "uniq_key": _uniq_key(result, report_id, user_id)
             + (f":{number}" if len(numbers) > 1 else ""),
             "shift_type": shift_name,
-            "warehouse": warehouse,
-            "issue_data": shift_date,
+            "warehouse": warehouse_id(warehouse, fallback=None),
+            "operating_day": shift_date,
             # Зона склада. У SMALL-P3 она выводится из устройства (`D`/`E`), у
-            # GLP-C и складов без зон остаётся `C2`. Раньше здесь была константа
-            # для всех складов, из-за чего у SMALL-P3 стояла зона GLP-C.
+            # GLP-C — `C2`. Пара (склад, зона) обязана быть в `warehouse_zones`:
+            # на неё ссылается составной внешний ключ, и зона чужого склада
+            # вставку уронит. Неизвестная пара даёт `None` — «зона неизвестна»,
+            # а не догадку.
             #
             # Считается **по своему** номеру: у `3561/3528` зоны могут
             # различаться, и одна общая зона была бы неверна для второго робота.
-            "issue_warehouse": device_zone(warehouse, number) or DEFAULT_ISSUE_WAREHOUSE,
+            "zone": _allowed_zone(
+                warehouse,
+                device_zone(warehouse, charging_robot or number)
+                or DEFAULT_ISSUE_WAREHOUSE,
+            ),
+            # Источник записи: приём оборудования через Telegram. Позволяет
+            # отличить этот путь от API (`api`) и классического журнала
+            # (`legacy`), когда путей станет больше двух.
+            "source": "intake_bot",
         }
 
         if include_optional:
@@ -864,6 +1021,20 @@ def build_rows(
             row["reported_error"] = reported_error
             row["reported_type"] = reported_type
             row["module_text"] = module_text
+
+        # **Пометка «на разбор»** (`needs_review` + `review_reason`).
+        #
+        # Только когда оператор согласился сохранить номер, которого нет в
+        # справочнике (решение владельца 12.10.2026). Отдельный набор колонок:
+        # в единой таблице их пока нет, и писать их «на всякий случай» значило
+        # бы уронить вставку целиком.
+        if include_review:
+            marked = _review_marked(result)
+
+            row["needs_review"] = marked
+            row["review_reason"] = (
+                str(result.get("review_reason") or "").strip() or None
+            )
 
         rows.append(row)
 
@@ -981,21 +1152,39 @@ def _split_columns_available() -> bool:
     )
 
 
+def _review_columns_available() -> bool:
+    """Есть ли набор пометки «на разбор» (`needs_review`, `review_reason`).
+
+    Отдельная проверка по той же причине, что и у остальных наборов: в единой
+    таблице этих колонок пока нет, и запрос с ними уронил бы **всю** вставку
+    (PostgREST отвергает запрос целиком из-за одной неизвестной колонки). Пока
+    колонок нет, пометка живёт в `unresolved_reason`.
+    """
+    return _columns_available(
+        GLPC_TABLE,
+        REVIEW_COLUMNS,
+        "_review_columns_state",
+        "_review_columns_checked_at",
+    )
+
 
 def reset_schema_cache() -> None:
     """Сброс памяти о колонках — только для тестов."""
     global _optional_columns_state, _optional_columns_checked_at
     global _split_columns_state, _split_columns_checked_at
+    global _review_columns_state, _review_columns_checked_at
 
     _optional_columns_state = None
     _optional_columns_checked_at = 0.0
     _split_columns_state = None
     _split_columns_checked_at = 0.0
+    _review_columns_state = None
+    _review_columns_checked_at = 0.0
 
 
 def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> bool:
     """
-    File one completed report in `exceptions_glpc`.
+    File one completed report in `exceptions`.
 
     Returns True when the row exists after the call (a repeated delivery counts
     as success — `uniq_key` makes the insert idempotent).
@@ -1021,14 +1210,15 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     title = validate_warehouse(warehouse if warehouse is not None else result.get("warehouse"))
     include_optional = _analytics_columns_available()
     include_split = _split_columns_available()
+    include_review = _review_columns_available()
 
     from sendToDataBase import rest_upsert
 
     # **Все строки уходят одним запросом.**
     #
     # `build_rows` возвращает по строке на каждое устройство из номера (см.
-    # `device_numbers`): `3561/3528` — две строки, у каждой свой `error_robot` и
-    # свой `uniq_key`. PostgREST принимает массив и вставляет его одной
+    # `device_numbers`): `3561/3528` — две строки, у каждой свой `robot_number`
+    # и свой `uniq_key`. PostgREST принимает массив и вставляет его одной
     # транзакцией: либо все строки, либо ни одной — «половина отчёта» записана
     # быть не может.
     #
@@ -1039,7 +1229,10 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     # существующая обработка ответа рассчитана на объект. Массив там, где
     # всегда был объект, — изменение ради изменения.
     rows = build_rows(
-        result, title, include_optional=include_optional, include_split=include_split
+        result, title,
+        include_optional=include_optional,
+        include_split=include_split,
+        include_review=include_review,
     )
     # Номера устройств нужны для логов и переживают пересборку ниже.
     row_numbers = [str(row.get("device_number") or "?") for row in rows]
@@ -1054,13 +1247,17 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     # платили за проверку. Наборы снимаются **по одному**: неприехавшая
     # миграция `0080` не должна заодно стирать `cause` (именно это и дало
     # 1663 пустые причины на живой базе).
-    if saved is None and (include_optional or include_split):
+    if saved is None and (include_optional or include_split or include_review):
         logger.warning(
             "Write to %s failed with the analytics columns (%s); retrying without them",
             GLPC_TABLE,
             "+".join(
                 name
-                for name, present in (("optional", include_optional), ("split", include_split))
+                for name, present in (
+                    ("optional", include_optional),
+                    ("split", include_split),
+                    ("review", include_review),
+                )
                 if present
             ),
         )
@@ -1071,8 +1268,14 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
         if include_split:
             _remember_columns("_split_columns_state", "_split_columns_checked_at", False)
 
+        if include_review:
+            _remember_columns("_review_columns_state", "_review_columns_checked_at", False)
+
         rows = build_rows(
-            result, title, include_optional=False, include_split=False
+            result, title,
+            include_optional=False,
+            include_split=False,
+            include_review=False,
         )
         row_numbers = [str(row.get("device_number") or "?") for row in rows]
         payload = _wire_payload(rows)

@@ -1,13 +1,13 @@
-"""Карточка робота читает таблицу, в которую **действительно пишут**.
+"""Карточка робота читает **единый** журнал `exceptions`.
 
-**Дефект, найденный 06.10.2026.** В `robot_card.py` стояло
-`EXCEPTIONS_TABLE = "exceptions"` — таблица под переход (`0068`/`0069`).
-Переход **не сделан**, писателя в ней нет: 7 строк против 24 185 в
-`exceptions_glpc`. Бот приёма и API пишут в legacy.
+**История.** 06.10.2026 карточка читала `exceptions`, но тогда переход не был
+сделан: писателя в таблице не было (7 строк против 24 185 в `exceptions_glpc`),
+шёл поиск по колонкам `start_time`/`robot_id`, которых в таблице не было, и
+карточка показывала ноль ошибок при 15 реальных. Источник вернули на legacy.
 
-Хуже: у `exceptions` **нет колонок** `start_time`, `exception_id`, `robot_id`,
-которые запрашивал код. Запрос падал, и карточка робота показывала ноль ошибок
-при 15 реальных. Проверено на живой базе.
+**12.10.2026 переход завершён** (перенос `0069` + перевод писателей), поэтому
+карточка снова читает `exceptions` — и это верно. Имя таблицы берётся из общего
+`journal`, чтобы читатели не разошлись.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import pathlib
 import re
 
 SOURCE = pathlib.Path(__file__).resolve().parents[1] / "robot_card.py"
+JOURNAL = pathlib.Path(__file__).resolve().parents[1] / "journal.py"
 
 
 def _code() -> str:
@@ -26,26 +27,35 @@ def _code() -> str:
 
 
 class TestRobotCardTable:
-    def test_reads_the_legacy_table(self) -> None:
-        """Источник — `exceptions_glpc`: только туда идёт запись."""
-        assert 'EXCEPTIONS_TABLE = "exceptions_glpc"' in _code()
+    def test_reads_the_unified_table(self) -> None:
+        """Источник — `journal.EXCEPTIONS_TABLE` (единый журнал).
 
-    def test_does_not_read_the_empty_table(self) -> None:
-        assert 'EXCEPTIONS_TABLE = "exceptions"' not in _code()
-
-    def test_uses_legacy_column_names(self) -> None:
-        """Колонки legacy, а не новой таблицы.
-
-        В `exceptions_glpc` начало ошибки — `error_start_time`, робот —
-        `error_robot`. Прежний код запрашивал `start_time` и `robot_id`, которых
-        в таблице нет, — запрос падал.
+        Проверяется связь с общим модулем, а не конкретная строка: если имя
+        таблицы снова поменяют, менять придётся **одно** место — `journal`, а не
+        каждого читателя по отдельности (именно так карточка и осталась бы на
+        архиве незамеченной).
         """
         code = _code()
 
-        assert "error_start_time" in code
-        assert "error_robot" in code
-        for missing in ('"start_time"', '"robot_id"', '"exception_id"', '"handle_by"'):
-            assert missing not in code, f"осталась колонка чужой таблицы: {missing}"
+        assert "EXCEPTIONS_TABLE = journal.EXCEPTIONS_TABLE" in code
+        # Общий модуль действительно указывает на `exceptions`.
+        assert 'EXCEPTIONS_TABLE = "exceptions"' in JOURNAL.read_text(encoding="utf-8")
+
+    def test_does_not_read_the_archive_table(self) -> None:
+        assert "exceptions_glpc" not in _code(), "карточка вернулась на архив"
+
+    def test_uses_the_new_column_names(self) -> None:
+        """Колонки единой таблицы: `start_time`, `robot_number`, `warehouse` id.
+
+        Прежний код запрашивал `error_start_time`/`error_robot` — имён, которых
+        в `exceptions` нет: запрос падал бы, и карточка показывала ноль ошибок.
+        """
+        code = _code()
+
+        assert "start_time" in code
+        assert "robot_number" in code
+        for missing in ('"error_start_time"', '"error_robot"', '"exception_id"'):
+            assert missing not in code, f"осталось имя чужой таблицы: {missing}"
 
     def test_scopes_by_warehouse(self) -> None:
         """Склад обязателен **в фильтре ошибок**, а не где-то ещё.
@@ -71,5 +81,9 @@ class TestRobotCardTable:
         end = window.find("\n    }")
         block = window if end == -1 else window[: end + 6]
 
-        assert '"error_robot"' in block, "фильтр потерял робота"
+        assert '"robot_number"' in block, "фильтр потерял робота"
         assert "warehouse" in block, "фильтр ошибок потерял склад — будут чужие ошибки"
+        assert 'journal.warehouse_id' in code, (
+            "склад обязан переводиться в числовой id: название в bigint-колонку "
+            "не сравняется, и карточка покажет ноль ошибок"
+        )

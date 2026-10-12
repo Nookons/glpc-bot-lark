@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from rapidfuzz import fuzz, process
 
+import journal
 from env_utils import env_int
 from sendToDataBase import WAREHOUSE, rest_count, rest_get
 from time_utils import parse_iso
@@ -30,16 +31,18 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 ROBOTS_TABLE = "robots_maintenance_list"
 HISTORY_TABLE = "change_status_robots"
-#: Таблица инцидентов, в которую **действительно пишут**.
+#: Таблица инцидентов — **единый журнал** `exceptions`.
 #:
-#: **Дефект, найденный 06.10.2026.** Здесь стояло `"exceptions"` — таблица под
-#: переход (`0068`/`0069`), **переход не сделан**, и писателя в ней нет: 7 строк
-#: против 24 185 в `exceptions_glpc`. Бот приёма и API пишут в legacy.
+#: История вопроса: 06.10.2026 здесь стояло `"exceptions"`, но переход тогда не
+#: был сделан — писателя в таблице не было (7 строк против 24 185 в
+#: `exceptions_glpc`), и карточка робота не показывала ни одной ошибки. Источник
+#: вернули на legacy.
 #:
-#: Хуже: у `exceptions` **нет колонок** `start_time`, `exception_id`, `robot_id`,
-#: которые запрашивал код, — запрос карточки робота падал, и в карточке не было
-#: ни одной ошибки. Проверено на живой базе.
-EXCEPTIONS_TABLE = "exceptions_glpc"
+#: **12.10.2026 переход завершён:** история перенесена миграцией `0069`,
+#: писатели переведены, поэтому источник снова `exceptions` — и теперь это
+#: верно. Имя таблицы берётся из общего `journal`, чтобы карточка и остальные
+#: читатели не разошлись.
+EXCEPTIONS_TABLE = journal.EXCEPTIONS_TABLE
 TEMPLATES_TABLE = "issue_templates"
 EMPLOYEES_TABLE = "employees"
 
@@ -283,29 +286,40 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         datetime.now(timezone.utc) - timedelta(days=ERROR_WINDOW_DAYS)
     ).isoformat()
 
-    # **Колонки legacy, а не новой таблицы.** В `exceptions_glpc` начало ошибки —
-    # `error_start_time`, робот — `error_robot` (числом, равным
-    # `robots_maintenance_list.id`), автор — в `employee`, а не `handle_by`.
+    # **Колонки единой таблицы.** Робот совпадает по `robot_number` (число,
+    # равное номеру в `robots_maintenance_list`), начало ошибки — `start_time`,
+    # склад — **числовой id**.
     #
     # **Склад обязателен.** Номера роботов повторяются между складами (`121`,
     # `122`, `123` есть и в GLP-C, и в SMALL-P3; `201`, `2000` — в GLP-C и
-    # P3-DC-1), поэтому без склада карточка показала бы чужие ошибки.
+    # P3-DC-1), поэтому без склада карточка показала бы чужие ошибки. У
+    # `exceptions.warehouse` тип bigint: сравнение с названием вернуло бы ноль
+    # строк — «карточка без ошибок», хотя они есть.
+    warehouse_key = journal.warehouse_id(warehouse)
+
+    if warehouse_key is None:
+        logger.warning("robot_card: неизвестный склад %r", warehouse)
+
+        return None
+
     errors_filter = {
-        "error_robot": f"eq.{robot.get('id')}",
-        "error_start_time": f"gte.{since}",
-        "warehouse": f"eq.{warehouse}",
+        "robot_number": f"eq.{robot.get('id')}",
+        "start_time": f"gte.{since}",
+        "warehouse": f"eq.{warehouse_key}",
     }
 
     total = rest_count(EXCEPTIONS_TABLE, errors_filter)
 
-    recent = rest_get(
-        EXCEPTIONS_TABLE,
-        params={
-            "select": "error_start_time,issue_type,recovery_title,employee",
-            **errors_filter,
-            "order": "error_start_time.desc",
-            "limit": "200",
-        },
+    recent = journal.legacy_rows(
+        rest_get(
+            EXCEPTIONS_TABLE,
+            params={
+                "select": journal.JOURNAL_COLUMNS,
+                **errors_filter,
+                "order": "start_time.desc",
+                "limit": "200",
+            },
+        )
     )
 
     # Автор ошибки лежит в `employee` (имя строкой), а не в `handle_by`:
@@ -363,11 +377,11 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         ]
 
         for row in recent[:LAST_ISSUES_LIMIT]:
-            # Тип ошибки лежит в самой строке (`issue_type`), а не за
-            # `exception_id` в шаблонах: у legacy-строки нет ссылки на шаблон,
-            # текст уже подставлен при записи.
+            # Строка уже приведена к исторической форме (`journal.legacy_rows`),
+            # поэтому тип и лечение лежат в `issue_type` / `recovery_title`:
+            # они собраны из снимка `raw_*` либо из справочника по `template_id`.
             card["last_issues"].append({
-                "at": _pretty(row.get("error_start_time")),
+                "at": _pretty(row.get("start_time")),
                 "issue_type": row.get("issue_type") or "unknown",
                 "recovery": row.get("recovery_title") or None,
                 "by": row.get("employee") or "-",

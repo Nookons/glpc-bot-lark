@@ -3,7 +3,7 @@
 
 Источники те же, что у отчёта смены:
 
-  * `exceptions_glpc` — ошибки (тип проблемы, робот, время);
+  * `exceptions` — ошибки (тип проблемы, робот, время); единый журнал с 12.10.2026;
   * `change_status_robots` — переходы Offline→Online (простой).
 
 Что считаем:
@@ -31,6 +31,7 @@ from supabase_storage import download_json, upload_json
 from shift_report import downtime_intervals, format_duration
 from time_utils import parse_iso
 from logging_config import setup_logging
+import journal
 
 
 logger = setup_logging(__name__)
@@ -38,7 +39,9 @@ logger = setup_logging(__name__)
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
-EXCEPTIONS_TABLE = "exceptions_glpc"
+#: Таблица инцидентов — единый журнал. Псевдоним оставлен, потому что имя
+#: читают внешние проверки; новое имя — `journal.EXCEPTIONS_TABLE`.
+EXCEPTIONS_TABLE = journal.EXCEPTIONS_TABLE
 MARKER_BUCKET = "bot-reports"
 
 PERIODS = {"day": 1, "week": 7, "month": 30}
@@ -74,14 +77,26 @@ def fetch_exceptions(since: datetime, warehouse: str = None):
 
     None — сбой чтения.
     """
-    return rest_get_all(
-        EXCEPTIONS_TABLE,
-        params={
-            "select": "error_robot,issue_type,error_start_time",
-            "warehouse": f"eq.{warehouse or WAREHOUSE}",
-            "error_start_time": f"gte.{since.isoformat()}",
-            "order": "error_start_time.desc",
-        },
+    # Фильтр — по новым колонкам единой таблицы: склад хранится **числовым
+    # id**, момент — `start_time` (было `error_start_time`), робот —
+    # `robot_number`. Строки приводятся к исторической форме, чтобы расчёты
+    # топов ниже читали те же поля, что и раньше.
+    warehouse_key = journal.warehouse_id(warehouse or WAREHOUSE)
+
+    if warehouse_key is None:
+        logger.warning("fetch_exceptions: неизвестный склад %r", warehouse)
+        return None
+
+    return journal.legacy_rows(
+        rest_get_all(
+            EXCEPTIONS_TABLE,
+            params={
+                "select": journal.JOURNAL_COLUMNS,
+                "warehouse": f"eq.{warehouse_key}",
+                "start_time": f"gte.{since.isoformat()}",
+                "order": "start_time.desc",
+            },
+        )
     )
 
 

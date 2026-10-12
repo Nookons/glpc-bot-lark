@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import telegram_api as tg
 
-from .engine import EngineError, Session
+from .engine import EngineError, Session, is_number_node
 from .keyboards import (
     CB_BACK,
     CB_CANCEL,
@@ -30,6 +30,7 @@ from .keyboards import (
     CB_RESTART,
     CB_SELECT,
     CB_TOGGLE,
+    callback,
     keyboard_with_breadcrumb,
 )
 from .tree_config import CANCEL_LABEL, load_tree
@@ -223,7 +224,16 @@ def _waiting_hint(session: Session) -> str:
         return "Send your answer in one message.\n" + example
 
     if node.type == NodeType.INPUT:
+        # **Пример зависит от ветки.** Узел ввода номера один, а формат
+        # вводимого значения — разный (робот / станция / рабочая станция / код
+        # места / код полки). Общая подсказка «For example: 3780 or H108/1834»
+        # показывала пример **номера робота** на ветке QR, и оператор вводил
+        # робота: 16 таких строк на 12.10.2026. Для текстовых узлов, которые
+        # номером не являются (`ask_description`), остаётся подсказка узла.
         example = node.placeholder or "Describe the problem in words"
+
+        if session.is_number_step():
+            example = session.text_example() or example
 
         return "Send your answer in one message.\n" + example
 
@@ -405,6 +415,18 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         elif action == CB_RESTART:
             session.restart()
         elif action == CB_EDIT:
+            # **Кнопка «Edit number» экрана мягкой проверки.**
+            #
+            # С финального экрана `back()` больше не уводит из ветки (иначе
+            # терялся ответ о причине и `Confirm` отказывал). Но если оператор
+            # правит номер — его надо вернуть **именно на шаг номера**, иначе
+            # кнопка ничего не делала бы.
+            if _goto_number_step(session):
+                if callback_id:
+                    tg.answer_callback_query(callback_id)
+                _redraw(chat_id, session, message_id)
+                return True
+
             session.back()
         elif action == CB_CANCEL:
             drop_session(chat_id, sender.get("id"))
@@ -547,6 +569,99 @@ def _card_identity(session: Session) -> str:
     parts = [part for part in (category, label, number) if part]
 
     return " · ".join(parts)
+
+
+def _goto_number_step(session: Session) -> bool:
+    """
+    Вернуть сессию на **последний шаг ввода номера** (для «Edit number»).
+
+    Возвращает False, если шага номера в пути нет. Отметки мягкой проверки
+    сбрасываются: оператор правит номер, и предупреждение должно быть
+    пересчитано заново, а не остаться от прежнего значения.
+    """
+    for index in range(len(session.path) - 1, -1, -1):
+        step = session.path[index]
+
+        if is_number_node(session.tree.node(step.node_id)):
+            session.navigate_to(index)
+            session.data.pop("review_pending", None)
+            session.data.pop("review_ack", None)
+            session.data.pop("review_reason", None)
+
+            return True
+
+    return False
+
+
+def unregistered_numbers(session: Session) -> List[str]:
+    """
+    Номера, которых **нет в справочнике** — «мягкий» случай.
+
+    Решение владельца 12.10.2026: если номер не найден в справочнике, оператора
+    **предупреждают** («Robot 9999 is not in the registry. Save anyway?»), но
+    **дают сохранить**, помечая запись на разбор. Данные не теряются, но видно,
+    что их надо проверить.
+
+    Возвращается список подписей вида `Robot 9999`; пустой список — либо всё
+    найдено, либо справочник недоступен (`lookup` вернул `None`). Второе — не
+    «не найдено»: обвинять верный номер из-за упавшего чтения нельзя.
+    """
+    from .validation import lookup
+
+    warehouse = str(session.data.get("warehouse") or "")
+    missing: List[str] = []
+
+    for step in session.path:
+        node = session.tree.node(step.node_id)
+
+        if not is_number_node(node):
+            continue
+
+        kind = session.number_kind_for_step(step)
+        found = lookup(kind, warehouse, step.value)
+
+        if found is False:
+            missing.append(f"{_kind_label(kind)} {str(step.value).strip()}")
+
+    return missing
+
+
+def _kind_label(kind: str) -> str:
+    """Как назвать устройство в предупреждении оператору."""
+    return {
+        "robot": "Robot",
+        "station": "Charging station",
+        "workstation": "Workstation",
+        "qr_floor": "Floor code",
+        "qr_shelf": "Shelf code",
+    }.get(kind, "Device")
+
+
+def soft_review_prompt(session: Session) -> Optional[Tuple[str, dict]]:
+    """
+    Предупреждение «нет в справочнике» с кнопками, или `None`.
+
+    Возвращается `(текст, клавиатура)`: текст по-английски, кнопки — Confirm
+    (мягко оставить запись и пометить её на разбор) и Edit number (вернуться
+    и исправить номер). Записи **не теряются** — это и есть «мягкая» валидация
+    из решения владельца.
+    """
+    missing = unregistered_numbers(session)
+
+    if not missing:
+        return None
+
+    lines = [
+        "⚠️ Not in the registry: " + ", ".join(missing) + ".",
+        "Save anyway? The entry will be marked for review.",
+    ]
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "Confirm", "callback_data": callback(CB_CONFIRM)},
+        {"text": "Edit number", "callback_data": callback(CB_EDIT)},
+    ]]}
+
+    return "\n".join(lines), keyboard
 
 
 def confirmation_card(session: Session, delivery: Dict[str, Any]) -> str:
@@ -732,6 +847,44 @@ def _confirm(
         )
         return
 
+    # **Мягкая проверка справочника — ДО записи и БЕЗ потери данных.**
+    #
+    # Решение владельца 12.10.2026: номер верный по формату, но его нет в
+    # справочнике — предупредить («Robot 9999 is not in the registry. Save
+    # anyway?») и дать сохранить, пометив запись на разбор. Отсюда два исхода:
+    # подтвердили повторно — пишем с `review_reason`; нажали «Edit number» —
+    # возвращаемся на шаг номера и правим. Путь при этом **не теряется**, фото
+    # остаётся на месте.
+    #
+    # Повторное подтверждение после предупреждения — это и есть согласие
+    # «Save anyway»: пишем строку и помечаем её на разбор.
+    if session.data.pop("review_pending", False):
+        session.data["review_ack"] = True
+
+    if not session.data.get("review_ack"):
+        prompt = soft_review_prompt(session)
+
+        if prompt:
+            text, keyboard = prompt
+            session.data["review_pending"] = True
+
+            if callback_id:
+                tg.answer_callback_query(callback_id, "Check the number")
+
+            if message_id is not None:
+                edit_caption(chat_id, message_id, text, session, reply_markup=keyboard)
+
+            return
+
+    # Согласие дано — помечаем запись на разбор. Номер при этом **не выдумываем**
+    # и не подменяем: он остаётся ровно тем, что ввёл оператор.
+    missing_numbers = unregistered_numbers(session)
+
+    if missing_numbers:
+        session.data["review_reason"] = (
+            "number is not in the registry: " + ", ".join(missing_numbers)
+        )
+
     # **Теперь показываем, что работа пошла.**
     #
     # Место выбрано точно: после проверки полноты (иначе прогресс мелькал бы
@@ -751,6 +904,10 @@ def _confirm(
     result = session.result()
     result["warehouse"] = session.data.get("warehouse") or ""
     result["note"] = session.data.get("note") or ""
+    # Признак «номер не найден в справочнике» доезжает до записи: строка
+    # пишется, но помечается на разбор (`review_reason`). Пустое значение —
+    # либо всё найдено, либо справочник был недоступен.
+    result["review_reason"] = session.data.get("review_reason") or ""
     result["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     result["thread_id"] = session.data.get("thread_id")
     result["user_id"] = sender.get("id")

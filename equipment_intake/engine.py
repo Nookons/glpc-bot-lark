@@ -141,6 +141,71 @@ class Session:
     def uploaded_image(self) -> Optional[str]:
         return self.data.get("image")
 
+    def answer_kind(self) -> str:
+        """
+        Вид номера на текущем шаге — по **ветке**, а не по узлу.
+
+        Узел `ask_number` один на всё дерево, а формат вводимого значения
+        зависит от выбранной ветки (робот / станция / рабочая станция / код
+        места / код полки). Без этого подсказка была общей, и на ветке QR
+        оператор вводил номер робота (16 таких строк на 12.10.2026).
+        """
+        from .tree_config import number_kind_for
+
+        return number_kind_for(self.path, self.current_node())
+
+    def text_example(self) -> str:
+        """Пример ввода для текущего текстового шага (по ветке)."""
+        from .tree_config import number_example
+
+        node = self.current_node()
+
+        if node is not None and node.type == NodeType.INPUT:
+            return number_example(self.answer_kind())
+
+        return ""
+
+    def is_number_step(self) -> bool:
+        """Вводится ли на этом шаге номер устройства, а не текст описания.
+
+        Номер проверяется по формату ветки; `ask_description` — свободный
+        текст, и проверять его нельзя.
+        """
+        return is_number_node(self.current_node())
+
+    def text_error(self, raw: str) -> Optional[str]:
+        """Понятная ошибка формата для текущего шага, или `None`.
+
+        Проверка стоит **на вводе**, а не при записи: описание ошибки в поле
+        номера (`'Driver component exception. 3528'`, `'Unable to drive'`) —
+        это мусор, и человек должен переписать его на месте, не теряя сессию.
+        """
+        node = self.current_node()
+
+        if not is_number_node(node):
+            return None
+
+        from .validation import validate_format
+
+        return validate_format(self.answer_kind(), raw)
+
+    def number_kind_for_step(self, step) -> str:
+        """Вид номера для **уже пройденного** шага пути.
+
+        Нужен на подтверждении: текущий узел — финальный, а проверить надо
+        именно тот шаг, где вводился номер (у зарядки их два — станция и
+        робот).
+        """
+        from .tree_config import number_kind_for
+
+        for index, item in enumerate(self.path):
+            if item is step:
+                return number_kind_for(
+                    self.path[: index + 1], self.tree.node(step.node_id)
+                )
+
+        return number_kind_for(self.path, None)
+
     def answers(self) -> Dict[str, Any]:
         """
         Ответы, собранные по ключам узлов.
@@ -176,11 +241,30 @@ class Session:
         node: Node,
         option: Optional[Option] = None,
     ) -> Optional[str]:
-        """Куда идти дальше: у варианта приоритет, затем у узла."""
+        """Куда идти дальше: у варианта приоритет, затем у узла.
+
+        **Разные шаги для разных веток.** У узла номера следующая цель одна, но
+        на зарядной ветке после станции надо спросить робота. `next_node_by_kind`
+        задаёт такую цель по виду номера (`answer_kind`), и она **сильнее**
+        `next_node` узла: иначе зарядная ветка молча шла бы сразу к описанию.
+        """
         if option is not None and option.next_node:
             return option.next_node
 
+        if node.next_node_by_kind:
+            kind = self.answer_kind_for(node)
+
+            for branch_kind, target in node.next_node_by_kind:
+                if branch_kind == kind:
+                    return target
+
         return node.next_node
+
+    def answer_kind_for(self, node: Optional[Node]) -> str:
+        """Вид вводимого номера для узла с учётом уже выбранного пути."""
+        from .tree_config import number_kind_for
+
+        return number_kind_for(self.path, node)
 
     def _enter(self, target: Optional[str], default_title: str) -> None:
         """Переход к узлу target; None — ветка закончилась, показываем итог."""
@@ -349,6 +433,19 @@ class Session:
         else:
             value = text
 
+        # **Формат номера проверяется ДО перехода.**
+        #
+        # Владелец 12.10.2026: «сейчас очень много некорректных данных идёт
+        # через бота». В поле номера попадало описание ошибки (`'Unable to
+        # drive'`, `'Driver component exception. 3528'`) — 103 невалидных
+        # номера из 2340 в его выгрузке за октябрь. Это не «мягкий» случай:
+        # сообщение об ошибке не является номером, и человек должен переписать
+        # его на месте. Сессия и фото сохраняются — терять уже введённое нельзя.
+        error = self.text_error(text)
+
+        if error:
+            raise EngineError(error)
+
         target = self._target_after(node)
         self._push(node, node.answer_key(), text, value, None, target)
         self._enter(target, node.summary_title)
@@ -381,16 +478,18 @@ class Session:
         return int(value) if value.is_integer() else value
 
     def back(self) -> bool:
-        """Шаг назад по дереву. False — уже в корне."""
-        if self.is_completed and self.current_id is None and self.path:
-            # С финального экрана назад — к последнему вопросу.
-            last = self.path[-1]
-            self.path = self.path[:-1]
-            self.depth = len(self.path)
-            self.current_id = last.node_id
-            self.is_completed = False
-            self.draft = []
-            return True
+        """Шаг назад по дереву. False — уже в корне.
+
+        **С финального экрана Back не уводит из ветки.** Раньше он возвращал к
+        последнему вопросу, **снимая** последний шаг пути. На финальном экране
+        (после `ask_cause`) это давало ловушку: кнопка «Edit selection» звала
+        `back()`, путь терял ответ о причине, а `Confirm` после этого отказывал
+        («Finish «What caused it?» first»). Теперь с финала возврат лишь
+        показывает итог заново: путь остаётся полным, и подтвердить можно сразу.
+        """
+        if self.is_completed and self.current_id is None:
+            # Путь не трогаем: сессия завершена, и `Confirm` обязан сработать.
+            return bool(self.path)
 
         if not self.path:
             return False
@@ -549,3 +648,17 @@ def _format_value(value: Any) -> str:
 
 def _num(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
+
+
+#: Ключи узлов, где вводится **номер устройства**, а не произвольный текст.
+#: `error_robot` — номер робота на зарядной ветке (`ask_charging_robot`).
+NUMBER_KEYS = ("device_number", "error_robot")
+
+
+def is_number_node(node: Optional[Node]) -> bool:
+    """Вводится ли на узле номер устройства (а не описание проблемы)."""
+    return (
+        node is not None
+        and node.type in TEXT_NODE_TYPES
+        and (node.key in NUMBER_KEYS or bool(getattr(node, "answer_kind", "")))
+    )
