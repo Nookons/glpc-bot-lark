@@ -543,7 +543,9 @@ def get_shift_exceptions(
 
     return journal.legacy_rows(
         _rest_get(
-            journal.EXCEPTIONS_TABLE,
+            # 🔴 Отчётное чтение: оборудование не в работе в рапорт не попадает
+            # (требование владельца 12.10.2026, миграция `0107`).
+            journal.EXCEPTIONS_REPORT_TABLE,
             params={
                 "operating_day": f"eq.{shift_date}",
                 "shift_type": f"eq.{shift_name}",
