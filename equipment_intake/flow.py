@@ -26,12 +26,14 @@ from .keyboards import (
     CB_CRUMB,
     CB_DONE,
     CB_EDIT,
+    CB_PAGE,
     CB_PREFIX,
     CB_RESTART,
     CB_SELECT,
     CB_TOGGLE,
     callback,
     keyboard_with_breadcrumb,
+    set_option_page,
 )
 from .tree_config import CANCEL_LABEL, load_tree
 from .types import NodeType
@@ -152,6 +154,40 @@ def _progress_bar(session: Session) -> str:
     return f" · level {level}"
 
 
+def _page_hint(session: Session) -> str:
+    """
+    Строка «Page N of M» для длинных списков, иначе пустая.
+
+    Владелец просил листать по два ряда; без подписи оператор не понимает,
+    что вариантов больше и они за кнопкой Next.
+    """
+    from .keyboards import (
+        OPTIONS_PER_PAGE,
+        option_page,
+        total_option_pages,
+    )
+
+    node = session.current_node()
+
+    if node is None:
+        return ""
+
+    if node.type not in (NodeType.CHOICE, NodeType.YESNO, NodeType.MULTI):
+        return ""
+
+    count = len(session.visible_options(node))
+    total = total_option_pages(count)
+
+    if total <= 1:
+        return ""
+
+    page = option_page(session, node)
+    first = page * OPTIONS_PER_PAGE + 1
+    last = min((page + 1) * OPTIONS_PER_PAGE, count)
+
+    return f"Page {page + 1} of {total} · options {first}–{last}"
+
+
 def step_caption(session: Session) -> str:
     """
     Подпись к фото: путь, вопрос и — главное — что бот чего-то ждёт.
@@ -176,6 +212,13 @@ def step_caption(session: Session) -> str:
         lines.append("")
 
     lines.append(f"{node.title}{_progress_bar(session)}")
+
+    # Номер страницы вариантов — только когда страниц больше одной. Иначе
+    # подпись не должна менять привычный вид.
+    page_hint = _page_hint(session)
+
+    if page_hint:
+        lines.append(page_hint)
 
     if node.description:
         lines.append(node.description)
@@ -408,6 +451,15 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             session.select(arg)
         elif action == CB_DONE:
             session.done_multi()
+        elif action == CB_PAGE:
+            # **Листание вариантов не сбрасывает диалог.**
+            #
+            # Страница живёт в `session.data` под ключом узла, а путь и шаг
+            # (`session.path`, `session.depth`, `current_id`) не трогаются
+            # вовсе — поэтому переход на «далее» лишь меняет видимые кнопки.
+            # Новая сессия при этом не создаётся: `handle_callback` берёт её
+            # из хранилища и кладёт обратно тем же объектом.
+            set_option_page(session, arg)
         elif action == CB_BACK:
             session.back()
         elif action == CB_CRUMB:

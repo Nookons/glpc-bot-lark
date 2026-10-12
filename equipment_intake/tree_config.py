@@ -1,22 +1,29 @@
 """
 Дерево решений производственного приёма ошибок.
 
-Путь сотрудника — два уровня выбора, затем два текстовых шага:
+Путь сотрудника — выбор категории, затем конкретики, затем два текстовых шага:
 
-    Object → Type → Device number → Description → Summary
+    Object → Type → Module → Error → Device number → Description → Cause → Summary
 
-    Robot            → A42T C2 | A42T | K50H → module → номер → описание
-    Workstation      → Pick | Conveyor | Tally      → module → номер → описание
-    Charging station → For A42T / C2 | For K50H     → номер → описание
-    QR Code          → Shelf | Floor                → номер → описание
+    Robot → K50H | A42T | A42T C2 → модуль модели → **ошибка модуля** → номер…
+    Workstation      — временно закрыто (`UNAVAILABLE`-узлы)
+    Charging station — временно закрыто
+    QR Code → Shelf | Floor → номер → описание
 
 Почему так (по требованию заказчика):
   * сотруднику нужно выбрать всего две вещи — что это и какая разновидность;
+  * **у каждой модели робота свой набор модулей, а у каждого модуля — свой
+    набор ошибок** (схема владельца 12.10.2026);
   * уникальный номер оборудования вводится руками: список техники меняется,
     закрыть его кнопками нельзя;
   * описание — свободным текстом. Именно эти описания потом собираются и
     превращаются в готовые варианты ошибок (см. `data/ANALYSIS.md` — разбор
     реальной выгрузки и `tools/build_tree_from_errors.py`).
+
+**Слой ошибок — новое здесь.** До 12.10.2026 модуль вёл сразу на номер
+устройства: в дереве было 13 узлов и **ни одного узла ошибок**, а что именно
+сломалось, оператор описывал только свободным текстом. Теперь ошибка — это
+выбор из кнопок, а свободный текст остаётся дополнительным уточнением.
 
 Дерево задано кодом осознанно: это зафиксированная бизнес-логика, а не
 догадка. Расширять просто — добавить вариант в нужный узел.
@@ -47,6 +54,7 @@ from .validation import (
 )
 
 
+
 # ============================================================
 # ПОСТРОЕНИЕ УЗЛОВ
 # ============================================================
@@ -63,13 +71,203 @@ ASK_DESCRIPTION = "ask_description"
 #: `error_robot`). До этой правки ветка спрашивала **один** номер, и на вопрос
 #: «Which charging station?» оператор отвечал номером робота — ровно тот класс
 #: дефекта, из-за которого в `device_number` QR-строк оказались `3492` и `2668`.
+#:
+#: **Сейчас узел в дереве не стоит.** Решение владельца 12.10.2026: «Workstation
+#: и Charging Station ПОКА НЕ РАБОТАЮТ». Ветка зарядки убрана из дерева целиком,
+#: иначе её узлы стали бы недостижимыми и валидатор справедливо упал бы. Сама
+#: машинерия сохранена — `validation` по-прежнему знает вид `station`, а
+#: `report_writer` пишет станцию и робота в две колонки: включить ветку обратно
+#: значит вернуть её варианты и этот узел, а не писать логику заново.
 ASK_CHARGING_ROBOT = "ask_charging_robot"
 #: Вопрос о причине ошибки — **владелец: «добавить причину ошибки как ещё один
-#: вопрос»**. Отв��чает на «почему это случилось», а не «что сломалось»:
+#: вопрос»**. Отвечает на «почему это случилось», а не «что сломалось»:
 #: описание проблемы и её причина — разные вещи, и раньше причину не спрашивали
 #: вовсе, поэтому в отчётах её не было.
 ASK_CAUSE = "ask_cause"
 SUMMARY = "summary"
+
+#: **Тексты «ветка пока не работает».**
+#:
+#: Решение владельца 12.10.2026: Workstation и Charging Station «ПОКА НЕ
+#: РАБОТАЮТ» — выбор такой категории обязан **сразу** сказать об этом и **не
+#: начинать диалог**. Текст по-английски (язык бота), вежливый и с указанием,
+#: что делать дальше: молчаливая кнопка или отказ без объяснения заставили бы
+#: оператора гадать, сломался бот или нет.
+#:
+#: Узел имеет тип `UNAVAILABLE`: вариантов у него нет, текст не принимается,
+#: кнопка «Confirm» не рисуется, а `flow._confirm` отказывает — то есть запись
+#: в журнал из этой ветки невозможна.
+WORKSTATION_UNAVAILABLE = (
+    "⚠️ Workstations are not available yet.\n\n"
+    "Please tap Cancel, send the photo again and choose Robot for now."
+)
+CHARGING_UNAVAILABLE = (
+    "⚠️ Charging stations are not available yet.\n\n"
+    "Please tap Cancel, send the photo again and choose Robot for now."
+)
+
+#: id узлов «ветка закрыта» — на них ведут варианты корня.
+WORKSTATION_UNAVAILABLE_NODE = "workstation_unavailable"
+CHARGING_UNAVAILABLE_NODE = "charging_unavailable"
+
+
+# ============================================================
+# МОДУЛИ И ОШИБКИ — СХЕМА ВЛАДЕЛЬЦА 12.10.2026
+# ============================================================
+#
+# **Владелец дал схему:** под каждой моделью робота — **свой** список модулей,
+# а под каждым модулем — **свой** список ошибок. Здесь это и зафиксировано.
+#
+# **Что было и почему это главная правка.** До 12.10.2026 модуль вёл **сразу на
+# номер устройства**: в дереве было 13 узлов и **ни одного узла ошибок**. То есть
+# «что именно сломалось» оператор описывал только свободным текстом, и по этому
+# тексту потом подбирался шаблон. Теперь ошибка — выбор из кнопок (слой
+# `robot_errors_*`), а свободное описание осталось **дополнением** к ней.
+#
+# **id узлов ошибок — контракт:** `robot_errors_<module>`, где `<module>` —
+# нижним регистром латиницей (`robot_errors_qr_code`). **id вариантов** —
+# `<module>_<slug>` (`chassis_went_off_road`, `safety_front_button`). По ним
+# третий слой (заготовки `issue_templates`) связывает ошибку дерева с шаблоном
+# автоматически, поэтому они **не переименовываются** произвольно.
+#
+# **Почему дубли со схемы убраны.** В списках A42T и A42T C2 `ROTATE` и
+# `QR CODE` написаны дважды — это ошибка рисования, а не два разных модуля:
+# физически поворот и код один. Оставлено по одному, а порядок приведён к
+# «сначала основные модули, потом QR CODE и SAFETY»: так оба списка читаются
+# одинаково и совпадают с колонкой A42T C2 на схеме.
+
+#: Ошибки каждого модуля: `module → ((option_id, label), …)`.
+#:
+#: Тексты — **дословно со схемы владельца** (английский, включая его написание
+#: `trigger` вместо `triggered` и регистр `HORN`/`Hook`). Переписывать их
+#: «правильнее» нельзя: по этим строкам строится связь с `issue_templates`, и
+#: расхождение в букве разорвало бы её.
+MODULE_ERRORS = {
+    "chassis": (
+        ("chassis_went_off_road", "Went off the road"),
+    ),
+    "lift": (
+        ("lift_cant_lift", "Can't lift up/down the fork"),
+    ),
+    "rotate": (
+        ("rotate_cant_rotate", "Can't rotate fork"),
+    ),
+    "tray": (
+        ("tray_cant_extend", "Can't extend/expand the tray"),
+    ),
+    "horn": (
+        ("horn_cant_extend", "Can't extend/expand the HORN"),
+    ),
+    "hook": (
+        ("hook_cant_extend", "Can't extend/expand the Hook"),
+    ),
+    "qr_code": (
+        ("qr_code_dirty", "QR Code dirty"),
+    ),
+    "safety": (
+        ("safety_front_button", "Front emergency button is trigger"),
+        ("safety_rear_button", "Rear emergency button is trigger"),
+        ("safety_bumper", "Safety bumper trigger"),
+        ("safety_system_disconnect", "Safety system disconnect"),
+    ),
+}
+
+#: Как модуль называется в заголовке своего узла ошибок. Ключ — хвост
+#: `robot_errors_<module>`; это же имя читает редактор `/tree`.
+ERROR_MODULE_TITLES = {
+    "chassis": "Chassis",
+    "lift": "Lift",
+    "rotate": "Rotate",
+    "tray": "Tray",
+    "horn": "Horn",
+    "hook": "Hook",
+    "qr_code": "QR Code",
+    "safety": "Safety",
+}
+
+#: Модули каждой модели: `node_id → ((option_id, label, error_module), …)`.
+#:
+#: **Порядок вариантов — это порядок из схемы владельца**, он же порядок кнопок.
+#: `error_module` — хвост узла `robot_errors_<module>`, куда ведёт модуль.
+#:
+#: **Почему id вариантов, а не подписи.** id попадает в оверлей редактора
+#: (`telegram_intake_options`), и его смена осиротила бы уже сохранённые правки.
+#: Где id существовал, он сохранён: `chassis`, `safety`, `lifting` — и добавлен
+#: `rotation` (прежний id поворота у A42T).
+#:
+#: **K50H — другой набор модулей**, и это не мелочь: у него есть `Lifting`, но
+#: нет `Lift`/`Rotate`/`Tray`/`Horn`/`Hook`. Ошибки общих модулей (Chassis,
+#: QR Code, Safety) — те же, что у A42T; `Lifting` несёт ошибку `Lift`
+#: («Can't lift up/down the fork»).
+ROBOT_MODULES = {
+    "robot_module_k50h": (
+        ("chassis", "Chassis", "chassis"),
+        ("qr_code", "QR Code", "qr_code"),
+        ("safety", "Safety", "safety"),
+        ("lifting", "Lifting", "lift"),
+    ),
+    "robot_module_a42t": (
+        ("chassis", "Chassis", "chassis"),
+        ("lifting", "Lifting", "lift"),
+        ("rotation", "Rotation", "rotate"),
+        ("tray", "Tray", "tray"),
+        ("horn", "Horn", "horn"),
+        ("hook", "Hook", "hook"),
+        ("qr_code", "QR Code", "qr_code"),
+        ("safety", "Safety", "safety"),
+    ),
+    #: **A42T C2 — отдельная ветка**, а не слияние с A42T (решение владельца
+    #: 12.10.2026). Список модулей совпадает с A42T, но узел свой: иначе в
+    #: отчёте нельзя было бы отличить C2 от A42T и правки редактора для одной
+    #: модели меняли бы другую.
+    "robot_module_a42t_c2": (
+        ("chassis", "Chassis", "chassis"),
+        ("lifting", "Lifting", "lift"),
+        ("rotation", "Rotation", "rotate"),
+        ("tray", "Tray", "tray"),
+        ("horn", "Horn", "horn"),
+        ("hook", "Hook", "hook"),
+        ("qr_code", "QR Code", "qr_code"),
+        ("safety", "Safety", "safety"),
+    ),
+}
+
+#: Прежние модули, **удалённые совсем** (не скрытые) по решению владельца
+#: 12.10.2026. Список оставлен как справка и для сторожа тестов: в дереве их
+#: быть не должно. История журнала при этом не трогается — `Not a module` (42
+#: записи), `Personally` (12), `Bummer` (11) остаются в базе как есть.
+REMOVED_MODULES = (
+    "not_a_module",
+    "personally",
+    "bummer",
+    "ground_camera",
+    "lidar",
+    "fingers",
+)
+
+
+def error_node_id(module: str) -> str:
+    """
+    id узла ошибок модуля: `chassis` → `robot_errors_chassis`.
+
+    **Контракт имён.** Так узел называется и в дереве, и в редакторе `/tree`, и
+    в связке с заготовками `issue_templates` (`error_templates.is_error_node`
+    проверяет тот же префикс). Одна функция на все места — чтобы префикс нельзя
+    было случайно написать по-разному в дереве и в проверке.
+    """
+    return f"robot_errors_{module}"
+
+
+def _model_title(module_node_id: str) -> str:
+    """
+    Название модели для заголовка узла модулей.
+
+    `robot_module_a42t_c2` → `A42T C2`: хвост id переводится в верхний регистр,
+    а разделитель `_` возвращается в пробел. Простое `upper()` дало бы
+    `A42T_C2` — в заголовке редактора это читается как опечатка, а заголовок
+    нужен именно для того, чтобы модели различались глазами.
+    """
+    return module_node_id.replace("robot_module_", "").replace("_", " ").upper()
 
 
 def _build_nodes() -> dict:
@@ -89,8 +287,12 @@ def _build_nodes() -> dict:
         description="Choose what is in the photo.",
         options=(
             opt("robot", "Robot", "robot_type"),
-            opt("workstation", "Workstation", "workstation_type"),
-            opt("charger", "Charging station", "charger_type"),
+            # **Workstation и Charging station — «пока недоступно».** Вариант
+            # ведёт прямо на узел-заглушку: диалог по шагам не начинается, и
+            # сразу видно, что делать вместо этого. Раньше здесь были
+            # `workstation_type` и `charger_type` — они убраны вместе с ветками.
+            opt("workstation", "Workstation", WORKSTATION_UNAVAILABLE_NODE),
+            opt("charger", "Charging station", CHARGING_UNAVAILABLE_NODE),
             opt("qr", "QR Code", "qr_type"),
         ),
     ))
@@ -98,6 +300,10 @@ def _build_nodes() -> dict:
     # ------------------------------------------------------------
     # Шаг 2: разновидность внутри выбранного оборудования
     # ------------------------------------------------------------
+    # Порядок моделей и их списки модулей — **точно по схеме владельца**.
+    #
+    # **A42T C2 ведёт в свой узел** (решение владельца 12.10.2026): до этого он
+    # шёл в общий с A42T узел, и в отчёте нельзя было понять, какая это модель.
     add(choice_node(
         "robot_type",
         "Which robot?",
@@ -105,22 +311,9 @@ def _build_nodes() -> dict:
         summary_label="Type",
         description="Choose the robot model.",
         options=(
-            opt("a42t_c2", "A42T C2", "robot_module_a42t"),
-            opt("a42t", "A42T", "robot_module_a42t"),
             opt("k50h", "K50H", "robot_module_k50h"),
-        ),
-    ))
-
-    add(choice_node(
-        "workstation_type",
-        "Which workstation?",
-        key="device_type",
-        summary_label="Type",
-        description="Choose the workstation type.",
-        options=(
-            opt("ws_pick", "Pick", "workstation_module"),
-            opt("ws_conveyor", "Conveyor", "workstation_module"),
-            opt("ws_tally", "Tally", "workstation_module"),
+            opt("a42t", "A42T", "robot_module_a42t"),
+            opt("a42t_c2", "A42T C2", "robot_module_a42t_c2"),
         ),
     ))
 
@@ -133,7 +326,7 @@ def _build_nodes() -> dict:
     # safety, больше нету — и нету смысла показывать все в таком случае».
     #
     # **Почему отдельные узлы, а не один с `only_for`.** Механизм `only_for` в
-    # дереве есть и работае�� (`visible_options` фильтрует варианты по пути), но
+    # дереве есть и работает (`visible_options` фильтрует варианты по пути), но
     # валидатор запрещает **одинаковые id вариантов внутри узла** — а `lifting`
     # нужен и K50H, и A42T. Отдельные узлы снимают это ограничение честно:
     # у каждой модели свой список модулей, и его правит редактор независимо.
@@ -152,66 +345,82 @@ def _build_nodes() -> dict:
     # техническому id в скобках.
     #
     # Теперь заголовок отвечает на вопрос «какие модули у **этой** модели» и
-    # работа��т как подпись в списке редактора.
-    add(choice_node(
-        "robot_module_k50h",
-        "K50H: which module?",
-        key="module",
-        summary_label="Module",
-        description="K50H has three modules: lifting, chassis and safety.",
-        options=(
-            opt("lifting", "Lifting", ASK_NUMBER),
-            opt("chassis", "Chassis", ASK_NUMBER),
-            opt("safety", "Safety", ASK_NUMBER),
-            # Ошибка бывает не в модуле: сбой программы, грязный код пола,
-            # посторонний предмет. Без этого варианта человек выбирал чужой
-            # модуль наугад и портил статистику.
-            opt("not_a_module", "Not a module", ASK_NUMBER),
-        ),
+    # работает как подпись в списке редактора.
+    # **Старые модули удалены совсем**, а не скрыты: `Not a module`,
+    # `Personally`, `Bummer`, `Ground camera`, `Lidar`, `Fingers` (решение
+    # владельца 12.10.2026). Записи в журнале при этом не трогаются — 65 штук
+    # (`Not a module` 42, `Personally` 12, `Bummer` 11) остаются историей;
+    # убраны только кнопки дерева. Список для сторожа — `REMOVED_MODULES`.
+    for module_node_id, module_options in ROBOT_MODULES.items():
+        model = _model_title(module_node_id)
+
+        add(choice_node(
+            module_node_id,
+            f"{model}: which module?",
+            key="module",
+            summary_label="Module",
+            description=(
+                "Choose the faulty module of this robot. "
+                "The error is chosen on the next step."
+            ),
+            options=tuple(
+                opt(option_id, label, error_node_id(error_module))
+                for option_id, label, error_module in module_options
+            ),
+        ))
+
+    # ------------------------------------------------------------
+    # Шаг 2в: **ошибки модуля** — новый слой дерева
+    # ------------------------------------------------------------
+    #
+    # **Это и есть главная правка 12.10.2026.** До неё модуль вёл прямо на
+    # `ask_number`, и в дереве не было **ни одного** узла ошибок: что именно
+    # сломалось, оператор описывал свободным текстом, а система пыталась угадать
+    # шаблон по этому тексту. Теперь ошибка — обычный выбор из кнопок.
+    #
+    # **Узел ошибок один на модуль, а не на пару «модель + модуль».** Одинаковые
+    # модули несут одинаковые ошибки: у K50H `Chassis`, `QR Code` и `Safety` —
+    # те же, что у A42T, а `Lifting` — ошибка `Lift` («Can't lift up/down the
+    # fork»). Железо и неисправности те же, и второй узел с тем же содержимым
+    # разошёлся бы при первой же правке. Различие моделей задают **узлы
+    # модулей** выше, а не узлы ошибок.
+    for error_module, error_options in MODULE_ERRORS.items():
+        add(choice_node(
+            error_node_id(error_module),
+            f"{ERROR_MODULE_TITLES[error_module]}: what is wrong?",
+            key="error",
+            summary_label="Error",
+            description="Choose the error you see.",
+            options=tuple(
+                opt(option_id, label, ASK_NUMBER)
+                for option_id, label in error_options
+            ),
+        ))
+
+    # ------------------------------------------------------------
+    # Ветки, закрытые владельцем: Workstation и Charging station
+    # ------------------------------------------------------------
+    # **Владелец 12.10.2026: «Workstation и Charging Station ПОКА НЕ РАБОТАЮТ».**
+    #
+    # Выбор такой категории **сразу** показывает сообщение и **не начинает
+    # диалог**: у узла нет вариантов, текст не принимается, кнопка «Confirm» не
+    # рисуется, а `flow._confirm` отказывает (узел не `FINAL` — сессия не
+    # завершена). Запись в журнал из этой ветки поэтому невозможна.
+    #
+    # Текст вежливый и **говорит, что делать**: молчаливый отказ заставил бы
+    # оператора гадать, сломался бот или нет.
+    add(Node(
+        id=WORKSTATION_UNAVAILABLE_NODE,
+        title="Workstations are not available yet",
+        type=NodeType.UNAVAILABLE,
+        description=WORKSTATION_UNAVAILABLE,
     ))
 
-    add(choice_node(
-        "robot_module_a42t",
-        "A42T / A42T C2: which module?",
-        key="module",
-        summary_label="Module",
-        description="A42T and A42T C2 have lifting, rotation, tray and chassis.",
-        options=(
-            opt("lifting", "Lifting", ASK_NUMBER),
-            opt("rotation", "Rotation", ASK_NUMBER),
-            opt("tray", "Tray", ASK_NUMBER),
-            opt("chassis", "Chassis", ASK_NUMBER),
-            opt("not_a_module", "Not a module", ASK_NUMBER),
-        ),
-    ))
-
-    add(choice_node(
-        "workstation_module",
-        "Workstation: which module?",
-        key="module",
-        summary_label="Module",
-        description=(
-            "Same list for Pick, Conveyor and Tally. "
-            "Choose the faulty module or add an option via /tree."
-        ),
-        options=(
-            opt("offline", "Offline", ASK_NUMBER),
-            opt("wrong_task", "Wrong task", ASK_NUMBER),
-        ),
-    ))
-
-    add(choice_node(
-        "charger_type",
-        "Which charging station?",
-        key="device_type",
-        summary_label="Type",
-        description="Choose which robot this station is for.",
-        options=(
-            # Обе ветки ведут на ввод номера **станции**; робот спрашивается
-            # отдельным шагом сразу после (см. `ask_charging_robot`).
-            opt("cs_a42t_c2", "Charge for big robot", ASK_NUMBER),
-            opt("cs_k50h", "Charge for small robot", ASK_NUMBER),
-        ),
+    add(Node(
+        id=CHARGING_UNAVAILABLE_NODE,
+        title="Charging stations are not available yet",
+        type=NodeType.UNAVAILABLE,
+        description=CHARGING_UNAVAILABLE,
     ))
 
     add(choice_node(
@@ -249,34 +458,26 @@ def _build_nodes() -> dict:
         description="Unique equipment number.",
         placeholder="For example: 3780 or H108/1834",
         answer_kind="robot",
-        # Зарядная ветка: после номера станции спрашиваем робота, который на
-        # ней стоял. Остальные ветки идут сразу к описанию.
-        next_node_by_kind=((KIND_STATION, ASK_CHARGING_ROBOT),),
+        # **Ветки по видам номера сейчас нет.** Раньше здесь стояло
+        # `next_node_by_kind=((KIND_STATION, ASK_CHARGING_ROBOT),)`: после номера
+        # станции спрашивался робот. Ветка зарядки убрана из дерева (владелец
+        # 12.10.2026), поэтому и развилка не нужна — механизм оставлен в
+        # `types.Node.next_node_by_kind` и включается возвратом ветки.
         next_node=ASK_DESCRIPTION,
     ))
 
     # ------------------------------------------------------------
-    # Шаг 3б: робот, стоявший на зарядной станции
+    # Шаг 3б: робот, стоявший на зарядной станции — **узел убран из дерева**
     # ------------------------------------------------------------
-    # **Владелец 12.10.2026:** «если зарядка то сначала спрашиваем зарядку
-    # потом номер робота и храним данные на сервере корректно». Поэтому
-    # станция и робот — **два номера и две колонки**: станция в
-    # `device_number`, робот в `robot_number`. Прежняя ветка спрашивала один
-    # номер, и на вопрос про станцию оператор отвечал роботом.
+    # **Владелец 12.10.2026: «Charging Station ПОКА НЕ РАБОТАЕТ».** Ветка
+    # зарядки убрана целиком, поэтому и второй её узел (`ask_charging_robot`)
+    # стал недостижим — а недостижимый узел валидатор справедливо запрещает.
     #
-    # Робот нужен, потому что без него ошибка зарядки не связана с роботом и
-    # не попадает в метрики по устройству.
-    add(Node(
-        id=ASK_CHARGING_ROBOT,
-        title="Which robot was charging?",
-        type=NodeType.INPUT,
-        key="error_robot",
-        summary_label="Robot",
-        description="The robot that was on this charging station.",
-        placeholder="For example: 3780 or H108/1834",
-        answer_kind="robot",
-        next_node=ASK_DESCRIPTION,
-    ))
+    # Логика не потеряна: писатель (`report_writer`) по-прежнему умеет писать
+    # станцию в `device_number`, а робота — в `robot_number`, и `validation`
+    # знает вид `station`. Вернуть ветку значит вернуть варианты корня, узел
+    # типа станции и этот узел — а не писать код заново. Константа
+    # `ASK_CHARGING_ROBOT` и карта `_NUMBER_KIND_BY_NODE` оставлены для этого.
 
     # ------------------------------------------------------------
     # Шаг 4: описание проблемы
@@ -351,6 +552,9 @@ def _build_nodes() -> dict:
 _NUMBER_KIND_BY_OPTION = {
     # Шаг 1 — что за оборудование.
     "robot": KIND_ROBOT,
+    # `workstation` и `charger` сейчас ведут на узлы «недоступно», и номер по ним
+    # не спрашивается вовсе. Записи оставлены намеренно: это вид номера **той**
+    # ветки, и при её возврате карта уже верна.
     "workstation": KIND_WORKSTATION,
     "charger": KIND_STATION,
     "qr": KIND_QR_FLOOR,
@@ -363,12 +567,23 @@ _NUMBER_KIND_BY_OPTION = {
     "ws_tally": KIND_WORKSTATION,
     "qr_shelf": KIND_QR_SHELF,
     "qr_floor": KIND_QR_FLOOR,
+    # Шаг 2в — **ошибки модулей**. Вид номера ищется от последнего шага пути к
+    # первому, поэтому ошибка (самый глубокий шаг) проверяется первой. Все
+    # ошибки робота дают номер робота; карта перечисляет их явно, чтобы новая
+    # ветка «ошибка → номер» не зависела от того, стоит ли выше модель в карте.
+    **{
+        option_id: KIND_ROBOT
+        for options in MODULE_ERRORS.values()
+        for option_id, _label in options
+    },
 }
 
 #: Вид номера по конкретному узлу (там, где ветку определяет сам узел).
-_NUMBER_KIND_BY_NODE = {
-    ASK_CHARGING_ROBOT: KIND_ROBOT,
-}
+#:
+#: Сейчас пусто: единственным таким узлом был `ask_charging_robot`, и он убран
+#: вместе с закрытой веткой зарядки. Механизм оставлен — он нужен, как только
+#: узел вернётся.
+_NUMBER_KIND_BY_NODE = {}
 
 
 def number_kind_for(path=None, node=None) -> str:

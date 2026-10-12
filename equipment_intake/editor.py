@@ -264,6 +264,11 @@ KIND_OPTION_ICON = "option_icon"
 KIND_NODE_TITLE = "node_title"
 KIND_NODE_DESCRIPTION = "node_description"
 KIND_NODE_PLACEHOLDER = "node_placeholder"
+# Поля **заготовки** в справочнике `issue_templates` (связь с ошибкой дерева).
+KIND_TEMPLATE_MODULE = "template_module"
+KIND_TEMPLATE_DESCRIPTION = "template_description"
+KIND_TEMPLATE_RECOVERY = "template_recovery"
+KIND_TEMPLATE_SOLVING_TIME = "template_solving_time"
 
 
 def _key(chat_id, user_id) -> Tuple[int, int]:
@@ -727,7 +732,7 @@ def _show_node(chat_id, sender, role: str, node_id: str, message_id, notice: str
 # ЭКРАН ВАРИАНТА
 # ============================================================
 
-def _option_caption(item: dict, role: str, notice: str = "") -> str:
+def _option_caption(item: dict, role: str, notice: str = "", node_id: str = "") -> str:
     lines: List[str] = ["Option", ""]
 
     if notice:
@@ -746,6 +751,27 @@ def _option_caption(item: dict, role: str, notice: str = "") -> str:
 
     lines.append(f"next: {item['next_node'] or 'end of branch'}")
     lines.append(f"visible: {'no (hidden)' if item['hidden'] else 'yes'}")
+
+    # **Связь с заготовкой видна прямо в карточке.** Требование владельца
+    # 12.10.2026: «нужно сделать связь как-то». Если связи не видно, проверить её
+    # нельзя, а «молча связал не с тем шаблоном» — ровно тот дефект, из-за
+    # которого оператор писал одно, а в журнал попадало другое (`Speed error`
+    # вместо `Driver component exception`).
+    #
+    # Строка не показывается `contributor`: он не управляет связью.
+    if role == ROLE_ADMIN:
+        lines.append("")
+
+        if node_id:
+            template_id = _linked_template_id(node_id, item["id"])
+
+            if template_id in (None, ""):
+                lines.append("🧩 Issue template: — not linked —")
+            else:
+                title = _template_row(template_id).get("employee_title") or "?"
+
+                lines.append(f"🧩 Issue template: #{template_id} {title}")
+                lines.append(_template_summary(template_id))
 
     if item["kind"] == "builtin":
         lines.append("")
@@ -780,6 +806,21 @@ def _option_keyboard(item: dict, role: str) -> Dict[str, list]:
 
         if move:
             rows.append(move)
+
+        # ── Поля заготовки (`issue_templates`) ───────────────────────────────
+        #
+        # Требование владельца 12.10.2026: «на сервере в столбцы с описанием
+        # ошибки что было сделано и тп». Кнопка ведёт в справочник: именно оттуда
+        # поля подставляются в журнал при выборе ошибки. У заготовки, созданной
+        # вместе с ошибкой, поля пустые — их и дозаполняют здесь.
+        rows.append([
+            {"text": "🧩 Issue descr.", "callback_data": _cb("q")},
+            {"text": "🛠 What was done", "callback_data": _cb("w")},
+        ])
+        rows.append([
+            {"text": "🏷 Module", "callback_data": _cb("m")},
+            {"text": "⏱ Solving time", "callback_data": _cb("k")},
+        ])
 
         rows.append([{
             "text": "👁 Show" if item["hidden"] else "🙈 Hide",
@@ -832,7 +873,7 @@ def _show_option(chat_id, sender, role: str, message_id, notice: str = "") -> bo
     _edit(
         chat_id,
         message_id,
-        _option_caption(item, role, notice=notice),
+        _option_caption(item, role, notice=notice, node_id=node_id),
         reply_markup=_option_keyboard(item, role),
     )
 
@@ -1205,6 +1246,43 @@ _PROMPTS = {
         "Send a single dash \"-\" to clear it.\n\n"
         "Cancel with the button below."
     ),
+    # ── Поля заготовки в справочнике `issue_templates` ───────────────────────
+    #
+    # Требование владельца 12.10.2026: «на сервере в столбцы с описанием ошибки
+    # что было сделано и тп». Тексты подсказок говорят прямо, **куда** попадёт
+    # значение: админ должен понимать, что заполняет шаблон подстановки, а не
+    # подпись кнопки.
+    KIND_TEMPLATE_MODULE: (
+        "Issue template — module\n\n"
+        "Option: \"{current}\"\n"
+        "Send the module (issue type) used in the journal, for example: Chassis, "
+        "Lift, Safety.\n\n"
+        "Cancel with the button below."
+    ),
+    KIND_TEMPLATE_DESCRIPTION: (
+        "Issue template — issue description\n\n"
+        "Option: \"{current}\"\n"
+        "Send the text that will be copied into the journal's issue description "
+        "when an operator picks this error.\n"
+        "Send a single dash \"-\" to clear it.\n\n"
+        "Cancel with the button below."
+    ),
+    KIND_TEMPLATE_RECOVERY: (
+        "Issue template — what was done\n\n"
+        "Option: \"{current}\"\n"
+        "Send the recovery action copied into the journal (for example: "
+        "\"Restart the safety module\").\n"
+        "Send a single dash \"-\" to clear it.\n\n"
+        "Cancel with the button below."
+    ),
+    KIND_TEMPLATE_SOLVING_TIME: (
+        "Issue template — solving time\n\n"
+        "Option: \"{current}\"\n"
+        "Send the solving time in minutes (a whole number, for example: 6).\n"
+        "It sets the journal's end time: start + this value.\n"
+        "Send a single dash \"-\" to set 0 (not filled in yet).\n\n"
+        "Cancel with the button below."
+    ),
 }
 
 
@@ -1240,6 +1318,16 @@ def _start_prompt(chat_id, sender, kind: str, message_id, node: Node,
                 current = item["description"]
             elif kind == KIND_OPTION_ICON:
                 current = item["icon"]
+
+        # Текущее значение поля **заготовки** берём из справочника, а не из
+        # варианта: это разные тексты, и показать чужой значило бы соврать.
+        if kind in (
+            KIND_TEMPLATE_MODULE,
+            KIND_TEMPLATE_DESCRIPTION,
+            KIND_TEMPLATE_RECOVERY,
+            KIND_TEMPLATE_SOLVING_TIME,
+        ):
+            current = _template_field(kind, node.id, option_id)
     else:
         if kind == KIND_NODE_DESCRIPTION:
             current = node.description
@@ -1469,7 +1557,8 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         return True
 
     # Дальше — действия над вариантом; contributor их не получает.
-    if action in ("r", "d", "i", "g", "G", "U", "W", "v", "L", "y", "e", "T", "E", "P", "N", "H"):
+    if action in ("r", "d", "i", "g", "G", "U", "W", "v", "L", "y", "e", "T", "E", "P", "N", "H",
+                  "q", "w", "m", "k"):
         if role != ROLE_ADMIN:
             _answer(callback_id, "Maintainers only")
             return True
@@ -1485,6 +1574,30 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             "r": KIND_OPTION_LABEL,
             "d": KIND_OPTION_DESCRIPTION,
             "i": KIND_OPTION_ICON,
+        }[action]
+
+        _answer(callback_id)
+        _start_prompt(chat_id, sender, kind, message_id, node, option_id=item["id"])
+        return True
+
+    # ── Поля заготовки в справочнике `issue_templates` ───────────────────────
+    #
+    # Требование владельца 12.10.2026: «на сервере в столбцы с описанием ошибки
+    # что было сделано и тп». Коды короткие (лимит callback_data — 64 байта):
+    # `q` — описание ошибки, `w` — «что было сделано», `m` — модуль,
+    # `k` — время решения.
+    if action in ("q", "w", "m", "k"):
+        item = _selected_option(view)
+
+        if item is None:
+            _answer(callback_id, "Menu expired — open /tree again")
+            return True
+
+        kind = {
+            "q": KIND_TEMPLATE_DESCRIPTION,
+            "w": KIND_TEMPLATE_RECOVERY,
+            "m": KIND_TEMPLATE_MODULE,
+            "k": KIND_TEMPLATE_SOLVING_TIME,
         }[action]
 
         _answer(callback_id)
@@ -1789,6 +1902,254 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     return True
 
 
+def _module_for_label(node_id: str, label: str) -> str:
+    """
+    Модуль заготовки: из узла слоя ошибок, иначе из карты владельца.
+
+    У узла `robot_errors_<module>` модуль известен из его id. У остальных узлов
+    (например `ask_cause`) модуля нет — вернётся пусто, и `issue_type` заготовки
+    останется незаполненным: приписать ошибку чужому модулю хуже, чем не
+    приписать. Карта `error_templates` уточняет по названию.
+    """
+    from .error_templates import module_from_node, seed_for_option
+
+    module = module_from_node(node_id)
+
+    if module:
+        return module
+
+    spec = seed_for_option(None, label, node_id)
+
+    return str(spec.get("module") or "") if spec else ""
+
+
+def _option_index(node_id: str, option_id: str) -> Optional[int]:
+    """Позиция варианта в эффективном списке узла (для карточки варианта)."""
+    items = storage.effective_options(
+        DEFAULT_TREE, node_id, storage.load_option_rows() or []
+    )
+
+    return next((i for i, item in enumerate(items) if item["id"] == option_id), None)
+
+
+def _selected_option_by_id(node_id: str, option_id: str) -> Optional[dict]:
+    """Вариант по его id (в отличие от `_selected_option`, тот берёт по позиции)."""
+    items = storage.effective_options(
+        DEFAULT_TREE, node_id, storage.load_option_rows() or []
+    )
+
+    return next((item for item in items if item["id"] == option_id), None)
+
+
+def _linked_template_id(node_id: str, option_id: str) -> Optional[Any]:
+    """
+    Шаблон, связанный с вариантом: сначала ссылка из базы, затем карта кода.
+
+    Ссылка из базы сильнее: админ мог связать вариант с **другим** шаблоном, и
+    его выбор — авторитетный. Карта нужна до применения миграции `0109` и для
+    встроенных вариантов, у которых строки-переопределения ещё нет.
+    """
+    stored = storage.option_template_id(node_id, option_id)
+
+    if stored not in (None, ""):
+        return stored
+
+    from .error_templates import seed_for_option
+
+    item = _selected_option_by_id(node_id, option_id)
+    label = item["label"] if item else None
+
+    spec = seed_for_option(option_id, label, node_id)
+
+    if spec is None:
+        return None
+
+    # Шаблон ищем среди строк справочника — по названию владельца: `id` заготовки
+    # заранее неизвестен, а `employee_title` уникален (0 дублей на 29 записях).
+    for row in storage.load_templates():
+        if str(row.get("employee_title") or "").strip() == str(spec["label"]):
+            return row.get("id")
+
+    return None
+
+
+#: Карта «вид ожидания → поле справочника». Одна таблица на чтение и запись:
+#: разъехавшиеся списки полей — это когда правят одно, а показывают другое.
+_TEMPLATE_FIELDS = {
+    KIND_TEMPLATE_MODULE: "issue_type",
+    KIND_TEMPLATE_DESCRIPTION: "issue_description",
+    KIND_TEMPLATE_RECOVERY: "recovery_title",
+    KIND_TEMPLATE_SOLVING_TIME: "solving_time",
+}
+
+
+def _template_row(template_id) -> Dict[str, Any]:
+    """Строка справочника по id (среди уже загруженных)."""
+    for row in storage.load_templates():
+        if str(row.get("id")) == str(template_id):
+            return row
+
+    return {}
+
+
+def _template_summary(template_id) -> str:
+    """
+    Что заполнено в заготовке — коротко, одной строкой.
+
+    Нужно, чтобы админ видел, **чего ещё не хватает**: заготовка создаётся почти
+    пустой (название и модуль), а `recovery_title` и `solving_time` заполняет
+    человек. Без этой строки «создал заготовку» выглядело бы как готовый шаблон,
+    и в журнал уезжало бы пустое «что было сделано».
+    """
+    row = _template_row(template_id)
+    module = str(row.get("issue_type") or "").strip() or "—"
+    description = str(row.get("issue_description") or "").strip()
+    recovery = str(row.get("recovery_title") or "").strip()
+    solving = row.get("solving_time")
+
+    parts = [f"module: {module}"]
+
+    if not description:
+        parts.append("description: — to fill in —")
+
+    if not recovery:
+        parts.append("what was done: — to fill in —")
+
+    if solving in (None, ""):
+        parts.append("solving time: — to fill in —")
+    else:
+        parts.append(f"solving time: {solving} min")
+
+    return "   " + " · ".join(parts)
+
+
+def _template_field(kind: str, node_id: str, option_id: str) -> str:
+    """
+    Текущее значение поля заготовки для подсказки.
+
+    Показывается в подсказке как «Current: …» — человек должен видеть, что
+    правит, а не заполнять поле вслепую. Пустое значение подсказка изобразит
+    прочерком (см. `_prompt_text`).
+    """
+    field = _TEMPLATE_FIELDS.get(kind)
+
+    if not field:
+        return ""
+
+    template_id = _linked_template_id(node_id, option_id)
+
+    if template_id in (None, ""):
+        return ""
+
+    value = _template_row(template_id).get(field)
+
+    return "" if value is None else str(value)
+
+
+def _apply_template_edit(kind: str, node_id: str, option_id: Optional[str], value: str,
+                         cleared: bool, sender) -> Tuple[bool, str, Optional[str]]:
+    """
+    Правка полей заготовки в `issue_templates` через карточку варианта.
+
+    Пустое поле очищается дефисом: «что было сделано» иногда надо стереть
+    целиком, а не оставить прежний текст. У `solving_time` дефис ставит `0` —
+    «время решения не задано» (в колонке `bigint` пустой строки быть не может).
+    """
+    if option_id is None:
+        return False, "⚠️ Option not found.", None
+
+    template_id = _linked_template_id(node_id, option_id)
+
+    # Связи нет — создаём заготовку по названию варианта. Так кнопка «Template»
+    # работает и для **встроенных** вариантов, заведённых до этой правки.
+    if template_id is None:
+        item = _selected_option_by_id(node_id, option_id)
+
+        if item is None:
+            return False, "⚠️ Option not found.", option_id
+
+        created = storage.create_template(
+            item["label"],
+            module=_module_for_label(node_id, item["label"]),
+            created_by=(sender or {}).get("id"),
+        )
+
+        if created is None:
+            return False, (
+                "⚠️ Could not create the issue template: the catalogue is "
+                "unavailable. Try again later."
+            ), option_id
+
+        storage.link_option_to_template(
+            node_id, option_id, created, updated_by=(sender or {}).get("id")
+        )
+        template_id = created
+
+    updated_by = (sender or {}).get("id")
+
+    if kind == KIND_TEMPLATE_MODULE:
+        ok = storage.update_template(
+            template_id,
+            module="" if cleared else value[:storage.MAX_TITLE_LENGTH],
+            updated_by=updated_by,
+        )
+
+        return ok, (
+            "✅ Template module cleared." if ok and cleared else
+            "✅ Template module saved." if ok else
+            "⚠️ Could not save the template module."
+        ), option_id
+
+    if kind == KIND_TEMPLATE_DESCRIPTION:
+        ok = storage.update_template(
+            template_id,
+            description="" if cleared else value[:storage.MAX_DESCRIPTION_LENGTH],
+            updated_by=updated_by,
+        )
+
+        return ok, (
+            "✅ Issue description cleared." if ok and cleared else
+            "✅ Issue description saved — it will be copied into the journal." if ok else
+            "⚠️ Could not save the issue description."
+        ), option_id
+
+    if kind == KIND_TEMPLATE_RECOVERY:
+        ok = storage.update_template(
+            template_id,
+            recovery="" if cleared else value[:storage.MAX_DESCRIPTION_LENGTH],
+            updated_by=updated_by,
+        )
+
+        return ok, (
+            "✅ “What was done” cleared." if ok and cleared else
+            "✅ “What was done” saved — it will be copied into the journal." if ok else
+            "⚠️ Could not save “what was done”."
+        ), option_id
+
+    if kind == KIND_TEMPLATE_SOLVING_TIME:
+        minutes = 0 if cleared else value
+
+        try:
+            number = max(0, int(float(str(minutes).strip())))
+        except (TypeError, ValueError):
+            return False, (
+                "⚠️ Solving time must be a number of minutes (for example: 6). "
+                "Send a single dash to clear it."
+            ), option_id
+
+        ok = storage.update_template(
+            template_id, solving_time=number, updated_by=updated_by
+        )
+
+        return ok, (
+            f"✅ Solving time saved: {number} min — the journal end time will be "
+            "start + this value." if ok else
+            "⚠️ Could not save the solving time."
+        ), option_id
+
+    return False, "⚠️ Unknown action.", option_id
+
+
 def _apply_edit(kind: str, node_id: str, option_id: Optional[str], value: str,
                 sender) -> Tuple[bool, str, Optional[str]]:
     """
@@ -1804,6 +2165,21 @@ def _apply_edit(kind: str, node_id: str, option_id: Optional[str], value: str,
         return False, "⚠️ Node not found.", None
 
     cleared = value == "-"
+
+    # ------------------------------------------------------------
+    # Поля ЗАГОТОВКИ (`issue_templates`) — связь с ошибкой дерева
+    # ------------------------------------------------------------
+    #
+    # Требование владельца 12.10.2026: «на сервере в столбцы с описанием ошибки
+    # что было сделано и тп». Сохраняем прямо в справочник: он и есть источник
+    # этих полей при подстановке в журнал.
+    if kind in (
+        KIND_TEMPLATE_MODULE,
+        KIND_TEMPLATE_DESCRIPTION,
+        KIND_TEMPLATE_RECOVERY,
+        KIND_TEMPLATE_SOLVING_TIME,
+    ):
+        return _apply_template_edit(kind, node_id, option_id, value, cleared, sender)
 
     if kind == KIND_ADD_LABEL:
         label = value[:storage.MAX_LABEL_LENGTH]
@@ -1822,10 +2198,52 @@ def _apply_edit(kind: str, node_id: str, option_id: Optional[str], value: str,
                 "is unavailable. Try a different name."
             ), None
 
+        # 🔴 **Заготовка в справочнике создаётся вместе с ошибкой.**
+        #
+        # Требование владельца 12.10.2026, дословно: «при добавление новой ошибки
+        # делать заготовку тоже чтобы потом были поля которые будут подставлены
+        # автоматически при копирование». Проверено на живой базе: у ошибок
+        # модулей шаблонов **не было вообще**, поэтому заготовка здесь — основной
+        # путь, а не удобство.
+        #
+        # Строка создаётся даже почти пустой (название и модуль): «что было
+        # сделано» и время решения знает человек, и выдумывать их нельзя.
+        module = _module_for_label(node_id, label)
+        template_id = None
+
+        try:
+            template_id = storage.create_template(
+                label, module=module, created_by=(sender or {}).get("id")
+            )
+
+            if template_id is not None:
+                storage.link_option_to_template(
+                    node_id, option_id_new, template_id,
+                    updated_by=(sender or {}).get("id"),
+                )
+        except Exception:  # noqa: BLE001
+            # Падение справочника не отменяет добавление ошибки: вариант уже
+            # сохранён и работает, связь можно поставить кнопкой «Template».
+            logger.exception(
+                "Equipment intake editor: не удалось создать заготовку для %r", label
+            )
+            template_id = None
+
+        if template_id is not None:
+            return True, (
+                f"✅ Option added: {label} (id: {option_id_new}).\n"
+                f"🧩 Issue template #{template_id} created and linked"
+                + (f" (module: {module})" if module else "")
+                + ".\nOpen its card to fill in the fields that will be copied "
+                "into the journal: issue description, what was done, solving time."
+            ), option_id_new
+
         return True, (
             f"✅ Option added: {label} (id: {option_id_new}). "
             "It is already available to employees at this step. "
-            "Open its card to change the target, description or icon."
+            "Open its card to change the target, description or icon.\n"
+            "⚠️ The issue template was not created (catalogue unavailable). "
+            "Use the card's “Template” button to create it later."
         ), option_id_new
 
     if option_id is None:
@@ -1920,7 +2338,18 @@ def _apply_edit(kind: str, node_id: str, option_id: Optional[str], value: str,
 def _back_to_screen(chat_id, sender, role: str, kind: str, node_id: str,
                     option_id: Optional[str], menu_message_id, notice: str) -> None:
     """Возвращает человека на экран, с которого он начал правку."""
-    if kind in (KIND_OPTION_LABEL, KIND_OPTION_DESCRIPTION, KIND_OPTION_ICON):
+    if kind in (
+        KIND_OPTION_LABEL,
+        KIND_OPTION_DESCRIPTION,
+        KIND_OPTION_ICON,
+        # Поля заготовки правятся из карточки варианта — возвращаем туда же,
+        # иначе после сохранения админ оказался бы на экране узла и потерял
+        # контекст, какой ошибке он заполняет поля.
+        KIND_TEMPLATE_MODULE,
+        KIND_TEMPLATE_DESCRIPTION,
+        KIND_TEMPLATE_RECOVERY,
+        KIND_TEMPLATE_SOLVING_TIME,
+    ):
         items = storage.effective_options(
             DEFAULT_TREE, node_id, storage.load_option_rows() or []
         )

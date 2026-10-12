@@ -53,18 +53,47 @@ ORDER_STEP = 10
 
 # Колонки v2 (после миграции) и v1 (до неё). Пробуем v2, при ошибке
 # откатываемся на v1: бот обязан работать и до применения SQL.
+#
+# **`template_id` — отдельный набор, а не часть v2.** Связь «ошибка дерева →
+# справочник `issue_templates`» приезжает **своей** миграцией (`0109`), отдельно
+# от колонок редактора v2. PostgREST отвергает запрос целиком, если в `select`
+# есть хотя бы одна неизвестная колонка, поэтому общий набор сделал бы так:
+# неприехавшая `0109` сняла бы заодно `is_builtin`/`hidden`/`sort_order`, и
+# редактор сообщил бы «база не готова» там, где на самом деле готова. Ровно на
+# этом уже теряли аналитику журнала (1663 строки без `cause`, см.
+# `report_writer.SPLIT_COLUMNS`) — второй раз тот же класс дефекта не заводим.
 _COLUMNS_V2 = (
     "node_id,option_id,label,next_node,description,icon,only_for,"
     "is_builtin,hidden,sort_order"
 )
+_COLUMNS_V2_LINK = _COLUMNS_V2 + ",template_id"
 _COLUMNS_V1 = "node_id,option_id,label,next_node,description,icon,only_for"
 _NODE_COLUMNS = "node_id,title,description,placeholder,stub_hint,next_node,hidden"
+
+#: Справочник готовых описаний ошибок — цель связи варианта дерева.
+TEMPLATES_TABLE = "issue_templates"
+
+#: Поля шаблона, которые читает и пишет редактор.
+TEMPLATE_COLUMNS = (
+    "id,employee_title,issue_type,issue_sub_type,issue_description,"
+    "recovery_title,solving_time,equipment_type"
+)
 
 # Насколько долго помним результат проверки «есть ли колонки v2». Короткий
 # TTL, чтобы после применения миграции бот подхватил её без перезапуска.
 _V2_TTL_SECONDS = 120
 _v2_state: Optional[bool] = None
 _v2_checked_at: float = 0.0
+
+#: Есть ли колонка связи `template_id` (миграция `0109`). **Отдельная память**:
+#: связь приезжает своей миграцией, и её отсутствие не должно выглядеть как
+#: «редактор не готов» (см. `_COLUMNS_V2`).
+_link_state: Optional[bool] = None
+_link_checked_at: float = 0.0
+
+#: Кэш карты `option_id → template_id` (см. `option_template_links`).
+_links_cache: Optional[Dict[str, Any]] = None
+_links_checked_at: float = 0.0
 
 _UNSET = object()
 
@@ -78,6 +107,14 @@ def _remember_v2(supported: bool) -> None:
 
     _v2_state = supported
     _v2_checked_at = time.time()
+
+
+def _remember_link(supported: bool) -> None:
+    """Запомнить, есть ли колонка связи (миграция `0109`)."""
+    global _link_state, _link_checked_at
+
+    _link_state = supported
+    _link_checked_at = time.time()
 
 
 def _v2_known_unsupported() -> bool:
@@ -97,22 +134,42 @@ def _v2_known_unsupported() -> bool:
 
 
 def _read_options() -> Optional[List[dict]]:
-    """Строки оверлея вариантов. None — база недоступна."""
+    """Строки оверлея вариантов. None — база недоступна.
+
+    **Порядок проб — от полного набора к усечённому.** Сначала v2 со ссылкой на
+    шаблон (`0109`), затем v2 без неё, затем v1. Каждый промах ожидаем: наборы
+    приезжают разными миграциями, и более новый не должен прятать более старый
+    (см. комментарий у `_COLUMNS_V2`).
+    """
     from sendToDataBase import rest_get
 
     # Если уже знаем, что v2-колонок нет, идём сразу к v1: иначе каждый вызов
     # даёт ожидаемую ошибку 400 в логе.
     if not _v2_known_unsupported():
-        # `optional=True`: отсутствие колонок v2 — ожидаемое состояние, пока
+        order = "node_id.asc,sort_order.asc,id.asc"
+
+        # `optional=True`: отсутствие колонок — ожидаемое состояние, пока
         # миграция не применена. Иначе каждый прогон проверки даёт ERROR.
         rows = rest_get(
             OPTION_TABLE,
-            {"select": _COLUMNS_V2, "order": "node_id.asc,sort_order.asc,id.asc"},
+            {"select": _COLUMNS_V2_LINK, "order": order},
             optional=True,
         )
 
         if rows is not None:
             _remember_v2(True)
+            _remember_link(True)
+            return [row for row in rows if isinstance(row, dict)]
+
+        rows = rest_get(
+            OPTION_TABLE,
+            {"select": _COLUMNS_V2, "order": order},
+            optional=True,
+        )
+
+        if rows is not None:
+            _remember_v2(True)
+            _remember_link(False)
             return [row for row in rows if isinstance(row, dict)]
 
         _remember_v2(False)
@@ -201,10 +258,376 @@ def overlay_supported() -> bool:
 
 def reset_capability_cache() -> None:
     """Сброс памяти о возможностях схемы — только для тестов."""
-    global _v2_state, _v2_checked_at
+    global _v2_state, _v2_checked_at, _link_state, _link_checked_at
 
     _v2_state = None
     _v2_checked_at = 0.0
+    _link_state = None
+    _link_checked_at = 0.0
+    reset_links_cache()
+
+
+# ============================================================
+# СВЯЗЬ СО СПРАВОЧНИКОМ `issue_templates`
+# ============================================================
+
+def link_supported() -> bool:
+    """
+    Есть ли колонка связи `template_id` (миграция `0109`).
+
+    **Отдельная проверка, а не общая с v2.** Наборы колонок приезжают разными
+    миграциями, и PostgREST отвергает запрос целиком из-за одной неизвестной
+    колонки. Общая проверка означала бы: нет `0109` — «редактор не готов»,
+    хотя правки дерева работают. Этот класс дефекта уже стоил аналитики журнала
+    (1663 строки без причины), поэтому память здесь своя.
+    """
+    global _link_state, _link_checked_at
+
+    if _link_state is not None and time.time() - _link_checked_at < _V2_TTL_SECONDS:
+        return _link_state
+
+    from sendToDataBase import rest_get
+
+    rows = rest_get(
+        OPTION_TABLE, {"select": "template_id", "limit": "1"}, optional=True
+    )
+    supported = rows is not None
+    _remember_link(supported)
+
+    if not supported:
+        logger.warning(
+            "intake storage: колонки template_id нет — примените миграцию "
+            "0109_intake_option_templates.sql, чтобы связать ошибки дерева "
+            "со справочником шаблонов"
+        )
+
+    return supported
+
+
+def load_templates() -> List[dict]:
+    """
+    Строки справочника `issue_templates`.
+
+    Пустой список — это **и** «шаблонов нет», **и** «база недоступна»: для
+    показа списка и выбора это одно и то же (нечего показать), а различать их
+    вызывающий код не обязан. Различие важно только при **записи**, и там оно
+    проверяется по результату самой записи.
+    """
+    from sendToDataBase import rest_get
+
+    rows = rest_get(
+        TEMPLATES_TABLE,
+        {"select": TEMPLATE_COLUMNS, "order": "employee_title.asc", "limit": "500"},
+        optional=True,
+    )
+
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def option_template_links() -> Dict[str, Any]:
+    """
+    Карта `option_id → template_id` по строкам оверлея.
+
+    Нужна писателю журнала: при выборе ошибки он обязан взять **точную** связь,
+    а не подбирать шаблон по тексту. Ошибка чтения — пустая карта (подбор
+    остаётся запасным путём, как и раньше).
+
+    **Кэш на 2 минуты.** Карта нужна на каждом отчёте, а дерево меняется редко;
+    без кэша каждая запись делала бы лишнее чтение всей таблицы вариантов в
+    момент приёма. TTL короткий по той же причине, что у остальных проверок
+    схемы: связанный в редакторе шаблон должен заработать без перезапуска бота.
+    """
+    global _links_cache, _links_checked_at
+
+    now = time.time()
+
+    if _links_cache is not None and now - _links_checked_at < _V2_TTL_SECONDS:
+        return dict(_links_cache)
+
+    links: Dict[str, Any] = {}
+
+    try:
+        rows = _read_options() or []
+    except Exception:  # noqa: BLE001
+        logger.exception("intake storage: не удалось прочитать связи вариантов")
+        return links
+
+    for row in rows:
+        option_id = str(row.get("option_id") or "")
+        template_id = row.get("template_id")
+
+        if option_id and template_id not in (None, ""):
+            links[option_id] = template_id
+
+    _links_cache = dict(links)
+    _links_checked_at = now
+
+    return links
+
+
+def reset_links_cache() -> None:
+    """Сброс кэша связей — только для тестов и после правки связи в редакторе."""
+    global _links_cache, _links_checked_at
+
+    _links_cache = None
+    _links_checked_at = 0.0
+
+
+def create_template(
+    label: str,
+    module: str = "",
+    description: str = "",
+    recovery: str = "",
+    solving_time=None,
+    created_by=None,
+) -> Optional[int]:
+    """
+    Заводит **заготовку** в `issue_templates` и возвращает её id.
+
+    Требование владельца 12.10.2026: при добавлении новой ошибки бот должен
+    сразу создать заготовку, «чтобы потом были поля которые будут подставлены
+    автоматически». Поэтому строка создаётся **всегда**, даже если человек
+    ничего не заполнил кроме названия: пустые поля допустимы, их дозаполнят.
+
+    **Что заполняется, а что нет.** Название (его ввёл человек) и модуль
+    (следует из узла) — заполняются; `issue_description` дублирует название,
+    потому что оно и есть описание ошибки словами владельца. `recovery_title` и
+    `solving_time` остаются пустыми: «что было сделано» и время решения знает
+    только человек, а выдуманное число испортило бы метрику «сколько решается
+    ошибка» (в справочнике значения 2–8 минут).
+
+    `None` — заготовка не создалась (база недоступна или запись отвергнута).
+    Вызывающий код в этом случае **всё равно** добавляет вариант: ошибка не
+    должна пропасть из дерева из-за недоступного справочника.
+    """
+    from equipment_intake.error_templates import stub_row
+
+    row = stub_row(label, module=module, created_by=created_by)
+
+    if not row.get("employee_title"):
+        return None
+
+    if description:
+        row["issue_description"] = _clean(description, MAX_DESCRIPTION_LENGTH)
+
+    if recovery:
+        row["recovery_title"] = _clean(recovery, MAX_DESCRIPTION_LENGTH)
+
+    if solving_time not in (None, ""):
+        row["solving_time"] = _solving_time(solving_time)
+
+    # Пустое значение в справочнике — это `NULL`, а не пустая строка: `example`
+    # показал бы «поле есть, но пустое» там, где значение не задавали.
+    row = {key: value for key, value in row.items() if value != ""}
+
+    from sendToDataBase import rest_post
+
+    created = rest_post(TEMPLATES_TABLE, row)
+
+    if not created:
+        logger.error(
+            "intake storage: не удалось создать заготовку шаблона %r", label
+        )
+        return None
+
+    if isinstance(created, list):
+        first = created[0] if created else None
+    else:
+        first = created
+
+    template_id = (first or {}).get("id") if isinstance(first, dict) else None
+
+    if template_id is None:
+        # `rest_post` вернул успех без тела (или без `id`) — заготовку не
+        # теряем: находим её по названию, единственному уникальному полю
+        # справочника (проверено: 0 дублей на 29 записях).
+        template_id = find_template_id(label)
+
+    if template_id is not None:
+        logger.info(
+            "intake storage: создана заготовка шаблона %r (id=%s, модуль=%r)",
+            label, template_id, module or "—",
+        )
+
+    return template_id
+
+
+def find_template_id(title: str) -> Optional[int]:
+    """id шаблона по точному названию, или `None`."""
+    from sendToDataBase import rest_get
+
+    wanted = str(title or "").strip()
+
+    if not wanted:
+        return None
+
+    rows = rest_get(
+        TEMPLATES_TABLE,
+        {"select": "id", "employee_title": f"eq.{wanted}", "limit": "1"},
+        optional=True,
+    )
+
+    if not rows:
+        return None
+
+    first = rows[0] if isinstance(rows, list) else rows
+    value = (first or {}).get("id") if isinstance(first, dict) else None
+
+    return value
+
+
+def update_template(
+    template_id,
+    title=_UNSET,
+    module=_UNSET,
+    description=_UNSET,
+    recovery=_UNSET,
+    solving_time=_UNSET,
+    updated_by=None,
+) -> bool:
+    """
+    Правка полей заготовки из редактора.
+
+    **Только переданные поля.** `_UNSET` означает «не трогать»: редактор
+    (`editor.py`) правит по одному полю за раз, и запись всего объекта затирала
+    бы соседние значения — этот дефект уже был у правки узлов и исправлен там
+    тем же приёмом.
+
+    Пустая строка — «очищено» и остаётся пустой; `solving_time` приводится к
+    целому (в колонке `bigint`, и мусор из справочника не должен ронять
+    сохранение).
+    """
+    if template_id in (None, ""):
+        return False
+
+    from sendToDataBase import rest_patch
+
+    payload: Dict[str, Any] = {}
+
+    if title is not _UNSET:
+        value = _clean(title, MAX_TITLE_LENGTH)
+
+        if not value:
+            return False
+
+        payload["employee_title"] = value
+
+    if module is not _UNSET:
+        payload["issue_type"] = _clean(module, MAX_TITLE_LENGTH)
+
+    if description is not _UNSET:
+        payload["issue_description"] = _clean(description, MAX_DESCRIPTION_LENGTH)
+
+    if recovery is not _UNSET:
+        payload["recovery_title"] = _clean(recovery, MAX_DESCRIPTION_LENGTH)
+
+    if solving_time is not _UNSET:
+        payload["solving_time"] = _solving_time(solving_time)
+
+    if not payload:
+        return False
+
+    if updated_by is not None:
+        payload["updated_by"] = updated_by
+
+    updated = rest_patch(
+        TEMPLATES_TABLE, params={"id": f"eq.{template_id}"}, payload=payload
+    )
+
+    if not updated:
+        logger.error(
+            "intake storage: не удалось сохранить шаблон id=%s (%s)",
+            template_id, ", ".join(payload),
+        )
+        return False
+
+    logger.info(
+        "intake storage: шаблон id=%s обновлён (%s)", template_id, ", ".join(payload)
+    )
+
+    return True
+
+
+def _solving_time(value) -> int:
+    """
+    Время решения в минутах — целое, неотрицательное.
+
+    Нечисловое значение приводим к нулю, а не роняем сохранение: испорченная
+    строка справочника не повод отказать человеку в правке. Формула совпадает с
+    `report_writer._solving_time` намеренно — у одной колонки не должно быть
+    двух разных способов приведения.
+    """
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def link_option_to_template(
+    node_id: str, option_id: str, template_id, base: DecisionTree = None,
+    updated_by=None,
+) -> bool:
+    """
+    Связать вариант дерева с шаблоном (снять связь — `template_id=None`).
+
+    Это **точная** связь, заменяющая подбор по тексту. Она же нужна кнопке
+    «выбрать шаблон» в карточке варианта: админ указывает, какая заготовка
+    соответствует ошибке, и при выборе ошибки поля подставляются автоматически.
+    """
+    if not link_supported():
+        return False
+
+    base = base or DEFAULT_TREE
+
+    if base.node(node_id) is None:
+        return False
+
+    current = effective_options(base, node_id, _read_options() or [])
+    entry = next((item for item in current if item["id"] == option_id), None)
+
+    if entry is None:
+        return False
+
+    row: Dict[str, Any] = {
+        "node_id": node_id,
+        "option_id": option_id,
+        "label": entry["label"],
+        "next_node": entry["next_node"],
+        "description": entry["description"],
+        "icon": entry["icon"],
+        "only_for": list(entry["only_for"]),
+        "is_builtin": bool(entry["is_builtin"]),
+        "hidden": bool(entry["hidden"]),
+        "sort_order": entry["index"] * ORDER_STEP + ORDER_STEP,
+        "template_id": template_id if template_id not in (None, "") else None,
+    }
+
+    if updated_by is not None:
+        row["updated_by"] = str(updated_by)
+
+    saved = _upsert_option_row(row)
+
+    if saved:
+        logger.info(
+            "intake storage: вариант %s узла %s связан с шаблоном %s",
+            option_id, node_id, row["template_id"],
+        )
+
+    return saved
+
+
+def option_template_id(node_id: str, option_id: str, base: DecisionTree = None):
+    """`template_id` варианта, или `None` (нет связи либо нет колонки)."""
+    base = base or DEFAULT_TREE
+
+    for row in _read_options() or []:
+        if (
+            str(row.get("node_id")) == str(node_id)
+            and str(row.get("option_id")) == str(option_id)
+        ):
+            return row.get("template_id")
+
+    return None
 
 
 # ============================================================
@@ -245,7 +668,12 @@ def effective_options(
     Каждый элемент:
         id, label, next_node, description, icon, only_for,
         is_builtin, hidden, kind ("builtin" | "edited" | "added"),
-        index (позиция в списке).
+        index (позиция в списке), template_id (связь со справочником).
+
+    `template_id` идёт из строки-переопределения. У встроенного варианта без
+    строки он `None` — но связь всё равно может быть найдена по карте
+    `error_templates.py`; здесь показывается только то, что явно записано в базе,
+    чтобы редактор не выдавал догадку за сохранённую связь.
     """
     node = base.node(node_id)
 
@@ -294,6 +722,9 @@ def effective_options(
             "is_builtin": True,
             "hidden": hidden,
             "kind": "edited" if row else "builtin",
+            # Связь со справочником шаблонов (миграция `0109`). У строки без
+            # колонки (старая база) её просто нет — `None`, а не выдумка.
+            "template_id": row.get("template_id") if row else None,
         }))
         sequence += 1
 
@@ -332,6 +763,7 @@ def effective_options(
             "is_builtin": False,
             "hidden": _row_hidden(row),
             "kind": "added",
+            "template_id": row.get("template_id"),
         }))
         sequence += 1
 
@@ -724,6 +1156,18 @@ def update_option(
         "sort_order": entry["index"] * ORDER_STEP + ORDER_STEP,
     }
 
+    # 🔴 **`template_id` здесь НЕ пишется — и это осознанно.**
+    #
+    # Связь со шаблоном при правке других полей не теряется: `rest_upsert` идёт
+    # через `resolution=merge-duplicates`, то есть `insert … on conflict do update`
+    # со **списком колонок из payload**. Незаписанная колонка остаётся прежней.
+    #
+    # Я сначала добавил сюда `row["template_id"] = entry["template_id"]` — и
+    # негативная проверка показала, что удаление этой строки ничего не меняет.
+    # Значит, строка была не защитой, а **риском**: `entry` приходит из кэша
+    # чтения, и устаревшее значение перезаписало бы свежую связь, выставленную в
+    # редакторе. Единственное место, где `template_id` пишется, —
+    # `link_option_to_template`, и только явным выбором человека.
     if updated_by is not None:
         row["updated_by"] = str(updated_by)
 
@@ -823,6 +1267,9 @@ def move_option(
             "updated_by": str(updated_by) if updated_by is not None else None,
         }
 
+        # `template_id` здесь тоже **не** пишется: `merge-duplicates` сохраняет
+        # незаписанные колонки, а значение из кэша чтения могло бы откатить
+        # свежую связь (разбор — в `update_option`).
         if not _upsert_option_row(row):
             # Частичный порядок хуже старого: сообщаем о неудаче наверх.
             logger.error(

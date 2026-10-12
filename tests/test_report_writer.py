@@ -2005,6 +2005,10 @@ class ConfirmationTextChecks(unittest.TestCase):
         session.select("robot")
         session.select("k50h")
         session.select("safety")
+        # **Слой ошибок 12.10.2026.** Между модулем и номером выбирается
+        # ошибка; без неё путь не завершается (`Confirm` справедливо откажет),
+        # потому что сессия останется на узле `robot_errors_safety`.
+        session.select("safety_front_button")
         session.submit_text("3780")
         session.submit_text("Lift reports an error")
         session.select("obstacle")
@@ -2101,7 +2105,7 @@ class TelegramConfirmationCardChecks(unittest.TestCase):
                 "thread_id": 318,
             }
         )
-        for step in ("robot", "a42t_c2", "lifting"):
+        for step in ("robot", "a42t_c2", "lifting", "lift_cant_lift"):
             session.select(step)
 
         session.submit_text("3490")
@@ -2754,7 +2758,7 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety"):
+        for step in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(step)
         session.submit_text("3780")
         session.submit_text("Lift reports an error")
@@ -2965,7 +2969,7 @@ class ConfirmShowsProgress(unittest.TestCase):
         from equipment_intake.tree_config import DEFAULT_TREE
 
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety"):
+        for step in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(step)
         session.submit_text("3780")
         session.submit_text("Lift reports an error")

@@ -106,29 +106,49 @@ class BranchDependentHintChecks(unittest.TestCase):
         self.assertNotIn("3780", hint, "вернулся пример номера робота")
 
     def test_robot_branch_still_hints_a_robot_number(self):
-        """Ветка робота не должна потерять свой пример — проверка обеих сторон."""
-        hint = self.hint(["robot", "a42t", "lifting"])
+        """Ветка робота не должна потерять свой пример — проверка обеих сторон.
+
+        **Путь изменился 12.10.2026:** между модулем и номером появился выбор
+        **ошибки**, поэтому модель и модуль теперь надо отвечать вместе с ней.
+        Прежний `["robot", "a42t", "lifting"]` останавливался на узле ошибок, и
+        `text_example()` был пуст.
+        """
+        hint = self.hint(["robot", "a42t", "lifting", "lift_cant_lift"])
 
         self.assertIn("3780", hint)
         self.assertIn("H108/1834", hint)
 
-    def test_charging_branch_hints_a_station_number(self):
-        hint = self.hint(["charger", "cs_k50h"])
+    def test_closed_branches_do_not_ask_for_a_number(self):
+        """Закрытые ветки **не спрашивают номер**: диалог по ним не идёт.
 
-        self.assertIn("137", hint)
-        self.assertNotIn("SS512", hint)
+        Решение владельца 12.10.2026: Workstation и Charging station «ПОКА НЕ
+        РАБОТАЮТ». Прежние проверки требовали, чтобы эти ветки подсказывали
+        номер станции (`137`) и код рабочей станции (`C2-H143`). Ожидание
+        изменено: теперь выбор категории показывает сообщение о недоступности и
+        останавливается — номера в этих ветках нет вовсе.
+        """
+        for option in ("workstation", "charger"):
+            with self.subTest(option=option):
+                session = Session(tree=DEFAULT_TREE)
+                session.select(option)
 
-    def test_workstation_branch_hints_a_workstation_code(self):
-        hint = self.hint(["workstation", "ws_pick", "offline"])
-
-        self.assertIn("C2-H143", hint)
+                self.assertFalse(session.is_number_step())
+                self.assertIsNone(session.current_node().options or None)
+                self.assertEqual(session.text_example(), "")
+                self.assertIn("not available yet", session.current_node().description)
 
     def test_every_branch_has_its_own_kind(self):
-        """Вид номера различается по веткам — иначе подсказка снова станет общей."""
+        """Вид номера различается по веткам — иначе подсказка снова станет общей.
+
+        **Ожидание изменилось 12.10.2026.** Ветки рабочей станции и зарядки
+        закрыты владельцем, поэтому номер по ним не вводится: проверять на них
+        «вид номера» больше нечего. Зарядная ветка осталась в карте кода (она
+        вернётся), и её вид проверяется **напрямую** по карте, а не через дерево.
+        """
         cases = {
             ("robot", "a42t"): v.KIND_ROBOT,
-            ("workstation", "ws_pick"): v.KIND_WORKSTATION,
-            ("charger", "cs_k50h"): v.KIND_STATION,
+            ("robot", "k50h", "safety", "safety_bumper"): v.KIND_ROBOT,
+            ("robot", "a42t_c2", "tray", "tray_cant_extend"): v.KIND_ROBOT,
             ("qr", "qr_floor"): v.KIND_QR_FLOOR,
             ("qr", "qr_shelf"): v.KIND_QR_SHELF,
         }
@@ -141,6 +161,20 @@ class BranchDependentHintChecks(unittest.TestCase):
                     session.select(option)
 
                 self.assertEqual(session.answer_kind(), expected)
+
+    def test_error_step_keeps_the_robot_number_kind(self):
+        """Ошибка модуля — самый глубокий шаг, и номер на ней остаётся робочим.
+
+        Вид номера ищется от последнего шага пути к первому. Без явной записи об
+        ошибках в карте (`_NUMBER_KIND_BY_OPTION`) вид брался бы у модели выше —
+        сегодня это тот же `robot`, но ветка «ошибка → номер» не должна зависеть
+        от того, что модель случайно тоже робот.
+        """
+        from equipment_intake.tree_config import number_kind_for
+
+        step = mock.Mock(option_id="safety_front_button")
+
+        self.assertEqual(number_kind_for([step], None), v.KIND_ROBOT)
 
     def test_examples_are_not_all_the_same(self):
         """Разные ветки — разные примеры: общий `placeholder` и был дефектом."""
@@ -270,7 +304,8 @@ class FormatValidationChecks(unittest.TestCase):
         """Свободный текст описания проверять нельзя — иначе отчёт не сдать."""
         session = Session(tree=DEFAULT_TREE)
 
-        for option in ("robot", "k50h", "safety"):
+        # Путь изменился 12.10.2026: между модулем и номером стоит выбор ошибки.
+        for option in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(option)
 
         session.submit_text("3780")
@@ -373,44 +408,66 @@ class RegistryLookupChecks(unittest.TestCase):
 # ============================================================
 
 class ChargingOrderChecks(unittest.TestCase):
+    """Зарядная ветка **закрыта** владельцем, но её машинерия цела.
+
+    **Что изменилось 12.10.2026.** Решение владельца: «Workstation и Charging
+    Station ПОКА НЕ РАБОТАЮТ». Прежние проверки ходили по дереву
+    (`charger → cs_k50h → ask_number → ask_charging_robot`) и требовали двух
+    номеров. Идти этим путём больше нельзя — выбор категории останавливает
+    диалог.
+
+    **Почему проверки не удалены, а переписаны.** Порядок «станция, потом
+    робот» — требование владельца и часть контракта записи: станция идёт в
+    `device_number`, робот — в `robot_number`. Когда ветку вернут, регресс
+    должен ловиться сразу, поэтому здесь сторожатся **обе** стороны:
+    1) по дереву зарядка не проходит; 2) вид номера и запись двух колонок
+    по-прежнему работают (`test_writer_files_both_numbers` ниже — без дерева).
+    """
+
     def setUp(self):
         """Изоляция от загрязнения `sys.modules` чужими тестами."""
         restore_real_send_to_database()
 
-    """Владелец: «сначала спрашиваем зарядку потом номер робота»."""
-
     def walk(self):
+        """Путь зарядки в дереве: доходит до узла «недоступно» и стоит."""
         session = Session(tree=DEFAULT_TREE)
         session.select("charger")
-        session.select("cs_k50h")
         return session
 
-    def test_station_is_asked_first(self):
+    def test_charging_branch_stops_at_the_unavailable_node(self):
+        """Выбор зарядки показывает отказ и **не** спрашивает номер."""
         session = self.walk()
 
-        self.assertEqual(session.current_id, "ask_number")
-        self.assertEqual(session.answer_kind(), v.KIND_STATION)
+        self.assertEqual(session.current_id, "charging_unavailable")
+        self.assertFalse(session.is_number_step())
+        self.assertFalse(session.is_text_step())
+        self.assertIn("not available yet", session.current_node().description)
 
-    def test_robot_is_asked_after_the_station(self):
-        session = self.walk()
-        session.submit_text("137")
-
-        self.assertEqual(session.current_id, "ask_charging_robot")
-        self.assertEqual(session.answer_kind(), v.KIND_ROBOT)
-
-    def test_both_numbers_reach_the_record(self):
-        session = self.walk()
-        session.submit_text("137")
-        session.submit_text("3780")
-
-        self.assertEqual(session.answers()["device_number"], "137")
-        self.assertEqual(session.answers()["error_robot"], "3780")
-
-    def test_station_number_is_still_format_checked(self):
+    def test_charging_branch_cannot_be_continued(self):
+        """Из закрытой ветки нельзя ни выбрать вариант, ни ввести текст."""
         session = self.walk()
 
         with self.assertRaises(EngineError):
-            session.submit_text("3780 robot")
+            session.select("cs_k50h")
+
+        with self.assertRaises(EngineError):
+            session.submit_text("137")
+
+    def test_station_kind_is_still_known_to_the_code(self):
+        """Вид `station` не потерян: карта веток и проверка формата на месте.
+
+        Это то, что вернётся вместе с веткой. Проверяем напрямую, потому что
+        через дерево до номера станции теперь не дойти.
+        """
+        from equipment_intake.tree_config import number_kind_for
+
+        # Вид задаёт **ветка**, а не конкретная подмарка станции: в карте стоит
+        # `charger`, и он же перекрывает `cs_k50h`/`cs_a42t_c2` ниже по пути.
+        step = mock.Mock(option_id="charger")
+
+        self.assertEqual(number_kind_for([step], None), v.KIND_STATION)
+        self.assertIsNone(v.validate_format(v.KIND_STATION, "137"))
+        self.assertIsNotNone(v.validate_format(v.KIND_STATION, "3780 robot"))
 
     def test_writer_files_both_numbers(self):
         """Станция — в `device_number`, робот — в `robot_number`."""
@@ -594,7 +651,8 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        for option in ("robot", "k50h", "safety"):
+        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
+        for option in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(option)
 
         session.submit_text("3780")
@@ -623,7 +681,8 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        for option in ("robot", "k50h", "safety"):
+        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
+        for option in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(option)
 
         session.submit_text("9999")
@@ -655,7 +714,8 @@ class ReviewMarkingChecks(unittest.TestCase):
 
         session = Session(tree=DEFAULT_TREE)
 
-        for option in ("robot", "k50h", "safety"):
+        # Слой ошибок (12.10.2026): между модулем и номером выбирается ошибка.
+        for option in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(option)
 
         session.submit_text("9999")

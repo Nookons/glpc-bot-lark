@@ -36,9 +36,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from equipment_intake.template_match import match_template
+from equipment_intake.template_match import (  # noqa: F401  (см. ниже)
+    match_template,
+    resolve_with_source,
+)
 from shift import WARSAW_TZ, get_current_shift
 from warehouses import WAREHOUSES
+
+# `match_template` в этом модуле намеренно оставлен **реэкспортом**, хотя сам
+# `report_writer` его больше не зовёт напрямую (подбор целиком живёт в
+# `resolve_with_source`). На `rw.match_template` смотрят тесты как на **шов**:
+# `tests/test_report_writer.py`, `tests/test_intake_validation.py` подменяют его,
+# чтобы отключить подбор и проверить остальную запись. Убрать имя значило бы
+# разом переписать десяток чужих тестов и потерять эту точку управления.
 
 logger = logging.getLogger(__name__)
 
@@ -867,7 +877,13 @@ def build_rows(
     # `issue_description` остаётся **сырым текстом оператора** — для истории и
     # разбора. Склейку в него больше не пишем: значения уже в своих колонках, а
     # повторять их здесь значило бы вернуть ту самую проблему.
+    #
+    # **Исключение — точная связь с заготовкой.** Тогда описание ошибки берётся
+    # из шаблона (см. `raw_description` ниже): владелец просил, чтобы поля
+    # «подставлялись автоматически», и описание ошибки — первое из них. Текст
+    # оператора при этом не теряется: он лежит в `reported_error`.
     details = [reported_error] if reported_error else []
+    linked_description = None
 
     # `add_by` is the employee's `card_id`, which the caller already resolved
     # while looking the name up. It stays None when the account is not linked or
@@ -875,18 +891,63 @@ def build_rows(
     # `employee` does. A missing card is acceptable; an invented one is not.
     card_id = _card_id(result.get("employee_card_id"))
 
-    # Подбор готового описания ошибки из справочника. Раньше сюда шёл сырой текст
+    # **Готовое описание ошибки из справочника.** Раньше сюда шёл сырой текст
     # оператора: `first_column` и `issue_type` дублировали категорию оборудования
     # («robot» = «robot»), `recovery_title` был пуст, `solving_time` равен нулю.
     # Из-за этого строки приёма нельзя было ни группировать по типу ошибки, ни
     # считать время решения. Проверено на живой базе 05.10.2026: так выглядели
     # все 246 строк бота.
     #
-    # `match_template` возвращает `None`, когда уверенного совпадения нет, — и
-    # тогда остаются прежние значения. Выдумывать шаблон нельзя: пустая колонка
-    # честнее ошибки, отнесённой не к тому типу.
-    template = match_template(answers.get("description"), load_templates())
+    # 🔴 **Порядок изменился 12.10.2026 — точная связь важнее подбора.**
+    #
+    # Требование владельца, дословно: «нужно сделать связь как-то и при добавление
+    # новой ошибки делать заготовку тоже чтобы потом были поля которые будут
+    # подставлены автоматически». Поэтому сначала берётся **связь** варианта
+    # дерева с шаблоном (`option_id` → `telegram_intake_options.template_id`, её
+    # задаёт редактор `/tree`, плюс карта `error_templates.py` для контракта
+    # узлов `robot_errors_*`), и только если связи нет — прежний подбор по тексту.
+    #
+    # **Почему связь вообще понадобилась.** Подбор даёт «лучшее приближение», и у
+    # шаблонов-дублей он ошибается: у id 5 «Driver component exception» и id 10
+    # «Speed error» совпадает `issue_sub_type`, и оператор писал «driver component
+    # exception», а в журнал попадало `Speed error`. Связь по id такой
+    # неоднозначности не оставляет (разбор дублей — в `error_templates.py`).
+    #
+    # Подбор **не выброшен**: у старых и нетиповых путей `option_id` нет, и
+    # «оставить как было» безопаснее, чем потерять шаблон вовсе.
+    steps = result.get("path") or []
+
+    # Связь читается **лениво**: `storage` тянет за собой дерево и его чтение, а
+    # писателю журнала они нужны только ради карты связей. Ошибка чтения связи —
+    # не повод не записать отчёт: `option_template_links` возвращает пустую карту,
+    # и подбор по тексту остаётся запасным путём.
+    try:
+        from equipment_intake.storage import option_template_links
+
+        option_links = option_template_links()
+    except Exception:  # noqa: BLE001
+        logger.exception("intake journal: не удалось прочитать связи вариантов")
+        option_links = {}
+
+    template, template_source = resolve_with_source(
+        answers.get("description"),
+        load_templates(),
+        steps=steps,
+        option_links=option_links,
+        # Шов намеренно проходит через **модуль**: тесты подменяют
+        # `rw.match_template`, и без явной передачи они бы перестали отключать
+        # подбор (см. докстроку `resolve_with_source`).
+        text_matcher=match_template,
+    )
     template_columns = _template_values(template, category, module, device_type)
+
+    # Описание ошибки для колонки журнала — **только при точной связи**. У
+    # заготовок оно равно названию ошибки словами владельца; у шаблонов с
+    # заполненным `issue_description` берётся оно. Пустое значение означает
+    # «шаблон не описал ошибку», и тогда остаётся текст оператора: подставлять
+    # пустоту вместо реального текста было бы потерей данных.
+    if template_source == "link" and template is not None:
+        linked_description = str(template.get("issue_description") or "").strip() or None
 
     # Время решения берём из шаблона; конец ошибки считается по конвенции
     # журнала (`error_end_time = error_start_time + solving_time`), проверенной
@@ -958,15 +1019,27 @@ def build_rows(
             "end_time": error_end.isoformat(),
             "start_time": received.isoformat(),
             "raw_fault": template_columns["raw_fault"],
-            # Сырой текст оператора остаётся здесь целиком и **не** подменяется
-            # шаблоном: это единственное место, где видно, что именно написал
-            # человек. То же описание дублируется в `telegram_equipment_reports`
-            # (`description`), поэтому подбор ничего не теряет.
+            # **Описание ошибки из шаблона — но только при ТОЧНОЙ связи.**
             #
-            # С 11.10.2026 склейки здесь **нет**: `reported_error` содержит текст
-            # оператора, а три остальных значения уехали в свои колонки
-            # (`reported_type`, `device_number`, `module_text`).
-            "raw_description": "\n".join(row_details) or None,
+            # Требование владельца 12.10.2026: «на сервере в столбцы с описанием
+            # ошибки что было сделано и тп». `raw_description` — та самая колонка
+            # «问题描述 Issue Description» в выгрузке смены (`tk-new`,
+            # `export-columns.ts`), и читатели предпочитают её справочнику
+            # (`exception_rows.py`): снимок важнее ссылки.
+            #
+            # Поэтому при связи по `option_id` сюда встаёт **описание из
+            # шаблона**, а сырой текст оператора остаётся в `reported_error` — он
+            # никуда не девается и виден в разборе.
+            #
+            # **Почему не всегда.** При подборе по тексту уверенности нет, и
+            # подставить описание «похожего» шаблона значило бы выдать догадку за
+            # факт. Там поведение прежнее — сырой текст оператора.
+            #
+            # С 11.10.2026 склейки здесь **нет** ни в одном из случаев:
+            # `reported_error` содержит текст оператора, а три остальных значения
+            # уехали в свои колонки (`reported_type`, `device_number`,
+            # `module_text`).
+            "raw_description": linked_description or "\n".join(row_details) or None,
             "equipment_category": template_columns["equipment_category"],
             "template_id": template_columns["template_id"],
             "photo_url": result.get("photo_url") or None,

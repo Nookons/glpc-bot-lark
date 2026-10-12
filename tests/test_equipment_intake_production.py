@@ -341,14 +341,18 @@ class IntegrationChecks(unittest.TestCase):
                  get_employee_name=lambda _: "Smoke User")}):
             self.assertTrue(flow.start(-100123, sender, "/tmp/photo.jpg", 777, warehouse="GLP-C"))
 
-            # Путь: робот → модель → модуль → **номер → описание → причина**.
-            # Вопрос о причине добавлен 07.10.2026 («добавить причину ошибки как
-            # ещё один вопрос»), поэтому шагов стало на один больше.
+            # Путь: робот → модель → модуль → **ошибка** → номер → описание →
+            # причина.
+            #
+            # **Слой ошибок добавлен 12.10.2026.** До него модуль вёл прямо на
+            # номер, и «что сломалось» оператор описывал только текстом. Теперь
+            # между модулем и номером стоит выбор ошибки, и без него путь не
+            # заканчивается: сессия осталась бы на `robot_errors_lift`.
             #
             # **Порядок важен:** причина спрашивается **после** описания. Первая
             # версия этого теста отвечала причину перед номером, и сессия не
             # завершалась — шаг причины оставался неотвеченным.
-            for option in ("robot", "a42t_c2", "lifting"):
+            for option in ("robot", "a42t_c2", "lifting", "lift_cant_lift"):
                 self.assertTrue(flow.handle_callback(-100123, sender, ["dt", "s", option], 900, "cb"))
 
             # Номер робота — формат ветки: только цифры (или `H`+цифры).
@@ -364,6 +368,10 @@ class IntegrationChecks(unittest.TestCase):
             self.assertTrue(session.is_completed)
             self.assertEqual(session.result()["answers"], {
                 "object": "Robot", "device_type": "A42T C2", "module": "Lifting",
+                # **Ошибка модуля — свой ответ** (12.10.2026). Это то, ради чего
+                # строился слой: раньше её не было, и «что сломалось» жило только
+                # в свободном тексте.
+                "error": "Can't lift up/down the fork",
                 "device_number": "9182", "description": "Lift reports an error",
                 "cause": "Obstacle on the path"})
 
@@ -472,7 +480,7 @@ class IntegrationChecks(unittest.TestCase):
         session = Session(tree=DEFAULT_TREE)
         # Путь до конца: `_confirm` не пишет незавершённую сессию — иначе в базу
         # уходили строки с пустым описанием (11 таких нашли с 04.10).
-        for step in ("robot", "k50h", "safety"):
+        for step in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(step)
         session.submit_text("3780")
         session.submit_text("Lift reports an error")
@@ -500,7 +508,7 @@ class IntegrationChecks(unittest.TestCase):
     def test_confirm_message_reports_success(self):
         sender = {"id": 1, "username": "u"}
         session = Session(tree=DEFAULT_TREE)
-        for step in ("robot", "k50h", "safety"):
+        for step in ("robot", "k50h", "safety", "safety_front_button"):
             session.select(step)
         session.submit_text("3780")
         session.submit_text("Lift reports an error")

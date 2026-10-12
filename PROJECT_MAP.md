@@ -257,7 +257,8 @@ photo → get_file → download_file → images/tg_<file_unique_id><ext>
 | --- | --- |
 | `exceptions_glpc` | Основной журнал: робот, тип, описания, время, смена, склад, `photo_url`. |
 | `exceptions` | Связка с роботом/сотрудником (`handle_by`, `robot_id`, времена). |
-| `issue_templates` | Шаблоны типов ошибок (`employee_title` — ключ распознавания). |
+| `issue_templates` | Справочник ошибок: описание, «что было сделано», время решения. |
+| `telegram_intake_options` | Варианты дерева + **точная связь** с шаблоном (`template_id`). |
 | `employees` | Сотрудники: `user_name`, `card_id`, `home_warehouse`, `is_leader`. |
 | `robots_maintenance_list` | Справочник роботов: статус, тип, текущая проблема. |
 | `change_status_robots` | Журнал смен статуса — источник MTTR и простоев. |

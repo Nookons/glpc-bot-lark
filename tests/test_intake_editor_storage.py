@@ -17,6 +17,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -73,6 +74,27 @@ class FakeDB:
         self.rows[table] = keep
         return bool(removed)
 
+    def rest_patch(self, table, params=None, payload=None):
+        """Правка строки — как `PATCH` у PostgREST.
+
+        Нужна заготовкам `issue_templates`: редактор правит их **по одному
+        полю**, и заглушка обязана это поведение поддерживать, иначе тесты
+        «проходят» на пустой базе и ничего не проверяют.
+        """
+        params = params or {}
+        rows = self.rows.setdefault(table, [])
+        updated = []
+        for row in rows:
+            match = all(
+                str(row.get(key)) == value[3:]
+                for key, value in params.items()
+                if isinstance(value, str) and value.startswith("eq.")
+            )
+            if match:
+                row.update(payload or {})
+                updated.append(dict(row))
+        return updated or None
+
 
 #: 🔴 Прежний `sendToDataBase` из `sys.modules` — чтобы вернуть его после теста.
 #:
@@ -95,10 +117,17 @@ def _install(db: FakeDB) -> None:
     module.rest_get = db.rest_get
     module.rest_upsert = db.rest_upsert
     module.rest_delete = db.rest_delete
+    module.rest_patch = db.rest_patch
     def _post(table, payload, **kwargs):
         # add_option пишет через rest_post: заглушка должна реально сохранять,
         # иначе тесты «проходят» на пустой базе и ничего не проверяют.
-        db.rows.setdefault(table, []).append(dict(payload))
+        # Справочнику `issue_templates` «база» выдаёт `id`, как identity-колонка:
+        # без него создание заготовки вернуло бы `None` и связь не встала бы.
+        rows = db.rows.setdefault(table, [])
+        if table == storage.TEMPLATES_TABLE:
+            rows.append({**dict(payload), "id": len(rows) + 1})
+            return [rows[-1]]
+        rows.append(dict(payload))
         return [payload]
 
     module.rest_post = _post
@@ -107,6 +136,10 @@ def _install(db: FakeDB) -> None:
     storage.reset_capability_cache()
     storage._v2_state = True
     storage._v2_checked_at = float("inf")
+    # Колонка связи `0109` в тестовой базе **есть**: без неё `link_option_to_template`
+    # отказывал бы, и тесты связи проверяли бы не то.
+    storage._link_state = True
+    storage._link_checked_at = float("inf")
 
 
 def _uninstall() -> None:
@@ -339,13 +372,22 @@ class EditorStorageTestCase(unittest.TestCase):
 
         Проверяется число запросов, а не текст лога: так тест не зависит от
         формата сообщений.
+
+        **Проб теперь две, и обе — один раз.** С 12.10.2026 добавляется набор со
+        связью `template_id` (миграция `0109`): она приезжает **своей** миграцией
+        и проверяется отдельно, чтобы её отсутствие не выглядело как «редактор не
+        готов». Здесь важно, что обе пробы делаются на **первом** вызове, а дальше
+        читается только v1.
         """
-        probes = {"v2": 0, "v1": 0}
+        probes = {"link": 0, "v2": 0, "v1": 0}
         module = types.ModuleType("sendToDataBase")
 
         def rest_get(table, params=None, optional=False):
             if table == storage.OPTION_TABLE:
-                if "is_builtin" in (params or {}).get("select", ""):
+                select = (params or {}).get("select", "")
+                if "template_id" in select:
+                    probes["link"] += 1
+                elif "is_builtin" in select:
                     probes["v2"] += 1
                 else:
                     probes["v1"] += 1
@@ -365,6 +407,7 @@ class EditorStorageTestCase(unittest.TestCase):
             storage.load_option_rows()
 
         self.assertEqual(probes["v2"], 1, "колонки v2 проверяются заново на каждый вызов")
+        self.assertEqual(probes["link"], 1, "проверка связи template_id идёт каждый раз")
         self.assertEqual(probes["v1"], 5, "откат к v1 должен происходить каждый раз")
 
     def test_missing_nodes_table_is_not_queried_on_every_call(self):
@@ -530,5 +573,464 @@ class FailureNoticeTests(unittest.TestCase):
         self.assertIn("rejected", notice)
 
 
+class TemplateLinkStorageChecks(EditorStorageTestCase):
+    """Заготовка и связь ошибки дерева со справочником (`issue_templates`).
+
+    Требование владельца 12.10.2026: «при добавление новой ошибки делать
+    заготовку тоже чтобы потом были поля которые будут подставлены
+    автоматически». Здесь проверяется, что заготовка **создаётся**, что поля
+    правятся по одному и что связь **не теряется** при правке варианта.
+    """
+
+    def _error_node(self, minimum: int = 1):
+        """Узел слоя ошибок — на нём связь и проверяется.
+
+        У встроенного варианта нет строки-оверлея, поэтому связь создаётся
+        первым же `link_option_to_template` — это и нужно.
+
+        `minimum` — сколько вариантов требуется: у узла шасси он один, а для
+        проверок «первый/второй» нужен узел с несколькими (`robot_errors_safety`).
+        """
+        for node_id, node in DEFAULT_TREE.nodes.items():
+            if node_id.startswith("robot_errors_") and len(node.options) >= minimum:
+                return node
+
+        self.fail(f"в дереве нет узла слоя ошибок с {minimum}+ вариантами")
+
+    def test_stub_row_keeps_unknown_fields_empty(self):
+        """Создание заготовки: описание и модуль есть, «что было сделано» — нет."""
+        template_id = storage.create_template(
+            "Conveyor jammed", module="Chassis", created_by=42
+        )
+
+        self.assertIsNotNone(template_id)
+
+        row = self.db.rows[storage.TEMPLATES_TABLE][0]
+
+        self.assertEqual(row["employee_title"], "Conveyor jammed")
+        self.assertEqual(row["issue_type"], "Chassis")
+        self.assertEqual(row["issue_description"], "Conveyor jammed")
+        self.assertEqual(row["equipment_type"], "Equipment")
+        self.assertIsNone(row["recovery_title"])
+        self.assertIsNone(row["solving_time"])
+
+    def test_create_refuses_empty_title(self):
+        """Без названия заготовка не создаётся: строка-пустышка смысла не имеет."""
+        self.assertIsNone(storage.create_template("   "))
+        self.assertEqual(self.db.rows.get(storage.TEMPLATES_TABLE, []), [])
+
+    def test_link_is_written_and_readable(self):
+        node = self._error_node()
+        option = node.options[0]
+
+        linked = storage.link_option_to_template(node.id, option.id, 152, updated_by=1)
+
+        self.assertTrue(linked)
+        self.assertEqual(storage.option_template_id(node.id, option.id), 152)
+
+    def test_link_map_only_contains_linked_options(self):
+        """Карта связей, которую читает писатель журнала."""
+        node = self._error_node(minimum=2)
+        first, second = node.options[0], node.options[1]
+
+        storage.link_option_to_template(node.id, first.id, 152)
+        storage.link_option_to_template(node.id, second.id, 156)
+        storage.reset_links_cache()
+
+        links = storage.option_template_links()
+
+        self.assertEqual(links.get(first.id), 152)
+        self.assertEqual(links.get(second.id), 156)
+        self.assertNotIn("no_such_option", links)
+
+    def test_editing_another_field_does_not_drop_the_link(self):
+        """🔴 Переименование варианта не должно ронять связь.
+
+        Связь держится на `merge-duplicates`: `rest_upsert` обновляет **только
+        колонки из payload**, и незаписанный `template_id` остаётся прежним.
+        Дефект был бы тихим: оператор увидел бы в журнале пустое «что было
+        сделано», а в логах не было бы ни строки.
+
+        **Негативная проверка (выполнена):** добавить в строку `update_option`
+        `"template_id": None` — тест падает. Именно так это и ломается: соблазн
+        «записать строку целиком» уже приводил к затиранию соседних полей у
+        узлов (см. `update_node`).
+        """
+        node = self._error_node()
+        option = node.options[0]
+
+        storage.link_option_to_template(node.id, option.id, 152)
+        renamed = storage.update_option(
+            node.id, option.id, label="Renamed error", updated_by=1
+        )
+
+        self.assertTrue(renamed)
+        self.assertEqual(
+            storage.option_template_id(node.id, option.id), 152,
+            "связь со шаблоном потеряна при переименовании",
+        )
+
+    def test_moving_an_option_does_not_drop_the_link(self):
+        """Перемещение «выше/ниже» тоже не должно ронять связь.
+
+        Берётся узел с **несколькими** вариантами (`robot_errors_safety`): у узла
+        шасси он один, и тест на нём молча скипался бы — то есть проверка
+        «перемещение не роняет связь» не выполнялась бы никогда.
+        """
+        node = self._error_node(minimum=2)
+        second = node.options[1]
+
+        storage.link_option_to_template(node.id, second.id, 156)
+        moved = storage.move_option(node.id, second.id, "up", updated_by=1)
+
+        self.assertTrue(moved)
+        self.assertEqual(storage.option_template_id(node.id, second.id), 156)
+
+    def test_template_fields_are_updated_one_by_one(self):
+        """Поля заготовки правятся по одному, не затирая соседние.
+
+        Это требование владельца: «на сервере в столбцы с описанием ошибки что
+        было сделано и тп». Форма правит по полю за раз, и запись всего объекта
+        стёрла бы уже заполненное.
+        """
+        template_id = storage.create_template("Went off the road", module="Chassis")
+        row = self.db.rows[storage.TEMPLATES_TABLE][0]
+
+        self.assertTrue(storage.update_template(template_id, recovery="Move the robot"))
+        self.assertEqual(row["recovery_title"], "Move the robot")
+        self.assertEqual(row["issue_description"], "Went off the road")
+
+        self.assertTrue(storage.update_template(template_id, solving_time=6))
+        self.assertEqual(row["solving_time"], 6)
+        self.assertEqual(row["recovery_title"], "Move the robot")
+
+        self.assertTrue(storage.update_template(template_id, description="Robot off road"))
+        self.assertEqual(row["issue_description"], "Robot off road")
+        self.assertEqual(row["solving_time"], 6)
+
+    def test_template_description_edit_keeps_the_title(self):
+        """Правка описания не переименовывает заготовку."""
+        template_id = storage.create_template("QR Code dirty", module="QR Code")
+        row = self.db.rows[storage.TEMPLATES_TABLE][0]
+
+        storage.update_template(template_id, description="DM code is unreadable")
+
+        self.assertEqual(row["employee_title"], "QR Code dirty")
+
+    def test_bad_solving_time_does_not_break_the_save(self):
+        """Мусор во времени решения приводится к нулю, а не роняет сохранение."""
+        template_id = storage.create_template("Safety bumper trigger", module="Safety")
+
+        self.assertTrue(storage.update_template(template_id, solving_time="abc"))
+        self.assertEqual(self.db.rows[storage.TEMPLATES_TABLE][0]["solving_time"], 0)
+
+        self.assertTrue(storage.update_template(template_id, solving_time="8"))
+        self.assertEqual(self.db.rows[storage.TEMPLATES_TABLE][0]["solving_time"], 8)
+
+    def test_update_without_a_template_id_is_refused(self):
+        """Правка без id — отказ, а не запись «во все строки»."""
+        self.assertFalse(storage.update_template(None, recovery="x"))
+        self.assertFalse(storage.update_template("", recovery="x"))
+
+    def test_link_requires_the_column(self):
+        """Без применённой миграции `0109` связь не пишется и не молчит.
+
+        `link_option_to_template` обязан вернуть `False`, а не сделать вид, что
+        сохранил: иначе админ увидел бы «связано», а связи в базе нет.
+        """
+        node = self._error_node()
+
+        storage.reset_capability_cache()
+        storage._remember_link(False)
+
+        self.assertFalse(
+            storage.link_option_to_template(node.id, node.options[0].id, 152)
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class EditorCreatesStubChecks(EditorStorageTestCase):
+    """`/tree` при добавлении ошибки заводит заготовку в `issue_templates`.
+
+    Требование владельца 12.10.2026: «при добавление новой ошибки делать
+    заготовку тоже чтобы потом были поля которые будут подставлены
+    автоматически при копирование».
+
+    Проверяется **через `editor._apply_edit`**, а не через `storage` напрямую:
+    владельцу важно, что это делает **бот по кнопке**, а не что функция умеет
+    создавать строку.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from equipment_intake import error_templates, editor
+
+        self.editor = editor
+        self.error_templates = error_templates
+        # Правка узлов и вариантов доступна только админу, но `_apply_edit` роли
+        # не проверяет (это делает `handle_callback`), поэтому здесь достаточно
+        # отправителя с id.
+        self.sender = {"id": 12345}
+
+    def _error_node(self):
+        for node_id, node in DEFAULT_TREE.nodes.items():
+            if node_id.startswith("robot_errors_") and node.options:
+                return node
+
+        self.fail("в дереве нет узла слоя ошибок")
+
+    def test_adding_an_error_creates_and_links_a_stub(self):
+        """🔴 Добавление новой ошибки создаёт заготовку **и** связывает её.
+
+        Поля заготовки: название (его ввёл человек) и модуль (следует из узла).
+        «Что было сделано» и время решения остаются пустыми — их знает человек.
+        """
+        node = self._error_node()
+
+        ok, notice, option_id = self.editor._apply_edit(
+            self.editor.KIND_ADD_LABEL, node.id, None, "Conveyor jammed", self.sender
+        )
+
+        self.assertTrue(ok, notice)
+        self.assertIsNotNone(option_id)
+
+        rows = self.db.rows.get(storage.TEMPLATES_TABLE, [])
+        self.assertEqual(len(rows), 1, "заготовка не создана")
+
+        row = rows[0]
+        self.assertEqual(row["employee_title"], "Conveyor jammed")
+        self.assertEqual(row["equipment_type"], "Equipment")
+        self.assertIsNone(row["recovery_title"])
+        self.assertIsNone(row["solving_time"])
+
+        # Связь с новым вариантом выставлена — иначе подстановки не будет.
+        self.assertEqual(
+            storage.option_template_id(node.id, option_id), row["id"],
+            "заготовка создана, но не связана с ошибкой",
+        )
+        self.assertIn("template", notice.lower())
+
+    def test_module_comes_from_the_error_node(self):
+        """`issue_type` заготовки — модуль из id узла слоя ошибок."""
+        node = self._error_node()
+        expected = self.error_templates.module_from_node(node.id)
+
+        self.editor._apply_edit(
+            self.editor.KIND_ADD_LABEL, node.id, None, "Some new failure", self.sender
+        )
+
+        row = self.db.rows[storage.TEMPLATES_TABLE][0]
+        self.assertEqual(row["issue_type"], expected)
+        self.assertTrue(expected, "модуль не определён из узла ошибок")
+
+    def test_option_is_still_added_when_the_catalogue_is_down(self):
+        """Сбой справочника **не отменяет** добавление ошибки.
+
+        Ошибка уже сохранена и работает; связь можно поставить позже. Обратное
+        поведение («не добавили, потому что справочник молчит») лишало бы
+        оператора кнопки из-за чужого сбоя.
+
+        **Негативная проверка:** убрать `try/except` вокруг создания заготовки —
+        тест падает с проброшенным исключением.
+        """
+        node = self._error_node()
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("catalogue is down")
+
+        with mock.patch.object(storage, "create_template", side_effect=boom):
+            ok, notice, option_id = self.editor._apply_edit(
+                self.editor.KIND_ADD_LABEL, node.id, None, "New failure", self.sender
+            )
+
+        self.assertTrue(ok, notice)
+        self.assertIsNotNone(option_id, "вариант не добавлен из-за сбоя справочника")
+        self.assertIn("template was not created", notice)
+        # Вариант действительно сохранился.
+        self.assertTrue(
+            any(r.get("option_id") == option_id
+                for r in self.db.rows.get(storage.OPTION_TABLE, []))
+        )
+
+    # ---------- правка полей заготовки из карточки варианта ----------
+
+    def _linked(self):
+        """Вариант узла ошибок, связанный с заготовкой в тестовой базе."""
+        node = self._error_node()
+        template_id = storage.create_template("Went off the road", module="Chassis")
+        storage.link_option_to_template(node.id, node.options[0].id, template_id)
+        storage.reset_links_cache()
+
+        return node, node.options[0], template_id
+
+    def test_template_description_edit_reaches_the_catalogue(self):
+        """«Описание ошибки» из карточки уезжает в `issue_description`.
+
+        Именно это поле подставляется в журнал, и требование владельца звучит
+        буквально: «на сервере в столбцы с описанием ошибки».
+        """
+        node, option, template_id = self._linked()
+
+        ok, notice, shown = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_DESCRIPTION, node.id, option.id,
+            "Robot drove off the road", self.sender,
+        )
+
+        self.assertTrue(ok, notice)
+        self.assertEqual(shown, option.id)
+        row = self.db.rows[storage.TEMPLATES_TABLE][0]
+        self.assertEqual(row["issue_description"], "Robot drove off the road")
+        # Название не тронуто: поля правятся по одному.
+        self.assertEqual(row["employee_title"], "Went off the road")
+        self.assertIn("journal", notice)
+
+    def test_template_recovery_edit_reaches_the_catalogue(self):
+        """«Что было сделано» уезжает в `recovery_title`."""
+        node, option, _ = self._linked()
+
+        ok, notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id,
+            "Move the robot back to the QR code", self.sender,
+        )
+
+        self.assertTrue(ok, notice)
+        self.assertEqual(
+            self.db.rows[storage.TEMPLATES_TABLE][0]["recovery_title"],
+            "Move the robot back to the QR code",
+        )
+
+    def test_template_solving_time_edit_reaches_the_catalogue(self):
+        """Время решения уезжает числом в `solving_time`."""
+        node, option, _ = self._linked()
+
+        ok, notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_SOLVING_TIME, node.id, option.id, "6", self.sender
+        )
+
+        self.assertTrue(ok, notice)
+        self.assertEqual(self.db.rows[storage.TEMPLATES_TABLE][0]["solving_time"], 6)
+
+    def test_template_solving_time_rejects_garbage(self):
+        """Нечисловое время решения — отказ, а не молчаливый ноль.
+
+        Ноль означал бы «решается мгновенно», и метрика времени решения
+        испортилась бы. Прочерк `-` — осознанная очистка (ставит 0).
+        """
+        node, option, _ = self._linked()
+
+        ok, notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_SOLVING_TIME, node.id, option.id, "soon", self.sender
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("number", notice)
+        self.assertIsNone(self.db.rows[storage.TEMPLATES_TABLE][0]["solving_time"])
+
+        # А прочерк — очистка, и это уже успех.
+        ok, _notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_SOLVING_TIME, node.id, option.id, "-", self.sender
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(self.db.rows[storage.TEMPLATES_TABLE][0]["solving_time"], 0)
+
+    def test_template_dash_clears_the_field(self):
+        """Дефис очищает поле заготовки: иначе стереть текст из Telegram нельзя."""
+        node, option, _ = self._linked()
+
+        self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id, "Do something", self.sender
+        )
+        ok, notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id, "-", self.sender
+        )
+
+        self.assertTrue(ok, notice)
+        self.assertEqual(self.db.rows[storage.TEMPLATES_TABLE][0]["recovery_title"], "")
+
+    def test_template_field_edit_creates_a_stub_for_a_builtin_option(self):
+        """Правка полей у варианта **без** связи сначала заводит заготовку.
+
+        Встроенные ошибки (`chassis_went_off_road` в коде) заводились до этой
+        правки, и заготовки у них нет. Кнопка «Issue descr.» обязана работать и
+        для них — иначе владелец не смог бы заполнить поля у 11 ошибок схемы.
+        """
+        node = self._error_node()
+        option = node.options[0]
+
+        self.assertIsNone(storage.option_template_id(node.id, option.id))
+
+        ok, notice, _ = self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id,
+            "Restart the module", self.sender,
+        )
+
+        self.assertTrue(ok, notice)
+        rows = self.db.rows.get(storage.TEMPLATES_TABLE, [])
+        self.assertEqual(len(rows), 1, "заготовка не создана для встроенной ошибки")
+        self.assertEqual(rows[0]["recovery_title"], "Restart the module")
+        self.assertIsNotNone(storage.option_template_id(node.id, option.id))
+
+    def test_template_prompt_shows_the_current_value(self):
+        """Подсказка показывает текущее значение — править вслепую нельзя."""
+        node, option, _ = self._linked()
+
+        self.editor._apply_edit(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id,
+            "Lift the robot", self.sender,
+        )
+
+        current = self.editor._template_field(
+            self.editor.KIND_TEMPLATE_RECOVERY, node.id, option.id
+        )
+
+        self.assertEqual(current, "Lift the robot")
+
+    def test_missing_link_is_shown_in_the_card(self):
+        """Карточка варианта говорит, что связи нет, а не молчит о ней.
+
+        Иначе «связано» и «не связано» выглядят одинаково, и проверить связь
+        можно только через базу.
+        """
+        node = self._error_node()
+        item = dict(storage.effective_options(
+            DEFAULT_TREE, node.id, storage.load_option_rows() or []
+        )[0])
+
+        caption = self.editor._option_caption(
+            item, self.editor.ROLE_ADMIN, node_id=node.id
+        )
+
+        self.assertIn("Issue template", caption)
+        self.assertIn("not linked", caption)
+
+    def test_link_is_shown_in_the_card(self):
+        """Со связью карточка показывает её id и название шаблона."""
+        node, option, template_id = self._linked()
+        item = dict(storage.effective_options(
+            DEFAULT_TREE, node.id, storage.load_option_rows() or []
+        )[0])
+
+        caption = self.editor._option_caption(
+            item, self.editor.ROLE_ADMIN, node_id=node.id
+        )
+
+        self.assertIn(f"#{template_id}", caption)
+        self.assertIn("Went off the road", caption)
+        self.assertIn("what was done: — to fill in —", caption)
+
+    def test_contributor_does_not_see_the_template_section(self):
+        """`contributor` связью не управляет — и раздел ему не показывается."""
+        node, _option, _tid = self._linked()
+        item = dict(storage.effective_options(
+            DEFAULT_TREE, node.id, storage.load_option_rows() or []
+        )[0])
+
+        caption = self.editor._option_caption(
+            item, self.editor.ROLE_CONTRIBUTOR, node_id=node.id
+        )
+
+        self.assertNotIn("Issue template", caption)

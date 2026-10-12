@@ -29,6 +29,14 @@ class NodeType(str, Enum):
     INPUT = "input"        # произвольный текст
     NUMBER = "number"      # число (с проверкой диапазона)
     FINAL = "final"        # конечный узел: показываем summary
+    # **Ветка временно закрыта.** Узел показывает сообщение и завершает диалог:
+    # вариантов у него нет, текст не принимается, кнопка «Confirm» не
+    # появляется. Отдельный тип, а не `FINAL`, намеренно: `FINAL` — это
+    # законченный отчёт с подтверждением и записью, а здесь записи быть не
+    # должно вовсе. Решение владельца 12.10.2026: Workstation и Charging
+    # Station «пока не работают», и выбор категории обязан сразу сказать об
+    # этом, а не тянуть оператора по шагам.
+    UNAVAILABLE = "unavailable"
 
 
 # Типы, где ответ вводится текстом, а не кнопкой.
@@ -298,7 +306,7 @@ class DecisionTree:
                         f"Node {node.id!r} of type {node.type.value} has no options"
                     )
 
-            if node.type == NodeType.FINAL:
+            if node.type in (NodeType.FINAL, NodeType.UNAVAILABLE):
                 continue
 
             targets: List[Optional[str]] = [node.next_node]
@@ -340,7 +348,7 @@ class DecisionTree:
             reachable.add(current)
             node = self.nodes.get(current)
 
-            if node is None or node.type == NodeType.FINAL:
+            if node is None or node.type in (NodeType.FINAL, NodeType.UNAVAILABLE):
                 continue
 
             if node.next_node:
