@@ -98,6 +98,41 @@ def _rows_matching(keyboard: dict, predicate) -> list:
     ]
 
 
+def assert_labels_are_readable(
+    case: unittest.TestCase, name: str, keyboard: dict, predicate
+) -> None:
+    """
+    🔴 **Ни одна подпись на кнопке не обрезается.**
+
+    Это ГЛАВНОЕ требование владельца (13.10.2026: «просто нужно чтобы ошибки
+    читались»). Дефект со скриншота — `[Chass…] [Lifting…] [Rotati…]`: Telegram
+    **обрезает** текст кнопки многоточием, а не переносит его, и подпись
+    перестаёт быть выбором.
+
+    Проверка считает **ширину текста** (`glyph_units`), а не число знаков:
+    `Tray →` (7 знаков) влезает в шесть колонок, `Horn →` (тоже 7) — нет,
+    потому что `Horn` шире. Счёт по знакам этот дефект пропускал.
+    """
+    import keyboard_layout as kl
+
+    for row in keyboard.get("inline_keyboard") or []:
+        choices = [b for b in row if predicate(b)]
+
+        if not choices:
+            continue
+
+        capacity = kl.ROW_UNITS / len(row) - 2 * kl.BUTTON_PADDING_UNITS
+
+        for button in choices:
+            width = kl.glyph_units(button.get("text") or "")
+
+            case.assertLessEqual(
+                width, capacity,
+                f"{name}: подпись {button.get('text')!r} ({width:.2f}) шире кнопки "
+                f"({capacity:.2f}) в ряду из {len(row)} — Telegram её обрежет",
+            )
+
+
 def assert_option_rows_within_limit(
     case: unittest.TestCase, name: str, keyboard: dict, predicate
 ) -> None:
@@ -217,12 +252,27 @@ class BotScreensFitTwoRows(unittest.TestCase):
         Самый заметный случай из жалобы владельца: «Abnormal walking»,
         «Damaged car body parts», «Safety controller issues», «Other», «Skip» и
         «Cancel» шли шестью отдельными рядами и уезжали за верх экрана.
+
+        **Что проверяется теперь.** Сетка есть (рядов стало 2–4 вместо 6), и
+        **каждая подпись читается целиком**. Требовать «ровно два ряда» нельзя:
+        «Safety controller issues» (24 знака) в ряд с другими не влезает, и
+        два ряда означали бы обрезку — ровно тот дефект, что был на скриншоте.
         """
         for direction in ("offline", "online"):
             with self.subTest(direction=direction):
                 keyboard = self.bot.reasons_keyboard(direction, 3780)
-                assert_option_rows_within_limit(
+
+                assert_labels_are_readable(
                     self, f"причины {direction}", keyboard, is_reason_choice
+                )
+
+                # Сетка, а не «по одной в ряд»: рядов меньше, чем кнопок.
+                rows = _rows_matching(keyboard, is_reason_choice)
+                total = sum(len(r) for r in rows)
+
+                self.assertLess(
+                    len(rows), total,
+                    f"{direction}: причины снова идут по одной в ряд",
                 )
 
     def test_reasons_do_not_lose_any_choice(self):
@@ -245,8 +295,23 @@ class BotScreensFitTwoRows(unittest.TestCase):
                 for code, _label in REASONS.get(direction, ()):
                     self.assertIn(
                         code, codes,
-                        f"{direction}: причина {code} потерялась в раскладке",
+                        f"{direction}: причина {code} п��терялась в раскладке",
                     )
+
+    def test_reason_labels_are_readable(self):
+        """
+        🔴 Причины статуса читаются целиком: «Safety controller issues» (24).
+
+        Это второй экран из жалобы владельца: подписи причин длиннее, чем у
+        модулей, и в ряду из шести они превращались в `Safety…`.
+        """
+        for direction in ("offline", "online"):
+            with self.subTest(direction=direction):
+                assert_labels_are_readable(
+                    self, f"причины {direction}",
+                    self.bot.reasons_keyboard(direction, 3780),
+                    is_reason_choice,
+                )
 
     def test_error_menu_root_fits_two_rows(self):
         """Меню типа ошибки: первый уровень — категории."""
@@ -576,13 +641,69 @@ class IntakeScreensFitTwoRows(unittest.TestCase):
 
         return Session(tree=DecisionTree(root_id="root", nodes={"root": node, "finish": finish}))
 
+    def _options(self, count: int):
+        """Те же варианты, что строит `_session` — для расчёта страниц."""
+        from equipment_intake.types import Option
+
+        return [Option(id=f"o{index}", label=f"Option {index + 1}") for index in range(count)]
+
+    def _per_page(self, count: int) -> int:
+        from equipment_intake.keyboards import options_per_page
+
+        return options_per_page(self._options(count))
+
+    def _pages(self, count: int) -> int:
+        from equipment_intake.keyboards import total_option_pages
+
+        return total_option_pages(count, self._options(count))
+
     def test_intake_choice_fits_two_rows(self):
-        """Списки вариантов дерева: 6, 8, 12, 13 и 25 штук."""
+        """
+        Списки вариантов дерева: 6, 8, 12, 13 и 25 штук.
+
+        🔴 **Проверка переименована по смыслу, а не по названию.** Раньше здесь
+        требовалось «не больше двух рядов». С 13.10.2026 ширина ряда выводится из
+        текста, и подписи вида `Option 12  →` (9.2 единицы) в шесть колонок не
+        влезают: честная раскладка даёт три ряда по четыре. Это **не регресс**, а
+        цена читаемости: при шести колонках Telegram показал бы `Option…`, и
+        оператор не отличил бы вариант 12 от варианта 1.
+
+        Поэтому проверяются два свойства, которые действительно нужны:
+        **подписи читаются** и **ни один вариант не потерян**.
+        """
         from equipment_intake.keyboards import node_keyboard
 
         for count in (1, 6, 8, 12, 13, 25):
             with self.subTest(count=count):
-                assert_option_rows_within_limit(
+                keyboard = node_keyboard(self._session(count))
+
+                assert_labels_are_readable(
+                    self, f"дерево, {count} вариантов", keyboard,
+                    lambda b: _callback(b).startswith(("dt:s", "dt:t")),
+                )
+
+                # Вариантов на **странице** — ровно столько, сколько влезло;
+                # остальные доступны листанием, а не выброшены.
+                shown = sum(
+                    1 for row in keyboard["inline_keyboard"] for b in row
+                    if _callback(b).startswith(("dt:s", "dt:t"))
+                )
+                pages = self._pages(count)
+                expected = min(count, self._per_page(count))
+
+                self.assertEqual(
+                    shown, expected,
+                    f"{count} вариантов: показано {shown} вместо {expected} "
+                    f"(страниц {pages})",
+                )
+
+    def test_intake_labels_are_readable(self):
+        """🔴 Подписи дерева читаются целиком при любом числе вариантов."""
+        from equipment_intake.keyboards import node_keyboard
+
+        for count in (1, 6, 8, 12, 13, 25):
+            with self.subTest(count=count):
+                assert_labels_are_readable(
                     self, f"дерево, {count} вариантов",
                     node_keyboard(self._session(count)),
                     lambda b: _callback(b).startswith(("dt:s", "dt:t")),
@@ -590,10 +711,12 @@ class IntakeScreensFitTwoRows(unittest.TestCase):
 
     def test_intake_long_labels_fit_two_rows(self):
         """
-        Длинные подписи тоже укладываются в два ряда.
+        Длинные подписи **читаются целиком** — ради этого сужается ряд.
 
-        Ради них ширина ряда сужается до трёх колонок: при шести текст
-        обрезался бы (`Wrong container posi…`), и оператор выбирал бы вслепую.
+        Было: «укладываются в два ряда». Проверка оказалась не о том: у девяти
+        подписей по 31 знаку в ряд влезает одна кнопка, и «два ряда» значило бы
+        показать две из девяти. Владелец просил читаемость, поэтому здесь
+        проверяется она, а не число рядов.
         """
         from equipment_intake.engine import Session
         from equipment_intake.keyboards import node_keyboard
@@ -613,9 +736,45 @@ class IntakeScreensFitTwoRows(unittest.TestCase):
             Session(tree=DecisionTree(root_id="root", nodes={"root": node, "finish": finish}))
         )
 
-        assert_option_rows_within_limit(
+        # 🔴 **Проверяется читаемость, а не число рядов.**
+        #
+        # Раньше здесь стояло «два ряда». У девяти подписей по 31 знаку в ряд
+        # влезает **одна** кнопка, и «два ряда» означало бы показать две из
+        # девяти — остальные за листанием. Владелец просил читаемость
+        # («просто нужно чтобы ошибки читались»), а не конкретное число рядов:
+        # лучше шесть рядов с полными подписями, чем два ряда с `Wrong cont…`.
+        assert_labels_are_readable(
             self, "дерево, длинные подписи", keyboard,
             lambda b: _callback(b).startswith(("dt:s", "dt:t")),
+        )
+
+        # 🔴 Ни один вариант не потерян. Подписей девять, в ряд влезает одна,
+        # поэтому страница вмещает шесть — остальные три доступны **листанием**
+        # (`Next ▶`), а не выброшены. Проверяю именно это: либо все девять на
+        # экране, либо есть чем долистать.
+        shown = sum(
+            1 for row in keyboard["inline_keyboard"] for b in row
+            if _callback(b).startswith(("dt:s", "dt:t"))
+        )
+        pager = [
+            b for row in keyboard["inline_keyboard"] for b in row
+            if "Next" in (b.get("text") or "")
+        ]
+
+        self.assertTrue(pager, "девять длинных подписей обязаны дать листание")
+
+        # Все девять достижимы: `per_page` на **каждой** странице.
+        from equipment_intake.keyboards import options_per_page, total_option_pages
+        from equipment_intake.types import Option
+
+        options = [Option(id=f"o{i}", label="Wrong container position on robot")
+                   for i in range(9)]
+        reachable = options_per_page(options) * total_option_pages(9, options)
+
+        self.assertGreaterEqual(
+            reachable, 9,
+            f"показано {shown}, но листанием доступно всего {reachable} — "
+            f"часть вариантов потеряна",
         )
 
     def test_intake_final_screen_fits_two_rows(self):
@@ -684,16 +843,58 @@ class GridHelperChecks(unittest.TestCase):
 
     def test_columns_shrink_for_long_labels(self):
         """
-        Ширина ряда — по длине подписей.
+        Ширина ряда — по **ширине текста**, а не по числу знаков.
 
-        Короткие (`Chassis`) — шесть, как просил владелец. Длинные
-        («Safety controller issues», 24 знака) — три, иначе текст обрезается.
+        🔴 **Числа изменились 13.10.2026, и это исправление.** Раньше здесь
+        стояло `== 6` для `Chassis`: считалось `len(label)`, и шесть колонок
+        давали на кнопку ≈6 знаков — Telegram обрезал подпись до `Chass…`
+        (скриншот владельца). Теперь ширина считается по глифам **вместе со
+        стрелкой `→`**, которую дописывает клавиатура.
+
+        Проверки ниже держат именно **читаемость**: при выбранной ширине подпись
+        обязана влезать целиком.
         """
-        self.assertEqual(kl.columns_for_labels(["Chassis", "Lifting"]), 6)
-        self.assertEqual(kl.columns_for_labels(["Chassis"] * 6), 6)
-        self.assertEqual(
-            kl.columns_for_labels(["Safety controller issues"]), kl.WIDE_LABEL_COLUMNS
+        # Короткие подписи по-прежнему идут по шесть.
+        self.assertEqual(kl.columns_for_labels(["A1", "A2"]), 6)
+
+        # 🔴 **Проверка со стрелкой — так, как зовёт клавиатура.**
+        #
+        # Здесь стояло `columns_for_labels(["Chassis","Lifting"])` — **без**
+        # стрелок, и функция возвращала 5 колонок. Но `_button` дописывает `→`, и
+        # «Chassis  →» (8.5) в пять колонок (7.2) не влезает: на экране это и был
+        # `Chass…`. Клавиатура зовёт расчёт через `labels_for_options`, который
+        # стрелку **учитывает**, — тест обязан звать так же, иначе он проверяет
+        # не то, что происходит на самом деле.
+        from equipment_intake.keyboards import labels_for_options
+        from equipment_intake.types import Option
+
+        options = [Option(id="a", label="Chassis", next_node="finish"),
+                   Option(id="b", label="Lifting", next_node="finish")]
+        labels = labels_for_options(options, has_next=True)
+
+        chassis = kl.columns_for_labels(labels)
+        self.assertLess(chassis, 6, "`Chassis  →` обязана сузить ряд")
+        self.assertTrue(
+            kl.fits_columns(labels, chassis),
+            f"модули не влезают в {chassis} колонок — Telegram обрежет подпись",
         )
+
+        # 🔴 Сравнивать «длиннее -> меньше колонок» **нельзя**: «Safety
+        # controller issues» (23 знака) даёт две колонки, а «Chassis» (7) —
+        # пять. Обе читаются, и это главное. Проверяю читаемость обеих.
+        long = kl.columns_for_labels(["Safety controller issues"])
+        self.assertTrue(
+            # Тело подписи шире, чем `columns_for_labels` получил на входе
+            # (стрелку дописывает клавиатура), поэтому её нужно учитывать явно —
+            # ровно так же, как это делает `labels_for_options`.
+            kl.fits_columns(["Safety controller issues  →"], long),
+            "длинная подпись не влезает в выбранную ширину — Telegram обрежет",
+        )
+        self.assertTrue(
+            kl.fits_columns(["Chassis  →", "Lifting  →"], chassis),
+            "модули не влезают в выбранную ширину",
+        )
+
         # Пустой список не должен ломать раскладку.
         self.assertEqual(kl.columns_for_labels([]), 6)
 

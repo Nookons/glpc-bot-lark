@@ -953,6 +953,14 @@ def _context_label(parents: Dict[str, List[str]], tree: DecisionTree, node_id: s
     return f"after {head}" + (f" +{rest} more" if rest > 0 else "")
 
 
+#: Сколько узлов показывать на странице обзо��а структуры.
+#:
+#: **Восемь — по числу строк, которые читаются в сообщении.** Это список текста,
+#: а не сетка кнопок, поэтому правило «два ряда» к нему не применяется: раньше
+#: тут стояло 8, и это верно.
+STRUCTURE_PAGE_SIZE = 8
+
+
 def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, list]]:
     """
     Обзор всех узлов дерева: видно структуру и скрытые узлы.
@@ -967,14 +975,17 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
     """
     node_ids = list(tree.nodes)
 
-    # 🔴 **Размер страницы — из правила «два ряда»** (владелец 13.10.2026), а не
-    # жёсткие 8: подписи узлов длинные («robot_errors_chassis (choice)»), ряд
-    # сужается до трёх колонок, и 8 кнопок дали бы **три** ряда вместо двух.
-    placeholders = [{"text": (tree.node(n).title if tree.node(n) else n)} for n in node_ids]
-    columns = keyboard_layout.columns_for_labels([b["text"] for b in placeholders])
-    pages = keyboard_layout.page_count(len(node_ids), columns)
-    page = keyboard_layout.clamp_page(page, len(node_ids), columns)
-    per_page = keyboard_layout.rows_per_page(columns)
+    # 🔴 **Размер страницы — от того, сколько строк списка читается, а не от
+    # ширины кнопок.** Здесь я (13.10.2026) переиспользовал правило «два ряда» и
+    # подставил ширину кнопок: подписи узлов длинные, ряд сузился, и на страницу
+    # попало **два** узла вместо семи — карта дерева стала нечитаемой, а тест
+    # «видно, чем достигается K50H» упал: узел уехал на вторую страницу.
+    #
+    # Список — **текст**, а не сетка кнопок: ширина кнопки тут ни при чём. Внизу
+    # идёт сетка переходов, и у неё своя ширина (считается ниже, по кнопкам).
+    per_page = STRUCTURE_PAGE_SIZE
+    pages = keyboard_layout.page_count(len(node_ids), keyboard_layout.DEFAULT_COLUMNS)
+    page = keyboard_layout.clamp_page(page, len(node_ids), keyboard_layout.DEFAULT_COLUMNS)
     chunk = node_ids[page * per_page:(page + 1) * per_page]
 
     overrides = storage.node_overrides()
@@ -1022,6 +1033,11 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
             "text": f"{page * per_page + offset + 1}. {(node.title if node else node_id)}"[:60],
             "callback_data": _cb("j", str(page * per_page + offset)),
         })
+
+    # Ширина **сетки переходов** — по подписям этих самых кнопок («1. Что
+    # показано в фото?» и т.п.), а не по подписям узлов для списка: это разные
+    # кнопки, и общая ширина тут ни при чём.
+    columns = keyboard_layout.columns_for_labels([b["text"] for b in buttons])
 
     rows: List[list] = list(keyboard_layout.grid_rows(buttons, columns=columns))
 

@@ -1828,7 +1828,19 @@ def reasons_keyboard(direction: str, robot_id) -> dict:
         for code, label in reasons
     ]
 
-    rows = keyboard_layout.grid_rows(buttons, columns=columns)
+    # 🔴 **`max_rows` не ограничиваем — иначе причина молча пропадает.**
+    #
+    # `grid_rows` по умолчанию режет до двух рядов (`MAX_OPTION_ROWS`), и при
+    # ширине в четыре колонки пятая причина (`Other` в online) исчезала с
+    # экрана: оставалось четыре кнопки из пяти. Это **потеря выбора**, а не
+    # оформление, — оператор не мог вернуть робота в работу с причиной «Other».
+    # Поймано проверкой `test_reasons_do_not_lose_any_choice`.
+    #
+    # Здесь список причин мал (4–5) и известен заранее, поэтому ��истание не
+    # нужно: показываем все ряды целиком.
+    rows = keyboard_layout.grid_rows(
+        buttons, columns=columns, max_rows=len(buttons) or 1
+    )
 
     # **«Skip» — сразу в офлайн без описания.**
     #

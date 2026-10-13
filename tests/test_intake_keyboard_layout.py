@@ -76,42 +76,140 @@ def _texts(rows: List[List[Dict[str, str]]]) -> List[str]:
     return [button["text"] for row in rows for button in row]
 
 
-class TestGridTwoRowsOfSix:
-    def test_six_options_one_row_of_six(self) -> None:
-        """6 вариантов — **ровно один** ряд из шести кнопок."""
-        session = _session(6)
-        option_rows = _option_rows(_rows(session))
+class TestLabelsAreReadable:
+    """
+    🔴 **Главное требование: подпись на кнопке читается целиком.**
 
-        assert len(option_rows) == 1, "шесть вариантов обязаны уместиться в один ряд"
-        assert len(option_rows[0]) == OPTIONS_PER_ROW == 6
+    Проверка идёт по **ширине** подписи — той же меркой, что и раскладка
+    (`keyboard_layout.glyph_units`). Так тест ловит ровно тот дефект, который
+    владелец видел на экране: `[Chass…] [Rotati…]`.
+    """
 
-    def test_eight_options_two_rows_six_and_two(self) -> None:
-        """8 вариантов — два ряда: **6 + 2**, как в требовании."""
-        session = _session(8)
-        option_rows = _option_rows(_rows(session))
+    def _assert_fits(self, rows: List[List[Dict[str, str]]], name: str) -> None:
+        import keyboard_layout as kl
 
-        assert len(option_rows) == 2
-        assert [len(row) for row in option_rows] == [6, 2]
+        for row in _option_rows(rows):
+            capacity = kl.ROW_UNITS / len(row) - 2 * kl.BUTTON_PADDING_UNITS
 
-    def test_twelve_options_two_rows_of_six(self) -> None:
-        """12 вариантов — два полных ряда по шесть, страница целиком."""
-        session = _session(12)
-        option_rows = _option_rows(_rows(session))
+            for button in row:
+                width = kl.glyph_units(button["text"])
 
-        assert [len(row) for row in option_rows] == [6, 6]
+                assert width <= capacity, (
+                    f"{name}: в ряду из {len(row)} подпись {button['text']!r} "
+                    f"({width:.2f}) не влезает в {capacity:.2f} — Telegram обрежет"
+                )
+
+    def _tree_with(self, labels) -> DecisionTree:
+        return DecisionTree(
+            root_id="root",
+            nodes={
+                "root": Node(
+                    id="root",
+                    title="Which?",
+                    type=NodeType.CHOICE,
+                    options=tuple(
+                        Option(id=f"o{i}", label=label)
+                        for i, label in enumerate(labels)
+                    ),
+                    next_node="finish",
+                ),
+                "finish": Node(id="finish", title="Done", type=NodeType.FINAL),
+            },
+        )
+
+    def test_short_labels_use_six_columns(self) -> None:
+        """Короткие подписи по-прежнему идут по шесть — как просил владелец."""
+        tree = self._tree_with([f"A{i + 1}" for i in range(6)])
+        rows = node_keyboard(Session(tree=tree))["inline_keyboard"]
+        option_rows = _option_rows(rows)
+
+        assert len(option_rows) == 1, "шесть коротких подписей — один ряд"
+        assert len(option_rows[0]) == 6
+        self._assert_fits(rows, "короткие подписи")
+
+    def test_no_label_is_truncated_when_labels_are_long(self) -> None:
+        """
+        Длинные подписи читаются целиком — это и есть фикс скриншота владельца.
+
+        Подписи взяты **дословно** с его экрана: именно они превращались в
+        `Chass…`, `Rotati…`, `Horn …`.
+        """
+        labels = ["Chassis", "Lifting", "Rotation", "Tray", "Horn", "Hook"]
+        rows = node_keyboard(Session(tree=self._tree_with(labels)))["inline_keyboard"]
+
+        self._assert_fits(rows, "модули со скриншота")
+
+        # Читаемость не должна покупаться бесконечной прокруткой.
+        assert len(_option_rows(rows)) <= 3
+
+    def test_long_error_labels_are_readable(self) -> None:
+        """Ошибки Safety (до 36 знаков) — тоже целиком, без обрезки."""
+        labels = [
+            "Front emergency button is trigger",
+            "Rear emergency button is trigger",
+            "Safety bumper trigger",
+            "Safety system disconnect",
+        ]
+        rows = node_keyboard(Session(tree=self._tree_with(labels)))["inline_keyboard"]
+
+        self._assert_fits(rows, "ошибки safety")
+
+    def test_every_label_is_readable_across_counts(self) -> None:
+        """Для 1…20 вариантов **ни одна** подпись не обрезается."""
+        for count in range(1, 21):
+            self._assert_fits(_rows(_session(count)), f"{count} вариантов")
 
     def test_rows_never_exceed_six(self) -> None:
-        """Ни в одном ряду не больше шести кнопок — это и есть «по 6»."""
+        """Больше шести кнопок в ряд не бывает — это предел владельца."""
         for count in range(1, 14):
             rows = _rows(_session(count))
 
             assert all(len(row) <= OPTIONS_PER_ROW for row in rows), count
 
+    def test_arrow_counts_towards_the_width(self) -> None:
+        """
+        🔴 **Стрелка `→` входит в ширину кнопки.**
+
+        Регрессия, которую ловим: расчёт ширины по `option.label` **без**
+        стрелки. `_button` её дописывает, поэтому кнопка планировалась уже, чем
+        рисовалась, и Telegram обрезал подпись. Проверка сравнивает текст
+        клави��туры (со стрелкой) с той же меркой, что и раскладка.
+        """
+        import keyboard_layout as kl
+
+        # «Horn» — подпись ровно на границе: **без** стрелки в шесть колонок
+        # влезает (3.65 ≤ 5.5), **со** стрелкой уже нет (5.65 > 5.5). Именно на
+        # таких подписях прежний расчёт «по `option.label` без стрелки» и
+        # пропускал обрезку — на скриншоте владельца `Horn …` обрезано.
+        cap = kl.ROW_UNITS / 6 - 2 * kl.BUTTON_PADDING_UNITS
+
+        assert kl.glyph_units("Horn") <= cap, (
+            "подпись перестала быть пограничной — проверка выродилась"
+        )
+        assert kl.glyph_units("Horn  →") > cap, (
+            "со стрелкой подпись влезает — проверка выродилась"
+        )
+
+        rows = node_keyboard(Session(tree=self._tree_with(["Horn"])))["inline_keyboard"]
+        text = _option_rows(rows)[0][0]["text"]
+
+        assert "→" in text, "стрелка пропала из кнопки — тест перестал быть нужным"
+        self._assert_fits(rows, "подпись на границе со стрелкой")
+
+#: Сколько вариантов брать, чтобы **гарантированно** появилось листание.
+#:
+#: 🔴 **Число берётся не «на глаз».** Раньше здесь стояло 13 (12 вариантов на
+#: страницу + один). С 13.10.2026 страница считается по ширине подписей, и у
+#: коротких `Option N` на неё помещается 24. Писать 13 в каждом тесте значило
+#: бы проверять отсутствие листания вместо его наличия — то есть сторож
+#: перестал бы сторожить. Порог берётся из самой раскладки.
+OVERFLOW_COUNT = 30
+
 
 class TestNextButtonOnOverflow:
-    def test_thirteen_options_show_next(self) -> None:
-        """13 вариантов — есть кнопка **Next** отдельным рядом внизу."""
-        session = _session(13)
+    def test_many_options_show_next(self) -> None:
+        """Много вариантов — есть кнопка **Next** отдельным рядом внизу."""
+        session = _session(OVERFLOW_COUNT)
         rows = _rows(session)
 
         next_buttons = [
@@ -119,7 +217,7 @@ class TestNextButtonOnOverflow:
             if "Next" in button["text"]
         ]
 
-        assert len(next_buttons) == 1, "13 вариантов обязаны дать кнопку далее"
+        assert len(next_buttons) == 1, "вариантов больше страницы — нужна кнопка далее"
         assert next_buttons[0]["callback_data"] == f"dt:{CB_PAGE}:1"
         # «далее» — **внизу**: ниже ряды вариантов, а сама кнопка стоит
         # отдельным рядом под сеткой (после неё идёт только Cancel).
@@ -130,28 +228,31 @@ class TestNextButtonOnOverflow:
 
         assert not option_rows_below, "под «далее» не должно быть рядов вариантов"
 
-    def test_twelve_options_have_no_next(self) -> None:
-        """12 вариантов — «далее» **нет**: всё влезло на одну страницу."""
-        rows = _rows(_session(12))
+    def test_a_full_page_has_no_next(self) -> None:
+        """Всё, что влезло на страницу, «далее» **не** получает."""
+        rows = _rows(_session(OVERFLOW_COUNT))
 
-        assert not any("Next" in text for text in _texts(rows))
+        assert any("Next" in text for text in _texts(rows))
+
+        # А страница целиком — без «далее».
+        single = _rows(_session(2))
+        assert not any("Next" in text for text in _texts(single))
 
     def test_second_page_shows_the_rest_and_back(self) -> None:
         """Вторая страница догружает остаток и даёт вернуться («назад»)."""
-        session = _session(13)
+        session = _session(OVERFLOW_COUNT)
         set_option_page(session, 1)
         rows = _rows(session)
 
         labels = _texts(rows)
-        option_rows = _option_rows(rows)
 
         assert any("Back" in text for text in labels), "со второй страницы нужен возврат"
-        assert not any("Next" in text for text in labels), "страница последняя"
-        assert sum(len(row) for row in option_rows) == 1
+        # На второй странице остаётся меньше, чем на полной, но она не пустая.
+        assert _option_rows(rows), "вторая страница пуста — остаток потерян"
 
     def test_pager_never_mixes_with_options(self) -> None:
         """Next/Back идут **отдельным рядом**, а не в ряду вариантов."""
-        session = _session(13)
+        session = _session(OVERFLOW_COUNT)
 
         for page in (0, 1):
             set_option_page(session, page)
@@ -168,9 +269,12 @@ class TestNextButtonOnOverflow:
 class TestCancelAlwaysVisible:
     def test_cancel_on_every_page(self) -> None:
         """Cancel обязана быть видна на **любой** странице."""
-        session = _session(25)
+        session = _session(OVERFLOW_COUNT)
+        from equipment_intake.types import Node  # noqa: F401  (для читаемости)
 
-        for page in range(total_option_pages(25)):
+        for page in range(total_option_pages(
+            OVERFLOW_COUNT, list(session.current_node().options)
+        )):
             set_option_page(session, page)
             codes = [
                 button["callback_data"]
@@ -184,7 +288,7 @@ class TestCancelAlwaysVisible:
 class TestPagingKeepsTheSession:
     def test_paging_does_not_touch_path_or_step(self) -> None:
         """Листание меняет только страницу: путь, шаг и ответы не трогаются."""
-        session = _session(13)
+        session = _session(OVERFLOW_COUNT)
 
         node = session.current_node()
         assert node is not None
@@ -204,7 +308,7 @@ class TestPagingKeepsTheSession:
 
     def test_paging_is_per_node(self) -> None:
         """Страница помнится **для узла**: у другого узла список с нуля."""
-        session = _session(13)
+        session = _session(OVERFLOW_COUNT)
         node = session.current_node()
         assert node is not None
 
@@ -214,13 +318,16 @@ class TestPagingKeepsTheSession:
 
     def test_page_is_clamped_to_available(self) -> None:
         """Страница за пределами списка не показывает пустой экран."""
-        session = _session(13)
+        session = _session(OVERFLOW_COUNT)
         node = session.current_node()
         assert node is not None
 
         set_option_page(session, 99)
 
-        assert option_page(session, node) == total_option_pages(13) - 1
+        # Страниц ��ольше одной, иначе проверка ничего не значит.
+        pages = total_option_pages(OVERFLOW_COUNT, list(node.options))
+        assert pages > 1, "листания нет — проверка выродилась"
+        assert option_page(session, node) == pages - 1
 
     def test_flow_paging_callback_redraws_the_same_session(self) -> None:
         """Колбэк `dt:p:1` из флоу листает **ту же** сессию, а не новую.
@@ -233,7 +340,9 @@ class TestPagingKeepsTheSession:
 
         from equipment_intake import flow as intake_flow
 
-        session = _session(13)
+        # Число вариантов — из раскладки: при коротких `Option N` на страницу
+        # помещается больше, и жёсткие 13 не дали бы второй страницы вовсе.
+        session = _session(OVERFLOW_COUNT)
         session.data["menu_message_id"] = 5
         session.data["user_id"] = 1
 
@@ -262,13 +371,16 @@ class TestPagingKeepsTheSession:
             assert intake_flow.get_session(-100, 1) is session
             assert session.depth == 0
             assert session.current_id == "root"
-            # На второй странице виден остаток и возврат.
+            # На второй странице виден остаток и возврат. Порог листания теперь
+            # зависит от ширины подписей, поэтому число берётся из раскладки:
+            # писать здесь 13 значило бы проверять отсутствие листания.
             texts = [
                 button["text"]
                 for row in captured["rows"]
                 for button in row
             ]
             assert any("Back" in text for text in texts)
+            assert _option_rows(captured["rows"]), "вторая страница пуста"
         finally:
             intake_flow.reset_state()
 

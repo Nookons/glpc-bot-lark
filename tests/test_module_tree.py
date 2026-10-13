@@ -306,14 +306,36 @@ class TestKeyboardColumns:
     """
 
     def test_eight_options_use_two_rows(self) -> None:
-        """Восемь модулей A42T — два ряда по шесть, без страниц."""
+        """Восемь модулей A42T — два ряда, без страниц, подписи целиком.
+
+        🔴 **Число колонок изменилось 13.10.2026 — и это и есть исправление.**
+        Раньше здесь жёстко стояло «шесть в ряд». Владелец прислал скриншот
+        живого бота:
+
+            [Chass…] [Lifting…] [Rotati…] [Tray →] [Horn …] [Hook …]
+
+        Шесть колонок давали кнопке ≈6 знаков, Telegram **обрезал** подписи
+        многоточием, и модуль нельзя было прочитать. Теперь ширина ряда
+        считается по ширине текста (`keyboard_layout.columns_for_labels`), и
+        восемь модулей идут по четыре в ряд — **подписи целиком**.
+        """
         rows = node_keyboard(_Session("robot_module_a42t"))["inline_keyboard"]
         option_rows = [row for row in rows if "Cancel" not in row[0]["text"]]
 
         assert len(option_rows) == 2, "восемь модулей обязаны лечь в два ряда"
-        assert len(option_rows[0]) == 6, "первый ряд — шесть кнопок"
-        assert len(option_rows[1]) == 2, "во втором ряду — остаток"
-        assert all(len(row) <= 6 for row in rows), "в ряду не больше шести кнопок"
+        assert sum(len(row) for row in option_rows) == 8
+
+        # Ни одна подпись не обрезается при такой ширине — это главное.
+        from equipment_intake import keyboards as kb
+
+        assert kb._columns_for(DEFAULT_TREE.node("robot_module_a42t").options) == 4
+
+        for row in option_rows:
+            capacity = kb.keyboard_layout.ROW_UNITS / len(row) - 2 * kb.keyboard_layout.BUTTON_PADDING_UNITS
+            for button in row:
+                assert kb.keyboard_layout.glyph_units(button["text"]) <= capacity, (
+                    f"подпись {button['text']!r} обрежется в ряду из {len(row)}"
+                )
 
     def test_three_options_stay_single_row(self) -> None:
         """Три варианта — один ряд, без дробления."""
@@ -343,16 +365,19 @@ class TestKeyboardColumns:
         подписи до **33 символов** («Front emergency button is trigger»), а в
         шести колонках влезает ≈ 7 знаков.
 
-        Подписи длиннее 12 символов теперь идут **по три в ряд** (`keyboards.py`,
-        `SINGLE_LINE_LABEL_LIMIT`), поэтому четыре ошибки занимают **два ряда**.
-        🔴 **Требование владельца не нарушено:** «два ряда» и было его условием —
-        важно, что **листать не нужно**, а не число рядов.
+        **Ожидание уточнено 13.10.2026.** Ширина ряда считается по **ширине
+        текста** (`keyboard_layout.columns_for_labels`), а не по числу знаков:
+        «Front emergency button is trigger» — 36 единиц ширины, и в ряд влезает
+        **одна** такая кнопка. Поэтому четыре ошибки Safety видны **без листания**
+        (две страницы не нужны), но каждая — своим рядом.
+        🔴 **Требование владельца не нарушено:** важно, что **листать не нужно** и
+        **подпись читается целиком**, а не число рядов.
         """
         rows = node_keyboard(_Session("robot_errors_safety"))["inline_keyboard"]
         option_rows = [row for row in rows if "Cancel" not in row[0]["text"]]
 
-        # Помещаются на один экран: два ряда вариантов + Cancel, без пейджера.
-        assert len(option_rows) == 2
+        # Помещаются на один экран: ряды вариантов + Cancel, без пейджера.
+        assert len(option_rows) == 4
         assert sum(len(row) for row in option_rows) == 4
 
         labels = [button["text"] for row in rows for button in row]

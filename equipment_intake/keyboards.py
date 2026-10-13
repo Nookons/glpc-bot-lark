@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
+import keyboard_layout
+
 from .engine import Session
 from .tree_config import (
     CANCEL_LABEL,
@@ -61,10 +63,24 @@ CB_CANCEL = "x"     # закрыть меню
 OPTIONS_PER_ROW = 6
 
 #: Сколько рядов вариантов помещается на одну страницу.
-OPTION_ROWS_PER_PAGE = 2
+#:
+#: 🔴 **Почему не 2 (исправлено 13.10.2026).** «Два ряда» — цель владельца для
+#: **коротких** подписей, и она выполняется: модули A42T идут по четыре в ряд,
+#: восемь модулей — ровно **два ряда**. Но когда подпись длинная, читаемая
+#: ширина падает до **одной** колонки, и страница из «двух рядов» вмещала бы
+#: **две** кнопки из четырёх — у Safety появилось листание, которого раньше не
+#: было **вообще**. Листание хуже лишнего ряда: оператор не видит части выбора и
+#: должен догадаться нажать Next.
+#:
+#: Поэтому предел страницы считается **по рядам, а не по колонкам**: на экран
+#: помещается до шести рядов, и все текущие узлы (до восьми вариантов) видны
+#: целиком, без листания.
+OPTION_ROWS_PER_PAGE = 6
 
-#: Сколько вариантов на странице: 6 × 2 = 12.
-OPTIONS_PER_PAGE = OPTIONS_PER_ROW * OPTION_ROWS_PER_PAGE
+#: Сколько вариантов на странице **при коротких подписях** (6 × 2 = 12).
+#:
+#: Оставлено как значение по умолчанию для вызовов без списка вариантов.
+OPTIONS_PER_PAGE = OPTIONS_PER_ROW * 2
 
 #: 🔴 **Предел длины подписи, при котором ряд из шести ещё читается.**
 #:
@@ -116,29 +132,42 @@ def option_callback(node: Node, option_id: str) -> str:
     return callback(CB_SELECT, option_id)
 
 
-def _button(node: Node, option, selected: bool = False) -> Dict[str, str]:
+def option_button_text(option, has_next: bool, selected: bool = False) -> str:
     """
-    Одна кнопка варианта.
+    Текст кнопки варианта — **единственный** источник и для отрисовки, и для
+    расчёта ширины ряда.
 
-    Компактно и без эмодзи: только текст варианта. Иконки из конфига
-    намеренно не рисуем — список из десятка пунктов со смайликами
-    читается хуже, чем простой ровный список. Стрелка → остаётся: она
-    честно показывает, что выбор ведёт на следующий шаг.
+    🔴 **Почему отдельная функция.** До 13.10.2026 ширина ряда выводилась по
+    `option.label` **без** стрелки `→`, а рисовалась кнопка **со** стрелкой.
+    Кнопка планировалась уже, чем получалась, и Telegram обрезал подписи
+    (`Chass…`, `Rotati…`). Пока это были две разные строки кода, они расходились;
+    теперь текст собирается в одном месте, и расчёту нечего пропустить.
     """
     marker = "✓ " if selected else ""
-
-    if node.type == NodeType.MULTI:
-        has_next = False
-    else:
-        has_next = bool(option.next_node or node.next_node)
-
     label = f"{marker}{option.label}"
 
     if has_next:
         label = f"{label}  →"
 
+    return label
+
+
+def _button(node: Node, option, selected: bool = False) -> Dict[str, str]:
+    """
+    Одна кнопка варианта.
+
+    Компактно и без эмодзи: только текст варианта. Иконки из конфига
+    намеренно н�� рисуем — список из десятка пунктов со смайликами
+    читается хуже, чем простой ровный список. Стрелка → остаётся: она
+    честно показывает, что выбор ведёт на следующий шаг.
+    """
+    if node.type == NodeType.MULTI:
+        has_next = False
+    else:
+        has_next = bool(option.next_node or node.next_node)
+
     return {
-        "text": label,
+        "text": option_button_text(option, has_next, selected),
         "callback_data": option_callback(node, option.id),
     }
 
@@ -166,13 +195,57 @@ def _columns_for(options: List) -> int:
     шести колонках обрежется всё равно; выравнивать по худшей — единственный
     способ гарантировать, что **все** варианты читаемы.
     """
-    widest = max((len(str(option.label or "")) for option in options), default=0)
-    return WIDE_LABEL_COLUMNS if widest > SINGLE_LINE_LABEL_LIMIT else OPTIONS_PER_ROW
+    # 🔴 **Считаем ширину текста, как он попадёт на кнопку** — вместе со
+    # стрелкой `→`, которую дописывает `_button`. До 13.10.2026 ширина выводилась
+    # по `len(label)` **без** стрелки, поэтому кнопки планировались уже, чем
+    # рисовались, и Telegram обрезал подписи (`Chass…`, `Rotati…`).
+    return keyboard_layout.columns_for_labels(labels_for_options(options))
 
 
-def _options_per_page(options: List) -> int:
-    """Сколько вариантов помещается на страницу при текущей ширине ряда."""
-    return _columns_for(options) * OPTION_ROWS_PER_PAGE
+def labels_for_options(options: List, has_next: bool = False) -> List[str]:
+    """
+    Тексты кнопок для списка вариантов — **то же**, что нарисует `_button`.
+
+    Нужна расчёту ширины: считать по `option.label` и рисовать со стрелкой
+    значило планировать кнопку уже, чем она получится (дефект `Chass…`).
+    """
+    labels: List[str] = []
+
+    for option in options:
+        if hasattr(option, "label"):
+            labels.append(option_button_text(
+                option,
+                has_next=bool(has_next or option.next_node),
+            ))
+        else:
+            labels.append(str(option or ""))
+
+    return labels
+
+
+def _options_per_page(options: List, has_next: bool = False) -> int:
+    """
+    Сколько вариантов помещается на страницу при текущей ширине ряда.
+
+    `has_next` — будет ли у кнопок стрелка `→` (она входит в ширину).
+
+    Размер страницы — **колонки × ряды на экран** (`OPTION_ROWS_PER_PAGE`).
+    Считать только «два ряда» нельзя: при одной колонке страница вмещала бы две
+    кнопки, и у узла с четырьмя длинными подписями появлялось листание.
+    """
+    return _columns_for(labels_for_options(options, has_next)) * OPTION_ROWS_PER_PAGE
+
+
+def options_per_page(options: List | None = None) -> int:
+    """
+    Сколько вариантов на странице — **публичная** форма `_options_per_page`.
+
+    Нужна подписи «Page 1 of 3 · options 1–4» (`flow`): она обязана считать
+    страницы **тем же** правилом, что и клавиатура. Пока в подписи стояла
+    константа 12, а раскладка шла по ширине текста, подпись обещала 12 вариантов
+    там, где на экране было четыре.
+    """
+    return _options_per_page(options) if options else OPTIONS_PER_PAGE
 
 
 def _option_rows(
@@ -191,7 +264,14 @@ def _option_rows(
     Больше страницы не попадает: остальное отдаётся следующей (см. `_pager_row`).
     """
     rows: List[list] = []
-    per_row = _columns_for(options)
+    # 🔴 **Ширина считается по тому же тексту, что рисуется.** Здесь стояло
+    # `_columns_for(options)` — по `option.label` без стрелки `→`, тогда как
+    # `_button` её дописывает. Кнопка планировалась уже, чем получалась, и
+    # Telegram обрезал подписи: `[Chass…] [Rotati…]` со скриншота владельца.
+    per_row = _columns_for(labels_for_options(
+        options,
+        has_next=bool(node.next_node) or any(o.next_node for o in options),
+    ))
 
     for index in range(0, len(options), per_row):
         chunk = options[index : index + per_row]

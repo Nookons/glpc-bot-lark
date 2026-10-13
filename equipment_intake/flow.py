@@ -162,8 +162,8 @@ def _page_hint(session: Session) -> str:
     что вариантов больше и они за кнопкой Next.
     """
     from .keyboards import (
-        OPTIONS_PER_PAGE,
         option_page,
+        options_per_page,
         total_option_pages,
     )
 
@@ -175,15 +175,22 @@ def _page_hint(session: Session) -> str:
     if node.type not in (NodeType.CHOICE, NodeType.YESNO, NodeType.MULTI):
         return ""
 
-    count = len(session.visible_options(node))
-    total = total_option_pages(count)
+    visible = session.visible_options(node)
+    count = len(visible)
+    # 🔴 **Страницы считаются по тем же подписям, что и клавиатура.** Здесь
+    # стояла константа `OPTIONS_PER_PAGE` (12), а раскладка с 13.10.2026 идёт по
+    # ширине текста: у длинных подписей на страницу помещается 2–4, а не 12.
+    # Подпись сказала бы «options 1–12», а на экране было бы четыре — то есть
+    # оператор решил бы, что часть вариантов потерялась.
+    per_page = options_per_page(visible)
+    total = total_option_pages(count, visible)
 
     if total <= 1:
         return ""
 
     page = option_page(session, node)
-    first = page * OPTIONS_PER_PAGE + 1
-    last = min((page + 1) * OPTIONS_PER_PAGE, count)
+    first = page * per_page + 1
+    last = min((page + 1) * per_page, count)
 
     return f"Page {page + 1} of {total} · options {first}–{last}"
 
