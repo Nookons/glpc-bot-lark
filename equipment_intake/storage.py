@@ -1021,10 +1021,18 @@ def node_from_rows(
     # Передаём пустой набор известных узлов: `_node_from_row` использует его
     # только для проверки `next_node`, а здесь форма узла нужна без неё — цель
     # проверяется тем же правилом, что и в рабочем дереве.
-    return _node_from_row(node_row, {})
+    #
+    # 🔴 **Строки кнопок передаются.** Без них узел считался бы «черновым» даже
+    # с готовыми кнопками, и карта показывала бы «ветка не в работе» на рабочей
+    # ветке (дефект `Fingers` у владельца, 13.10.2026).
+    return _node_from_row(node_row, {}, option_rows)
 
 
-def _node_from_row(row: Dict[str, Any], nodes: Dict[str, Node]) -> Optional[Node]:
+def _node_from_row(
+    row: Dict[str, Any],
+    nodes: Dict[str, Node],
+    option_rows: Sequence[Dict[str, Any]] = (),
+) -> Optional[Node]:
     """
     Узел, созданный из веба, или `None`, если строку создать нельзя.
 
@@ -1064,7 +1072,16 @@ def _node_from_row(row: Dict[str, Any], nodes: Dict[str, Node]) -> Optional[Node
         # следующим шагом, а показывать вопрос с пустым списком нельзя. Поэтому
         # такой узел объявляется черновым (`is_stub`) — бот попросит описать
         # проблему текстом, и приём не сломается, пока человек наполняет ветку.
-        is_stub=parsed_type == NodeType.CHOICE,
+        #
+        # 🔴 **Черновой — только пока кнопок НЕТ.** Здесь стояло
+        # `is_stub=parsed_type == NodeType.CHOICE`, то есть признак ставился
+        # навсегда: кнопки добавляли, а `is_stub` оставался `True`. Бот это
+        # учитывал (`is_stub and not node.options`), а **веб смотрел только
+        # `is_stub`** — и показывал владельцу «This branch is not in use: the bot
+        # does not write a report from it» на **рабочей** ветке `Fingers`,
+        # которая отчёт исправно пишет. Ложная тревога хуже молчания: по ней
+        # человек идёт чинить то, что не сломано.
+        is_stub=parsed_type == NodeType.CHOICE and not option_rows,
         stub_hint=str(row.get("stub_hint") or ""),
         next_node=target,
     )
@@ -1200,7 +1217,14 @@ def build_tree(
         # целиком (первая версия так и делала), узел остался бы в дереве со всеми
         # своими кнопками — то есть «удаление не сработало».
         if not _row_deleted(row):
-            created = _node_from_row(row, nodes)
+            # Строки кнопок нужны, чтобы узел **с готовыми кнопками** не считался
+            # черновым: иначе карта показывала бы «ветка не в работе» на рабочей
+            # ветке (дефект `Fingers`, 13.10.2026).
+            created = _node_from_row(
+                row, nodes,
+                [item for item in option_rows
+                 if str(item.get("node_id") or "") == node_id],
+            )
 
             if created is not None:
                 nodes[node_id] = created
@@ -1301,6 +1325,13 @@ def build_tree(
             stub_hint=node.stub_hint if stub_hint is None else str(stub_hint),
             next_node=resolved_next,
             options=tuple(options),
+            # 🔴 **Признак «черновая ветка» пересчитывается, а не наследуется.**
+            # Узел, созданный из веба, родился без кнопок и был помечен
+            # черновым; после добавления кнопок он **рабочий**. Пока признак
+            # копировался как есть (`replace` без этого поля), ветка
+            # `Fingers` владельца навсегда оставалась «не в работе» в вебе —
+            # при том что бот по ней писал отчёт.
+            is_stub=node.is_stub and not options,
         )
 
     for node_id in hidden_targets:

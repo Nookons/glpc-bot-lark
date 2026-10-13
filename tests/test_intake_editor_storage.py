@@ -1264,6 +1264,126 @@ class NewModuleGetsItsOwnErrorAndCauseNodes(EditorStorageTestCase):
         )
 
 
+class StubFlagMatchesWhetherTheBranchWorks(EditorStorageTestCase):
+    """
+    🔴 **«Черновая ветка» — только пока у неё НЕТ кнопок.**
+
+    Живой дефект владельца 13.10.2026. Веб показывал на **рабочей** ветке
+    `Fingers`:
+
+        This branch is not in use: the bot does not write a report from it.
+
+    А ветка отчёт писала: оператор проходил `Fingers → ошибка → причина → итог`,
+    и в журнал ложилась запись. Ложная тревога хуже молчания — по ней человек
+    идёт чинить то, что не сломано.
+
+    **Причина.** Признак `is_stub` ставился **при создании** узла из веба
+    (`is_stub = тип == CHOICE`) и больше не пересчитывался: кнопки добавляли, а
+    признак оставался `True`. Бот это учитывал (`is_stub and not node.options`),
+    а веб смотрел **только** `is_stub` — отсюда расхождение «бот пишет отчёт,
+    веб говорит, что не пишет».
+    """
+
+    def _node_row(self, node_id: str) -> dict:
+        return {
+            "node_id": node_id,
+            "node_type": "choice",
+            "title": "Camera: what is wrong?",
+            "next_node": None,
+            "hidden": False,
+            "deleted": False,
+        }
+
+    def test_draft_without_buttons_is_flagged(self):
+        """Узел без кнопок — черновой, и это правда: приём по нему не идёт."""
+        tree = storage.build_tree(
+            DEFAULT_TREE, [], [self._node_row("draft_camera")]
+        )
+        node = tree.node("draft_camera")
+
+        self.assertTrue(node.is_stub, "черновой узел без кнопок не помечен")
+        self.assertEqual(node.options, ())
+
+    def test_working_branch_is_not_flagged(self):
+        """
+        🔴 Узел **с кнопками** — рабочий, и предупреждения быть не должно.
+
+        Именно это было сломано: `is_stub` оставался `True`, и веб показывал
+        «ветка не в работе» на ветке, которая пишет отчёт.
+        """
+        options = [{
+            "node_id": "draft_camera", "option_id": "camera_dead",
+            "label": "Camera is dead", "next_node": "summary",
+            "hidden": False, "deleted": False, "sort_order": 10,
+        }]
+
+        tree = storage.build_tree(
+            DEFAULT_TREE, options, [self._node_row("draft_camera")]
+        )
+        node = tree.node("draft_camera")
+
+        self.assertEqual(len(node.options), 1, "кнопка не привязалась")
+        self.assertFalse(
+            node.is_stub,
+            "узел с кнопками помечен черновым — веб покажет ложное "
+            "«This branch is not in use»",
+        )
+
+    def test_flag_clears_when_the_first_button_is_added(self):
+        """
+        Признак **пересчитывается** при пересборке узла, а не наследуется.
+
+        Проверка отделена от предыдущей намеренно: там узел собирается сразу с
+        кнопкой, а здесь — сначала черновой, потом к нему добавляют кнопку.
+        Дефект был именно во втором случае: `replace()` не пересчитывал поле, и
+        узел, переживший добавление кнопки, оставался черновым.
+        """
+        rows = [self._node_row("draft_camera")]
+
+        before = storage.build_tree(DEFAULT_TREE, [], rows).node("draft_camera")
+        self.assertTrue(before.is_stub)
+
+        options = [{
+            "node_id": "draft_camera", "option_id": "camera_dead",
+            "label": "Camera is dead", "next_node": "summary",
+            "hidden": False, "deleted": False, "sort_order": 10,
+        }]
+        after = storage.build_tree(DEFAULT_TREE, options, rows).node("draft_camera")
+
+        self.assertFalse(
+            after.is_stub,
+            "после добавления кнопки признак не снялся — веб покажет "
+            "«ветка не в работе» на рабочей ветке",
+        )
+
+    def test_editor_note_follows_the_same_rule(self):
+        """
+        Пометка в Telegram-редакторе — по тому же правилу.
+
+        Один `node.is_stub` показывал «draft branch» и там, где кнопки уже есть.
+        Человек читал это как «приём не идёт» и шёл чинить рабочую ветку.
+        """
+        from equipment_intake.editor import _node_caption
+
+        rows = [self._node_row("draft_camera")]
+
+        draft = storage.build_tree(DEFAULT_TREE, [], rows)
+        text = _node_caption(draft, draft.node("draft_camera"), "admin")
+        self.assertIn("draft branch", text, "черновая ветка не помечена")
+
+        options = [{
+            "node_id": "draft_camera", "option_id": "camera_dead",
+            "label": "Camera is dead", "next_node": "summary",
+            "hidden": False, "deleted": False, "sort_order": 10,
+        }]
+        working = storage.build_tree(DEFAULT_TREE, options, rows)
+        text2 = _node_caption(working, working.node("draft_camera"), "admin")
+        self.assertNotIn(
+            "draft branch", text2,
+            "рабочая ветка помечена как черновая — ложная подсказка",
+        )
+
+
 class WebCreatedBlocksAreEditable(EditorStorageTestCase):
     """
     🔴 Блоки и кнопки, **созданные из веба**, полностью редактируемы.

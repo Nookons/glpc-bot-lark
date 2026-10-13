@@ -613,7 +613,12 @@ def _node_caption(tree: DecisionTree, node: Node, role: str, notice: str = "") -
     if node.next_node:
         lines.append(f"next: {_node_name(tree, node.next_node)}")
 
-    if node.is_stub:
+    # 🔴 **С проверкой «и кнопок нет».** Один `node.is_stub` показывал пометку
+    # «черновая ветка» даже там, где кнопки уже добавлены и ветка работает:
+    # признак ставился при создании узла из веба и не снимался (исправлено
+    # 13.10.2026). Для редактора это ложная подсказка — человек решил бы, что
+    # приём по ветке не идёт, хотя она пишет отчёт.
+    if node.is_stub and not node.options:
         lines.append("(draft branch — no choices yet; employees describe it in words)")
 
     lines.append("")
