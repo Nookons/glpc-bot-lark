@@ -1094,7 +1094,18 @@ def _node_from_row(
         # does not write a report from it» на **рабочей** ветке `Fingers`,
         # которая отчёт исправно пишет. Ложная тревога хуже молчания: по ней
         # человек идёт чинить то, что не сломано.
-        is_stub=parsed_type == NodeType.CHOICE and not option_rows,
+        # 🔴 **Черновой — только если кнопок нет ИМЕННО У ЭТОГО УЗЛА.**
+        # Проверять `not option_rows` нельзя: вызывающие передают **всю**
+        # таблицу кнопок (`tree_view` зовёт так), и тогда условие ложно всегда —
+        # настоящий черновой узел переставал помечаться. Поймано проверкой на
+        # узле-черновике: `is_stub` выходил `False`.
+        is_stub=(
+            parsed_type == NodeType.CHOICE
+            and not [
+                item for item in option_rows
+                if str(item.get("node_id") or "") == node_id
+            ]
+        ),
         stub_hint=str(row.get("stub_hint") or ""),
         next_node=target,
     )

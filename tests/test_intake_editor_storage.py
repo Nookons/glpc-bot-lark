@@ -1445,6 +1445,52 @@ class StubFlagMatchesWhetherTheBranchWorks(EditorStorageTestCase):
             "«ветка не в работе» на рабочей ветке",
         )
 
+    def test_draft_is_flagged_through_the_public_wrapper(self):
+        """
+        🔴 **Черновой узел помечается, даже когда переданы ВСЕ строки кнопок.**
+
+        `tree_view` (карта веба) зовёт `node_from_rows` и передаёт **всю**
+        таблицу кнопок, а не кнопки одного узла. Первая версия исправления
+        проверяла `not option_rows` — и на этом пути условие было ложно
+        **всегда**: настоящий черновой узел переставал помечаться, и карта
+        молчала о том, что приём по ветке не идёт.
+
+        Проверка идёт через **публичную обёртку** намеренно: дефект жил именно
+        в ней (в `build_tree` строки фильтруются по `node_id`, там было верно).
+        """
+        rows = [self._node_row("draft_camera")]
+        # Чужие кнопки: они не должны влиять на признак этого узла.
+        options = [
+            {"node_id": "other_node", "option_id": "o1", "label": "Other",
+             "next_node": "summary", "hidden": False, "deleted": False,
+             "sort_order": 10},
+        ]
+
+        node = storage.node_from_rows("draft_camera", rows[0], options)
+
+        self.assertIsNotNone(node)
+        self.assertTrue(
+            node.is_stub,
+            "черновой узел не помечен, когда переданы кнопки ДРУГИХ узлов",
+        )
+        self.assertEqual(node.options, (), "чужие кнопки привязались к узлу")
+
+    def test_working_node_is_not_flagged_through_the_public_wrapper(self):
+        """Обратная сторона: со **своими** кнопками узел рабочий."""
+        rows = [self._node_row("draft_camera")]
+        options = [
+            {"node_id": "draft_camera", "option_id": "camera_dead",
+             "label": "Camera is dead", "next_node": "summary",
+             "hidden": False, "deleted": False, "sort_order": 10},
+        ]
+
+        node = storage.node_from_rows("draft_camera", rows[0], options)
+
+        self.assertFalse(
+            node.is_stub,
+            "узел со своими кнопками помечен черновым",
+        )
+
     def test_editor_note_follows_the_same_rule(self):
         """
         Пометка в Telegram-редакторе — по тому же правилу.
