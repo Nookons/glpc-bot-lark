@@ -731,7 +731,20 @@ def link_option_to_template(
         "description": entry["description"],
         "icon": entry["icon"],
         "only_for": list(entry["only_for"]),
-        "is_builtin": bool(entry["is_builtin"]),
+        # 🔴 **`is_builtin` — по факту, а не по словарю `effective_options`.**
+        #
+        # Живой дефект 13.10.2026: кнопка `robot_errors_fingers
+        # .fingers_stuck_open_close` создана из веба (в коде её нет), но получила
+        # `is_builtin=true` — потому что словарь, собранный по **базовому**
+        # дереву, не нашёл её среди встроенных и пометил как «правку
+        # встроенной». Следствие было видимым: `effective_options` считает такую
+        # строку правкой, а не добавлением, и **карта веба п��казывала у блока
+        # 0 кнопок**, тогда как рабочее дерево — 1. Человек видел пустой блок и
+        # не мог привязать заготовку.
+        #
+        # Признак обязан следовать факту: кнопка встроенная ровно тогда, когда
+        # она объявлена в коде.
+        "is_builtin": bool(_find_base_option(base, node_id, option_id)),
         "hidden": bool(entry["hidden"]),
         "sort_order": entry["index"] * ORDER_STEP + ORDER_STEP,
         "template_id": template_id if template_id not in (None, "") else None,

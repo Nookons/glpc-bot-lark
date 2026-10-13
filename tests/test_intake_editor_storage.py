@@ -1264,6 +1264,95 @@ class NewModuleGetsItsOwnErrorAndCauseNodes(EditorStorageTestCase):
         )
 
 
+class WebButtonStaysAnAddition(EditorStorageTestCase):
+    """
+    🔴 **Кнопка из веба остаётся «добавленной», а не «правкой встроенной».**
+
+    Живой дефект 13.10.2026. Кнопка `robot_errors_fingers
+    .fingers_stuck_open_close` создана из веба — в коде её нет. После привязки
+    заготовки она получила `is_builtin=true`.
+
+    **Чем это видно человеку.** `effective_options` считает такую строку
+    «правкой встроенного варианта» и не отдаёт её как добавленную, поэтому
+    **карта веба показывала у блока 0 кнопок**, тогда как рабочее дерево — 1.
+    Владелец видел пустой блок и не мог привязать к нему заготовку.
+
+    **Причина.** `link_option_to_template` брал `is_builtin` из словаря
+    `effective_options`, собранного по **базовому** дереву: встроенной кнопки
+    там нет, и признак выходил `True`. Теперь он берётся по факту —
+    `_find_base_option`.
+    """
+
+    def _web_error_button(self) -> tuple[str, str]:
+        """Кнопка ошибки, созданная из веба (в коде её нет)."""
+        # Якорь — кнопка, которая есть в **коде** (`root.robot`): в офлайновой
+        # заглушке живых строк базы нет, и кнопку из веба там взять неоткуда.
+        node_id = storage.add_node(
+            title="Camera: what is wrong?",
+            node_type="choice",
+            after_node_id="root",
+            after_option_id="robot",
+            created_by="test",
+        )
+        self.assertIsNotNone(node_id, "узел не создался")
+        self.addCleanup(storage.delete_node, node_id, updated_by="cleanup")
+
+        option_id = storage.add_option(
+            node_id, "Camera is dead", next_node="summary", created_by="test"
+        )
+        self.assertIsNotNone(option_id, "кнопка не создалась")
+        self.addCleanup(storage.delete_option, node_id, option_id, updated_by="cleanup")
+
+        return node_id, option_id
+
+    def test_linking_a_template_keeps_the_button_an_addition(self):
+        """Привязка заготовки не превращает добавленную кнопку во встроенную."""
+        node_id, option_id = self._web_error_button()
+
+        self.assertTrue(
+            storage.link_option_to_template(node_id, option_id, 38, updated_by="test"),
+            "привязка заготовки не прошла",
+        )
+
+        rows = storage.load_option_rows() or []
+        row = next(
+            (r for r in rows
+             if str(r.get("node_id")) == node_id
+             and str(r.get("option_id")) == option_id),
+            None,
+        )
+
+        self.assertIsNotNone(row, "строка кнопки пропала")
+        self.assertFalse(
+            row.get("is_builtin"),
+            "кнопка из веба помечена встроенной — карта покажет у блока 0 кнопок",
+        )
+
+    def test_the_button_is_visible_on_the_map_after_linking(self):
+        """
+        Следствие, которое видел человек: кнопка **остаётся в карте**.
+
+        Проверяется через тот же путь, что и карта (`effective_options` по
+        б��зовому дереву), а не через `is_builtin` напрямую: важно именно то, что
+        кнопка не пропадает.
+        """
+        node_id, option_id = self._web_error_button()
+
+        self.assertTrue(
+            storage.link_option_to_template(node_id, option_id, 38, updated_by="test")
+        )
+
+        shown = storage.effective_options(
+            DEFAULT_TREE, node_id, storage.load_option_rows() or []
+        )
+        ids = {item["id"] for item in shown}
+
+        self.assertIn(
+            option_id, ids,
+            "кнопка из веба исчезла из карты после привязки заготовки",
+        )
+
+
 class StubFlagMatchesWhetherTheBranchWorks(EditorStorageTestCase):
     """
     🔴 **«Черновая ветка» — только пока у неё НЕТ кнопок.**
