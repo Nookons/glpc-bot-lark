@@ -67,6 +67,7 @@ from supabase_storage import (
     upload_json,
     upload_photo_and_get_url,
 )
+import keyboard_layout
 import robot_status
 from sendToDataBase import (
     WAREHOUSE,
@@ -1795,11 +1796,39 @@ def clear_pending_status(chat_id, user_id):
 
 
 def reasons_keyboard(direction: str, robot_id) -> dict:
-    """Кнопки с причинами: callback_data несёт всё нужное, состояние не нужно."""
-    rows = [
-        [{"text": label, "callback_data": f"st:{direction}:{robot_id}:{code}"}]
-        for code, label in robot_status.REASONS.get(direction, ())
+    """
+    Кнопки с причинами: callback_data несёт всё нужное, состояние не нужно.
+
+    🔴 **Раскладка — сетка не больше двух рядов** (требование владельца
+    13.10.2026: «Сделай по всему боту чтобы было не больше двух рядов кнопок в
+    противном случае они не читаются»). До этого каждая причина шла **своим
+    рядом**, и экран выглядел так:
+
+        [ Abnormal walking ]
+        [ Damaged car body parts ]
+        [ Safety controller issues ]
+        [ Other ]
+        [ ⏭️ Skip — no description ]
+        [ ✖️ Cancel ]
+
+    Шесть рядов уезжали за верх экрана, и оператор не видел всего выбора.
+
+    **Ширина ряда — по длине подписей** (`columns_for_labels`): «Safety
+    controller issues» — 24 знака, в ряду из шести это `Safety…`. При длинных
+    подписях ряд сужается до трёх колонок, и текст читается целиком.
+    """
+    reasons = list(robot_status.REASONS.get(direction, ()))
+    labels = [label for _code, label in reasons]
+    # Skip и Cancel не участвуют в выборе ширины: обе подписи короткие, а
+    # «Skip — no description» длиннее прочих и зря сузило бы ряд причин.
+    columns = keyboard_layout.columns_for_labels(labels)
+
+    buttons = [
+        {"text": label, "callback_data": f"st:{direction}:{robot_id}:{code}"}
+        for code, label in reasons
     ]
+
+    rows = keyboard_layout.grid_rows(buttons, columns=columns)
 
     # **«Skip» — сразу в офлайн без описания.**
     #
@@ -1907,21 +1936,32 @@ def find_robot_matches(number, strict: bool = True):
 
 
 def warehouse_keyboard(action: str, number, titles):
-    """Кнопки выбора склада: номер есть и там, и там."""
-    rows = [
-        [{
+    """
+    Кнопки выбора склада: номер есть и там, и там.
+
+    🔴 **Сетка, а не по одной в ряд** (владелец 13.10.2026: «не больше двух
+    рядов кнопок… иначе они не читаются»). Было `N + 1` рядов — по ряду на
+    склад плюс Cancel.
+    """
+    buttons = [
+        {
             "text": f"🏭 {title}",
             "callback_data": f"w:{action}:{warehouse_key(title)}:{number}",
-        }]
+        }
         for title in titles
     ]
+
+    rows = keyboard_layout.grid_rows(
+        buttons,
+        columns=keyboard_layout.columns_for_labels([b["text"] for b in buttons]),
+    )
 
     rows.append([{"text": "✖️ Cancel", "callback_data": "w:cancel:-:0"}])
 
     return {"inline_keyboard": rows}
 
 
-def error_menu_keyboard(path: tuple = ()) -> dict:
+def error_menu_keyboard(path: tuple = (), page: int = 0) -> dict:
     """
     Кнопки меню типа ошибки.
 
@@ -1930,15 +1970,24 @@ def error_menu_keyboard(path: tuple = ()) -> dict:
 
     Выбранный путь едет в callback_data (em:c:<индексы>), поэтому серверное
     состояние не нужно: нажатие обрабатывается в любом порядке.
+
+    🔴 **Раскладка — сетка не больше двух рядов** (требование владельца
+    13.10.2026). До этого каждая категория и каждый подтип занимали **свой
+    ряд**: при десятке подтипов экран уезжал за верх, и оператор не видел
+    всего списка. Лишнее теперь уходит на **следующие страницы**
+    (`em:p:<страница>:<путь>`), а не пропадает.
+
+    Ряд навигации (листание, «Back», «Cancel») считается **отдельно** от двух
+    рядов вариантов — уточнение владельца того же дня.
     """
-    rows = []
+    buttons: List[Dict[str, str]] = []
 
     if not path:
         for index, (title, items) in enumerate(ERROR_MENU.items()):
-            rows.append([{
+            buttons.append({
                 "text": f"{'📂' if items else '•'} {title}",
                 "callback_data": f"em:c:{index}",
-            }])
+            })
     else:
         parent = _error_menu_node(path)
 
@@ -1955,28 +2004,51 @@ def error_menu_keyboard(path: tuple = ()) -> dict:
                 label, button = action
                 code = "custom" if not label else label.lower()
 
-                rows.append([{
+                buttons.append({
                     "text": button,
                     "callback_data": f"em:a:{code}",
-                }])
+                })
                 continue
 
             row_path = ".".join(str(p) for p in path + (index,))
 
-            rows.append([{
+            buttons.append({
                 "text": f"• {item}",
                 # Путь до листа: em:l:<индексы через точку>
                 "callback_data": f"em:l:{row_path}",
-            }])
+            })
 
+    # Ширина ряда — по подписям этого уровня: у подтипов о��и длиннее, и при
+    # шести колонках текст обрезался бы.
+    columns = keyboard_layout.columns_for_labels([b["text"] for b in buttons])
+    page_data = keyboard_layout.paginate(buttons, columns, page)
+
+    rows: List[list] = keyboard_layout.grid_rows(
+        page_data["items"], columns=columns
+    )
+
+    pager = keyboard_layout.pager_row(
+        page_data["page"],
+        page_data["pages"],
+        f"em:p:{'.'.join(str(p) for p in path)}",
+    )
+
+    if pager:
+        rows.append(pager)
+
+    # Навигация идёт **своими рядами** и в лимит двух рядов вариантов не входит.
+    nav: List[Dict[str, str]] = []
+
+    if path:
         parent_path = ".".join(str(p) for p in path[:-1])
-
-        rows.append([{
+        nav.append({
             "text": "⬅️ Back",
             "callback_data": f"em:c:{parent_path}",
-        }])
+        })
 
-    rows.append([{"text": "✖️ Cancel", "callback_data": "em:x"}])
+    nav.append({"text": "✖️ Cancel", "callback_data": "em:x"})
+
+    rows.append(nav)
 
     return {"inline_keyboard": rows}
 
@@ -3401,11 +3473,26 @@ def flush_expired_robot_fixes() -> int:
 
 
 def robot_fix_keyboard(candidates):
-    """Кнопки: исправить на похожий номер или подтвердить текущий."""
-    rows = [
-        [{"text": f"✅ Robot #{number}", "callback_data": f"rf:{number}"}]
+    """
+    Кнопки: исправить на похожий номер или подтвердить текущий.
+
+    🔴 **Сетка, а не по одной в ряд** (владелец 13.10.2026). Было `K + 1`
+    рядов: по ряду на кандидата плюс «номер верный».
+
+    ⚠️ **«No, the number is correct» всегда отдельным рядом.** Это не вариант
+    выбора, а выход из ветки: в одной сетке с номерами его легко нажать по
+    ошибке — подписи стоят вплотную, а решение необратимое (номер уйдёт в
+    журнал как есть).
+    """
+    buttons = [
+        {"text": f"✅ Robot #{number}", "callback_data": f"rf:{number}"}
         for number in candidates
     ]
+
+    rows = keyboard_layout.grid_rows(
+        buttons,
+        columns=keyboard_layout.columns_for_labels([b["text"] for b in buttons]),
+    )
 
     rows.append([{
         "text": "➡️ No, the number is correct",
@@ -3633,6 +3720,41 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
 
     node = _error_menu_node(path) if path else None
 
+    # ── Листание страниц меню ────────────────────────────────────────────────
+    #
+    # `em:p:<путь>:<страница>` — тем же уровнем, но другой страницей. Путь
+    # едет в колбэке, поэтому серверного состояния не нужно: страницу можно
+    # листать в любом порядке, и она не «съезжает» при возврате.
+    #
+    # 🔴 **Почему страницы, а не обрезка.** Меню типа ошибки задаёт владелец
+    # через `TELEGRAM_ERROR_MENU`, и подтипов бывает больше, чем влезает в два
+    # ряда. Показать только первые значило бы **спрятать** остальные типы: их
+    # нельзя было бы выбрать вовсе.
+    if action == "p":
+        page_raw = parts[3] if len(parts) > 3 else ""
+
+        try:
+            page = int(page_raw)
+        except (TypeError, ValueError):
+            page = 0
+
+        if callback_id:
+            tg.answer_callback_query(callback_id)
+
+        title = error_menu_label(path) if path else ""
+        caption = (
+            f"📷 {title}\nChoose a sub-type:" if path else "📷 Choose the issue type:"
+        )
+
+        tg.edit_message_caption(
+            chat_id,
+            message_id,
+            caption,
+            reply_markup=error_menu_keyboard(path, page=page),
+            message_thread_id=_reply_thread(chat_id, pending.get("thread_id")),
+        )
+        return
+
     if action == "c":
         if path and node and node[1]:
             # Категория с подтипами: перерисовываем на новый уровень.
@@ -3825,22 +3947,22 @@ def robot_number_keyboard(chat_id) -> dict:
         return None
 
     # Последние в справочнике — обычно самые «свежие» и нужные.
-    recent = list(numbers)[-8:][::-1]
-    rows = []
-    row = []
+    #
+    # 🔴 **Сколько номеров показывать — из лимита рядов** (владелец 13.10.2026:
+    # «не больше двух рядов кнопок»). Было жёстк�� 8 номеров по 4 в ряд = 2 ряда
+    # **плюс** ряд Cancel, то есть три. Теперь число выводится из правила:
+    # 2 ряда × 6 колонок = 12, и Cancel идёт третьим — но это уже навигация,
+    # а не варианты, и в лимит не входит.
+    recent = list(numbers)[-keyboard_layout.rows_per_page(
+        keyboard_layout.DEFAULT_COLUMNS
+    ):][::-1]
 
-    for number in recent:
-        row.append({
-            "text": str(number),
-            "callback_data": f"em:n:{number}",
-        })
+    buttons = [
+        {"text": str(number), "callback_data": f"em:n:{number}"}
+        for number in recent
+    ]
 
-        if len(row) == 4:
-            rows.append(row)
-            row = []
-
-    if row:
-        rows.append(row)
+    rows = keyboard_layout.grid_rows(buttons)
 
     rows.append([{"text": "✖️ Cancel", "callback_data": "em:x"}])
 

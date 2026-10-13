@@ -42,6 +42,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import keyboard_layout
 import telegram_api as tg
 
 from . import storage
@@ -647,12 +648,28 @@ def _node_keyboard(tree: DecisionTree, node: Node, role: str, items: List[dict])
     """
     rows: List[list] = []
 
+    # 🔴 **Сетка не больше двух рядов** (требование владельца 13.10.2026:
+    # «Сделай по всему боту чтобы было не больше двух рядов кнопок в противном
+    # случае они не читаются»). До этого **каждый вариант шёл своим рядом**, и
+    # экран модуля A42T (8 вариантов) занимал **11 рядов** — кнопки уезжали за
+    # верх экрана.
+    #
+    # **Индекс варианта в `callback_data` остаётся абсолютным**, а не «внутри
+    # страницы»: обработчик (`action == "s"`) берёт его из снимка списка
+    # (`view["options"]`), и относительная нумерация открывала бы чужую карточку.
+    buttons = []
+
     for index, item in enumerate(items):
         state = "🙈 " if item["hidden"] else ""
-        rows.append([{
+        buttons.append({
             "text": f"{index + 1}. {state}{item['label']}"[:60],
             "callback_data": _cb("s", str(index)),
-        }])
+        })
+
+    rows.extend(keyboard_layout.grid_rows(
+        buttons,
+        columns=keyboard_layout.columns_for_labels([b["text"] for b in buttons]),
+    ))
 
     if node.type in _OPTION_NODE_TYPES:
         if role == ROLE_ADMIN:
@@ -884,7 +901,11 @@ def _show_option(chat_id, sender, role: str, message_id, notice: str = "") -> bo
 # ОБЗОР СТРУКТУРЫ И ВЫБОР ЦЕЛИ
 # ============================================================
 
-PAGE_SIZE = 8
+#: 🔴 **Константы размера страницы здесь больше нет.** Раньше было `PAGE_SIZE = 8`,
+#: и список узлов резался по 8 штук **по одному в ряд** — экран структуры и выбор
+#: цели занимали до 11 рядов. С 13.10.2026 размер страницы выводится из правила
+#: «не больше двух рядов» (`keyboard_layout.rows_per_page`), а ширина ряда — из
+#: длины подписей. Число 8 стало неверным: при трёх колонках оно давало три ряда.
 
 
 def _node_parents(tree: DecisionTree) -> Dict[str, List[str]]:
@@ -945,9 +966,16 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
     начинается с модели.
     """
     node_ids = list(tree.nodes)
-    pages = max(1, (len(node_ids) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
-    chunk = node_ids[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    # 🔴 **Размер страницы — из правила «два ряда»** (владелец 13.10.2026), а не
+    # жёсткие 8: подписи узлов длинные («robot_errors_chassis (choice)»), ряд
+    # сужается до трёх колонок, и 8 кнопок дали бы **три** ряда вместо двух.
+    placeholders = [{"text": (tree.node(n).title if tree.node(n) else n)} for n in node_ids]
+    columns = keyboard_layout.columns_for_labels([b["text"] for b in placeholders])
+    pages = keyboard_layout.page_count(len(node_ids), columns)
+    page = keyboard_layout.clamp_page(page, len(node_ids), columns)
+    per_page = keyboard_layout.rows_per_page(columns)
+    chunk = node_ids[page * per_page:(page + 1) * per_page]
 
     overrides = storage.node_overrides()
     parents = _node_parents(tree)
@@ -965,7 +993,7 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
         if node is None:
             continue
 
-        position = page * PAGE_SIZE + offset + 1
+        position = page * per_page + offset + 1
         options = len(node.options)
         lines.append(f"{position}. {node.title}  ({node.id})")
         lines.append(
@@ -982,14 +1010,20 @@ def _structure_screen(tree: DecisionTree, page: int) -> Tuple[str, Dict[str, lis
         lines.append("")
         lines.append("Hidden nodes (their links point past them): " + ", ".join(hidden[:5]))
 
-    rows: List[list] = []
+    # 🔴 **Абсолютная позиция в колбэке.** Раньше здесь ехали `page` и `offset`
+    # по отдельности, и обработчик считал `page * PAGE_SIZE + offset`. Размер
+    # страницы теперь зависит от подписей, поэтому старая формула открыла бы
+    # чужой узел. Абсолютная позиция от размера страницы не зависит вовсе.
+    buttons = []
 
     for offset, node_id in enumerate(chunk):
         node = tree.node(node_id)
-        rows.append([{
-            "text": f"{page * PAGE_SIZE + offset + 1}. {(node.title if node else node_id)}"[:60],
-            "callback_data": _cb("j", f"{page}:{offset}"),
-        }])
+        buttons.append({
+            "text": f"{page * per_page + offset + 1}. {(node.title if node else node_id)}"[:60],
+            "callback_data": _cb("j", str(page * per_page + offset)),
+        })
+
+    rows: List[list] = list(keyboard_layout.grid_rows(buttons, columns=columns))
 
     navigation: List[Dict[str, str]] = []
 
@@ -1019,9 +1053,39 @@ def _target_picker(tree: DecisionTree, page: int, current: Optional[str]) -> Tup
     `next_node` ломают приём ошибок.
     """
     node_ids = list(tree.nodes)
-    pages = max(1, (len(node_ids) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
-    chunk = node_ids[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    # 🔴 **Размер страницы — из правила «два ряда»** (владелец 13.10.2026), а не
+    # жёсткие 8: сколько влезает в два ряда, зависит от длины подписей. Список
+    # узлов даёт длинные подписи («robot_errors_chassis (choice)»), поэтому
+    # колонок будет три, а не шесть, — и `PAGE_SIZE = 8` показывал бы **три**
+    # ряда там, где помещается два.
+    #
+    # Индекс внутри страницы (`offset`) остаётся относительным: обработчик
+    # `action == "G"` читает и страницу, и смещение из колбэка, поэтому по
+    # ним восстанавливается абсолютная позиция.
+    buttons = []
+
+    for offset, node_id in enumerate(node_ids):
+        node = tree.node(node_id)
+        mark = "• " if node_id == current else ""
+
+        buttons.append({
+            "text": f"{mark}{(node.title if node else node_id)} ({node.type.value})"[:60],
+            "callback_data": _cb("G", f"{offset}"),
+        })
+
+    columns = keyboard_layout.columns_for_labels([b["text"] for b in buttons])
+    pages = keyboard_layout.page_count(len(buttons), columns)
+    page = keyboard_layout.clamp_page(page, len(buttons), columns)
+    per_page = keyboard_layout.rows_per_page(columns)
+
+    chunk = buttons[page * per_page:(page + 1) * per_page]
+
+    # Смещение возвращаем в колбэк: без него после листания открылся бы узел с
+    # началом текущей страницы.
+    for offset, button in enumerate(chunk):
+        absolute = page * per_page + offset
+        button["callback_data"] = _cb("G", f"{absolute}")
 
     lines = [
         "Where should this option lead?",
@@ -1032,16 +1096,7 @@ def _target_picker(tree: DecisionTree, page: int, current: Optional[str]) -> Tup
         "Choose a node below. Final nodes end the branch.",
     ]
 
-    rows: List[list] = []
-
-    for offset, node_id in enumerate(chunk):
-        node = tree.node(node_id)
-        mark = "• " if node_id == current else ""
-
-        rows.append([{
-            "text": f"{mark}{(node.title if node else node_id)} ({node.type.value})"[:60],
-            "callback_data": _cb("G", f"{page}:{offset}"),
-        }])
+    rows: List[list] = list(keyboard_layout.grid_rows(chunk, columns=columns))
 
     navigation: List[Dict[str, str]] = []
 
@@ -1517,10 +1572,11 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         return True
 
     if action == "j":
-        page = _int((parts[2] if len(parts) > 2 else "0"), 0)
-        offset = _int((parts[3] if len(parts) > 3 else "0"), 0)
+        # Позиция приходит **абсолютной** — так её и кладёт `_structure_screen`.
+        # Считать её как `page * PAGE_SIZE + offset` нельзя: размер страницы
+        # зависит от длины подписей, и формула открыла бы чужой узел.
+        position = _int((parts[3] if len(parts) > 3 else "0"), 0)
         node_ids = list(tree.nodes)
-        position = page * PAGE_SIZE + offset
         _answer(callback_id)
 
         if 0 <= position < len(node_ids):
@@ -1623,10 +1679,14 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         if arg == "e":
             target: Optional[str] = None
         else:
-            page = _int((parts[2] if len(parts) > 2 else "0"), 0)
-            offset = _int((parts[3] if len(parts) > 3 else "0"), 0)
+            # 🔴 **Позиция приходит абсолютной** — так её и кладёт
+            # `_target_picker`. Раньше здесь считалось `page * PAGE_SIZE +
+            # offset` по жёсткой константе 8; после перехода на сетку «два
+            # ряда» размер страницы стал зависеть от длины подписей, и старая
+            # формула открывала бы **чужой узел** (или уходила за границы
+            # списка). Проверка границ остаётся — она и ловит битый колбэк.
+            position = _int((parts[3] if len(parts) > 3 else "0"), 0)
             node_ids = list(tree.nodes)
-            position = page * PAGE_SIZE + offset
 
             if not (0 <= position < len(node_ids)):
                 _answer(callback_id, "Node not found")

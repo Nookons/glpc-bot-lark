@@ -7297,7 +7297,11 @@ def test_error_menu_parse_and_keyboard():
         bot.ERROR_MENU = menu
 
         root = bot.error_menu_keyboard(())
-        labels = [row[0]["text"] for row in root["inline_keyboard"]]
+        # 🔴 **Читаем ВСЕ кнопки, а не по одной из ряда.** С 13.10.2026 меню
+        # рисуется сеткой (владелец: «не больше двух рядов кнопок… иначе они не
+        # читаются»), поэтому `row[0]` видел бы только первую кнопку ряда и
+        # проверка «порядок категорий» стала бы ложно-зелёной.
+        labels = [b["text"] for row in root["inline_keyboard"] for b in row]
         check(
             "меню: первый уровень — категории",
             labels == ["📂 Robot", "📂 Location", "• Qr Code", "✖️ Cancel"],
@@ -7309,11 +7313,12 @@ def test_error_menu_parse_and_keyboard():
         )
         check(
             "меню: категория без подтипов помечена точкой",
-            "📂" not in root["inline_keyboard"][2][0]["text"],
+            all("📂" not in b["text"] for row in root["inline_keyboard"] for b in row
+                if b["text"] == "• Qr Code"),
         )
 
         second = bot.error_menu_keyboard((0,))
-        labels = [row[0]["text"] for row in second["inline_keyboard"]]
+        labels = [b["text"] for row in second["inline_keyboard"] for b in row]
         check(
             "меню: второй уровень — подтипы, назад и отмена",
             labels == ["• Abnormal walking", "• Stuck", "⬅️ Back", "✖️ Cancel"],
@@ -7321,7 +7326,8 @@ def test_error_menu_parse_and_keyboard():
         )
         check(
             "меню: подтип ведёт на лист",
-            second["inline_keyboard"][1][0]["callback_data"] == "em:l:0.1",
+            any(b["callback_data"] == "em:l:0.1"
+                for row in second["inline_keyboard"] for b in row),
         )
         check(
             "меню: метка листа склеена из уровней",
