@@ -182,8 +182,13 @@ def _page_hint(session: Session) -> str:
     # ширине текста: у длинных подписей на страницу помещается 2–4, а не 12.
     # Подпись сказала бы «options 1–12», а на экране было бы четыре — то есть
     # оператор решил бы, что часть вариантов потерялась.
-    per_page = options_per_page(visible)
-    total = total_option_pages(count, visible)
+    # Ширина считается **со стрелкой** — так же, как рисует `_option_rows`.
+    # Без этого подпись обещала больше вариантов, чем помещалось на экран.
+    from .keyboards import has_next_arrow
+
+    arrow = has_next_arrow(node, visible)
+    per_page = options_per_page(visible, has_next=arrow)
+    total = total_option_pages(count, visible, has_next=arrow)
 
     if total <= 1:
         return ""

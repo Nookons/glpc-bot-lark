@@ -223,6 +223,26 @@ def labels_for_options(options: List, has_next: bool = False) -> List[str]:
     return labels
 
 
+def has_next_arrow(node: Node, options: List) -> bool:
+    """
+    Будет ли у кнопок стрелка `→` — она входит в ширину и меняет число колонок.
+
+    🔴 **Одна функция на все места.** Дефект, найденный аудитом 13.10.2026:
+    `_option_rows` считала ширину **со** стрелкой, а окно страницы
+    (`_options_per_page`) и подпись (`flow._page_hint`) — **без** неё. У узла с
+    `node.next_node` число колонок выходило больше, чем влезало, и рядов
+    печаталось больше лимита владельца: воспроизведено **9 рядов вместо 6**.
+    Кнопки уезжали за верх экрана — ровно то, на что он жаловался.
+    """
+    if node is None:
+        return False
+
+    if node.type == NodeType.MULTI:
+        return False
+
+    return bool(node.next_node) or any(o.next_node for o in options)
+
+
 def _options_per_page(options: List, has_next: bool = False) -> int:
     """
     Сколько вариантов помещается на страницу при текущей ширине ряда.
@@ -236,7 +256,7 @@ def _options_per_page(options: List, has_next: bool = False) -> int:
     return _columns_for(labels_for_options(options, has_next)) * OPTION_ROWS_PER_PAGE
 
 
-def options_per_page(options: List | None = None) -> int:
+def options_per_page(options: List | None = None, has_next: bool = False) -> int:
     """
     Сколько вариантов на странице — **публичная** форма `_options_per_page`.
 
@@ -245,7 +265,10 @@ def options_per_page(options: List | None = None) -> int:
     константа 12, а раскладка шла по ширине текста, подпись обещала 12 вариантов
     там, где на экране было четыре.
     """
-    return _options_per_page(options) if options else OPTIONS_PER_PAGE
+    return (
+        _options_per_page(options, has_next=has_next)
+        if options else OPTIONS_PER_PAGE
+    )
 
 
 def _option_rows(
@@ -305,7 +328,9 @@ def _option_pages(session: Session) -> Dict[str, int]:
     return pages
 
 
-def total_option_pages(count: int, options: List | None = None) -> int:
+def total_option_pages(
+    count: int, options: List | None = None, has_next: bool = False
+) -> int:
     """Сколько страниц нужно для `count` вариантов (минимум одна).
 
     **`options` нужен, потому что размер страницы теперь зависит от подписей:**
@@ -316,7 +341,10 @@ def total_option_pages(count: int, options: List | None = None) -> int:
     if count <= 0:
         return 1
 
-    per_page = _options_per_page(options) if options else OPTIONS_PER_PAGE
+    per_page = (
+        _options_per_page(options, has_next=has_next)
+        if options else OPTIONS_PER_PAGE
+    )
 
     return (count + per_page - 1) // per_page
 
@@ -413,8 +441,13 @@ def node_keyboard(session: Session) -> Dict[str, list]:
         # поэтому на страницу помещается 6, а не 12. Считать по константе
         # значило бы показать на первой странице меньше вариантов, чем влезает,
         # и потерять часть из них между страницами.
-        per_page = _options_per_page(visible)
-        total = total_option_pages(len(visible), visible)
+        # Ширина считается **по тому же тексту, что рисуется** — со стрелкой.
+        per_page = _options_per_page(
+            visible, has_next=has_next_arrow(node, visible)
+        )
+        total = total_option_pages(
+            len(visible), visible, has_next=has_next_arrow(node, visible)
+        )
 
         start = page * per_page
         page_options = visible[start : start + per_page]

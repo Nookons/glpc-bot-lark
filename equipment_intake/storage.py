@@ -105,6 +105,22 @@ TEMPLATE_COLUMNS = (
 # TTL, чтобы после применения миграции бот подхватил её без перезапуска.
 _V2_TTL_SECONDS = 120
 _v2_state: Optional[bool] = None
+
+#: 🔴 **Память о таблице УЗЛОВ — своя, отдельная от `_v2_state`.**
+#:
+#: Дефект, найденный аудитом 13.10.2026. `load_node_rows` при недоступности
+#: таблицы `telegram_intake_nodes` помечала `_remember_v2(False)` — общий признак
+#: «нет колонок v2 у таблицы **вариантов**». Следствие тяжёлое: `_read_options`
+#: уходила на набор v1 (7 колонок вместо 12), и в рабочем дереве снова
+#: появлялись **18** скрытых и удалённых кнопок (включая петлю
+#: `k50h_a42t_c2 → robot_type`), ветка `Fingers` пропадала, а редактор отвечал
+#: «база не готова». Деградация залипала на весь TTL и переживала
+#: восстановление связи.
+#:
+#: Две разные таблицы не могут делить один признак: сбой чтения одной не
+#: означает ничего про колонки другой.
+_node_state: Optional[bool] = None
+_node_checked_at: float = 0.0
 _v2_checked_at: float = 0.0
 
 #: Есть ли колонка связи `template_id` (миграция `0109`). **Отдельная память**:
@@ -133,6 +149,26 @@ _UNSET = object()
 # ============================================================
 # ЧТЕНИЕ
 # ============================================================
+
+def _node_table_known_missing() -> bool:
+    """Точно ли известно, что таблицы узлов нет (и память ещё свежа).
+
+    Отдельно от `_v2_known_unsupported`: это **разные** таблицы, и сбой чтения
+    одной не говорит ничего про колонки другой.
+    """
+    return (
+        _node_state is False
+        and time.time() - _node_checked_at < _V2_TTL_SECONDS
+    )
+
+
+def _remember_node_table(present: bool) -> None:
+    """Запомнить, читается ли таблица узлов (своя память, см. `_node_state`)."""
+    global _node_state, _node_checked_at
+
+    _node_state = bool(present)
+    _node_checked_at = time.time()
+
 
 def _remember_v2(supported: bool) -> None:
     global _v2_state, _v2_checked_at
@@ -280,13 +316,11 @@ def load_node_rows() -> Optional[List[dict]]:
     пока миграция не применена, каждый запрос даёт 404 в логе, и настоящие
     проблемы в нём не видны.
 
-    Пропуск запроса привязан к тому же признаку, что и проверка колонок v2:
-    таблица и колонки создаются **одной** миграцией. Отдельного «помню, что
-    таблицы нет» здесь намеренно нет: если бы этот признак расходился с
-    `_v2_state`, `node_overrides()` вернул бы пусто и правка заголовка
-    показывала бы скрытый узел — ровно тот дефект, который уже исправлялся.
+    🔴 **Память у этой таблицы своя** (`_node_state`). Раньше пропуск запроса
+    был привязан к общему признаку «нет колонок v2 у **вариантов**», и сбой
+    чтения узлов ломал чтение кнопок: см. `_node_state`.
     """
-    if _v2_known_unsupported():
+    if _node_table_known_missing():
         return []
 
     from sendToDataBase import rest_get
@@ -316,11 +350,20 @@ def load_node_rows() -> Optional[List[dict]]:
             )
 
     if rows is None:
-        # Таблицы нет — значит и миграции v2 нет: отметить это, чтобы не
-        # спрашивать её снова на каждое сообщение. Признак общий с колонками
-        # намеренно: так не бывает состояния «колонки есть, а таблицы нет».
-        _remember_v2(False)
+        # 🔴 **Помечаем «нет таблицы УЗЛОВ», а НЕ «нет колонок у вариантов».**
+        #
+        # Здесь стояло `_remember_v2(False)` — общий признак. Сбой чтения
+        # `telegram_intake_nodes` уводил `_read_options` на набор v1 (7 колонок
+        # вместо 12), и в рабочем дереве снова появлялись **18** скрытых и
+        # удалённых кнопок (включая петлю `k50h_a42t_c2 → robot_type`), ветка
+        # `Fingers` пропадала, редактор отвечал «база не готова». Деградация
+        # залипала на TTL и переживала восстановление связи.
+        #
+        # Две разные таблицы не могут делить один признак.
+        _remember_node_table(False)
         return []
+
+    _remember_node_table(True)
 
     return [row for row in rows if isinstance(row, dict)]
 
@@ -361,11 +404,16 @@ def overlay_supported() -> bool:
 def reset_capability_cache() -> None:
     """Сброс памяти о возможностях схемы — только для тестов."""
     global _v2_state, _v2_checked_at, _link_state, _link_checked_at
+    global _node_state, _node_checked_at
 
     _v2_state = None
     _v2_checked_at = 0.0
     _link_state = None
     _link_checked_at = 0.0
+    # Таблица узлов — своя память (см. `_node_state`): без сброса тест, увидевший
+    # её недоступной, оставил бы `False` для всех следующих.
+    _node_state = None
+    _node_checked_at = 0.0
     reset_links_cache()
     # Координаты холста — своя миграция, поэтому и память своя: без сброса
     # тест, проверивший работу до `0114`, оставил бы `False` для всех следующих.
@@ -859,6 +907,21 @@ def effective_options(
     """
     node = base.node(node_id)
 
+    # 🔴 **Признак «узел собран из строк» — чтобы кнопки не сочли встроенными.**
+    #
+    # Дефект, найденный аудитом 13.10.2026. Когда узла нет в переданном дереве,
+    # он собирается из строк базы (`_web_node`), и его кнопки попадали в **первую**
+    # ветку цикла ниже — с `is_builtin: True` и `kind: "edited"`, хотя в коде их
+    # нет. Два читателя одного дерева расходились: редактор `/tree` (зовёт с
+    # `DEFAULT_TREE`) показывал `is_builtin=true`, а карта (зовёт со слитым
+    # деревом, где узел есть) — `false, added`. В базе при этом `false`.
+    #
+    # Последствие для человека: он нажимал «Delete» на **своей** кнопке и получал
+    # «Built-in options are hidden, not deleted» — удалить её через бота было
+    # нельзя. Именно эти кнопки правит `move_option`, и он же писал им
+    # `is_builtin=true` (исправлено там же).
+    built_from_rows = node is None
+
     if node is None:
         # Узел создан из веба: в коде его нет, но варианты у него уже могут быть.
         # Собираем временный узел из строк, чтобы кнопки нового блока были видны
@@ -907,13 +970,18 @@ def effective_options(
             # но терять нельзя (например, Yes = True у YESNO).
             "value": option.value,
             "status": option.status,
-            "is_builtin": True,
+            # Встроенная — только если узел есть в коде. У собранного из строк
+            # узла все кнопки **добавленные** (см. `built_from_rows`).
+            "is_builtin": not built_from_rows,
             "hidden": hidden,
             # Удаление — отдельное состояние: человек различает «временно скрыл»
             # и «удалил насовсем», и сводить их в одно значило бы потерять эту
             # разницу (в том числе при восстановлении).
             "deleted": _row_deleted(row) if row else False,
-            "kind": "edited" if row else "builtin",
+            "kind": (
+                "added" if built_from_rows
+                else ("edited" if row else "builtin")
+            ),
             # Связь со справочником шаблонов (миграция `0109`). У строки без
             # колонки (старая база) её просто нет — `None`, а не выдумка.
             "template_id": row.get("template_id") if row else None,
@@ -998,10 +1066,20 @@ def hidden_node_target(
     if node is None or node.type == NodeType.FINAL or node_id == base.root_id:
         return None
 
+    # 🔴 **Удалённые кнопки не считаются.** Здесь отбрасывалось только
+    # `hidden`, и удалённая кнопка попадала в набор целей. Дефект найден аудитом
+    # 13.10.2026 и воспроизведён: у узла одна живая кнопка (`→ x`) и одна
+    # удалённая (`→ y`) — множество целей выходило из двух элементов, функция
+    # возвращала `None`, и узел **нельзя было ни скрыть, ни удалить**. Отказ при
+    # этом объяснялся вводящим в заблуждение «варианты ведут в разные места»,
+    # хотя рабочее дерево вело ровно в `x`.
+    #
+    # Оператор видит только живые кнопки, поэтому и решение обязано опираться
+    # на них.
     outgoing = [
         item["next_node"]
         for item in effective_options(base, node_id, option_rows)
-        if not item["hidden"] and item["next_node"]
+        if not item["hidden"] and not item.get("deleted") and item["next_node"]
     ]
 
     if not outgoing:
@@ -1804,7 +1882,11 @@ def set_option_hidden(
 
     if hidden:
         rows = _read_options() or []
-        node = base.node(node_id)
+        # 🔴 **Узел ищется и среди созданных из веба.** Здесь стояло только
+        # `base.node(node_id)`: у блока из веба его в коде нет, `node` выходил
+        # `None`, и защита **пропускалась** — последнюю кнопку удавалось скрыть.
+        # Оператор оставался с одним «Cancel» и записать ошибку не мог.
+        node = base.node(node_id) or _web_node(node_id, rows)
 
         if (
             node is not None
@@ -1892,7 +1974,11 @@ def delete_option(
     if entry.get("deleted"):
         return True
 
-    node = base.node(node_id)
+    # 🔴 **Узел ищется и среди созданных из веба** — по той же причине, что и в
+    # `set_option_hidden`: иначе защита пропускалась, и последнюю кнопку
+    # удавалось удалить. Проверено на живом `robot_errors_fingers`: вызов
+    # возвращал `True`, оставляя узел без вариантов.
+    node = base.node(node_id) or _web_node(node_id, rows)
 
     if (
         node is not None
@@ -1992,7 +2078,21 @@ def move_option(
             "description": item["description"],
             "icon": item["icon"],
             "only_for": list(item["only_for"]),
-            "is_builtin": bool(item["is_builtin"]),
+            # 🔴 **`is_builtin` — по факту: есть ли кнопка в КОДЕ.**
+            #
+            # Здесь стояло `bool(item["is_builtin"])` — значение из словаря
+            # `effective_options`. Для блока, созданного из веба, этот словарь
+            # собран по базовому дереву и **врёт**: встроенной кнопки там нет, а
+            # признак выходит `True`. Следствие проверено на живых данных:
+            # `move_option("ask_cause_fingers", …)` записывал всем четырём
+            # кнопкам `is_builtin=true`, после чего **карта отдавала у блока
+            # `option_count=0`** — человек видел пустой блок и решал, что кнопки
+            # потеряны (они оставались в базе, но считались «правкой
+            # встроенной»).
+            #
+            # Тот же расчёт, что в `link_option_to_template`: признак обязан
+            # следовать факту, а не словарю, собранному по неполному дереву.
+            "is_builtin": bool(_find_base_option(base, node_id, item["id"])),
             "hidden": bool(item["hidden"]),
             "sort_order": position * ORDER_STEP + ORDER_STEP,
             "updated_by": str(updated_by) if updated_by is not None else None,
@@ -2693,6 +2793,20 @@ def _repoint_references_to(
 
         if not other or other == removed_id or base.node(other) is not None:
             continue
+
+        # 🔴 **Кнопки веб-узлов тоже переводятся.**
+        #
+        # Здесь проверялся только `next_node` самого узла, а его **кнопки** — нет.
+        # Дефект найден аудитом 13.10.2026 и воспроизведён: после удаления
+        # веб-узла `webB` кнопка другого веб-узла (`webA.goB`) продолжала
+        # указывать на `webB`. Рабочее дерево такую цель отбрасывает
+        # (`→ None`), и ветка обрывалась: оператор нажимал кнопку, а диалог
+        # заканчивался ничем. Комментарий рядом обещал «ссылки возвращаются на
+        # продолжение ветки» — обещание не выполнялось.
+        for item in effective_options(base, other, _read_options() or []):
+            if item["next_node"] == removed_id:
+                if update_option(other, item["id"], next_node=target, base=base):
+                    fixed += 1
 
         if str(row.get("next_node") or "") == removed_id:
             if update_node(other, next_node=target, base=base):
