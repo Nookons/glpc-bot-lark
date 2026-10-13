@@ -17,8 +17,11 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
+from equipment_intake import storage
 from equipment_intake.keyboards import node_keyboard
+from equipment_intake.error_templates import is_error_node  # noqa: E402
 from equipment_intake.tree_config import (
     DEFAULT_TREE,
     MODULE_ERRORS,
@@ -441,6 +444,61 @@ class TestCauseQuestion:
         assert "dirty_code" in lists["qr_code"]
         assert "dirty_code" not in lists["chassis"]
 
+    def test_every_error_button_leads_to_a_cause_node_of_its_own_module(self) -> None:
+        """
+        🔴 **Любая кнопка ошибки ведёт в узел причин СВОЕГО модуля.**
+
+        Проверяются **все** узлы `robot_errors_*`, а не только известные коду:
+        узел, созданный из веба (владелец добавил модуль — «хочу добавить
+        `robots_error_` что-то там»), в `MODULE_ERRORS` отсутствует, и прежняя
+        проверка его **не видела**.
+
+        **Дефект, который это ловит (живой, 13.10.2026).** Ветка владельца
+        `robot_errors_fingers` вела в `ask_cause_qr_code`: выбрав «Fingers stuck
+        open/close», оператор видел причины QR-кода («Dirty or damaged floor
+        code»). Причина уходит в отчёт и определяет метрику, поэтому чужая
+        причина — это неверные данные, а не косметика.
+        """
+        found = 0
+
+        for node_id, node in DEFAULT_TREE.nodes.items():
+            if not is_error_node(node_id):
+                continue
+
+            for option in node.options:
+                found += 1
+                target = option.next_node or ""
+
+                assert target.startswith("ask_cause"), (
+                    f"{node_id}.{option.id} ведёт в {target!r} — это не узел причин"
+                )
+
+                # Хвост обязан совпасть с хвостом узла ошибок: `robot_errors_lift`
+                # -> `ask_cause_lift`. Иначе у одного железа два узла причин.
+                module = node_id[len("robot_errors_"):]
+                assert target == cause_node_id(module), (
+                    f"{node_id}.{option.id} ведёт в {target!r}, "
+                    f"а должен — в {cause_node_id(module)!r}"
+                )
+
+        assert found > 0, "не нашлось ни одной кнопки ошибки — пров��рка выродилась"
+
+    def test_every_error_node_has_a_title_for_the_operator(self) -> None:
+        """
+        Заголовок узла ошибок читается человеком, а не повторяет служебный id.
+
+        Живой дефект: у созданного из веба `robot_errors_fingers` заголовком был
+        **сам id**, и оператор видел «robot_errors_fingers: what is wrong?»
+        вместо «Fingers: what is wrong?» (у остальных — «Tray: what is wrong?»).
+        """
+        for node_id, node in DEFAULT_TREE.nodes.items():
+            if not is_error_node(node_id):
+                continue
+
+            assert node.title and node.title != node_id, (
+                f"{node_id}: заголовок — служебный id, оператор увидит его как вопрос"
+            )
+
     def test_old_shared_cause_node_is_gone(self) -> None:
         """Общего узла `ask_cause` больше нет — иначе осталась бы вторая точка входа."""
         assert DEFAULT_TREE.node("ask_cause") is None, (
@@ -488,6 +546,96 @@ class TestCauseQuestion:
         """Ответ о причине попадает в результат с ключом `cause` — у каждого модуля."""
         for module in MODULE_ERRORS:
             assert DEFAULT_TREE.node(cause_node_id(module)).answer_key() == "cause"
+
+
+class TestLiveOverlayLinksEveryErrorToItsOwnCauses:
+    """
+    🔴 **Живой оверлей (база) связывает ошибку со СВОИМИ причинами.**
+
+    Сторожа выше проверяют **код** (`DEFAULT_TREE`). Но узлы и кнопки создаются
+    и правятся из веба и живут **строками в базе** — владелец добавил модуль и
+    узел ошибок именно так. Код-сторож такого дефекта не видит: `robot_errors_fingers`
+    в `DEFAULT_TREE` отсутствует.
+
+    **Дефект (живой, 13.10.2026).** Ветка владельца вела из ошибки пальцев в
+    `ask_cause_qr_code`, и оператор видел причины QR-кода. Причина уходит в отчёт.
+
+    **Как проверяется без сети.** `rest_get` подменяется: строки базы подаются
+    прямо в `apply_overlay`, поэтому тест офлайновый и детерминированный.
+    """
+
+    def _overlay(self, nodes=(), options=()):
+        """Дерево с наложенными строками «базы» — как его видит бот."""
+        def fake_get(table, params=None, optional=False):
+            if table == storage.NODE_TABLE:
+                return list(nodes)
+            if table == storage.OPTION_TABLE:
+                return list(options)
+            return []
+
+        with patch("sendToDataBase.rest_get", side_effect=fake_get):
+            storage.reset_capability_cache()
+
+            return storage.apply_overlay(DEFAULT_TREE)
+
+    def test_error_node_from_web_leads_to_its_own_causes(self):
+        """Ошибка, созданная из веба, ведёт в `ask_cause_<её модуль>`."""
+        tree = self._overlay(
+            nodes=[{
+                "node_id": "robot_errors_camera", "node_type": "choice",
+                "title": "Camera: what is wrong?", "next_node": None,
+                "hidden": False, "deleted": False,
+            }, {
+                "node_id": "robot_module_a42t", "node_type": "choice",
+                "title": "A42T: which module?", "next_node": None,
+                "hidden": False, "deleted": False,
+            }],
+            options=[
+                {"node_id": "robot_module_a42t", "option_id": "camera",
+                 "label": "Camera", "next_node": "robot_errors_camera",
+                 "hidden": False, "deleted": False, "sort_order": 100},
+                {"node_id": "robot_errors_camera", "option_id": "camera_dead",
+                 "label": "Camera is dead", "next_node": "ask_cause_camera",
+                 "hidden": False, "deleted": False, "sort_order": 10},
+            ],
+        )
+
+        node = tree.node("robot_errors_camera")
+        assert node is not None, "узел из веба не попал в дерево"
+
+        targets = {option.next_node for option in node.options}
+        assert targets == {"ask_cause_camera"}, (
+            f"ошибка из веба ведёт в {targets}, а должна — в ask_cause_camera"
+        )
+
+    def test_mislinked_error_from_web_is_detected(self):
+        """
+        🔴 Обратная сторона: чужая причина **обнаруживается**.
+
+        Без этой проверки тест выше проходил бы и при «любой узел причин сойдёт»:
+        он сравнивает конкретный id, но не показывает, что подмена ссылки на
+        чужую ломает проверку. Здесь ссылка намеренно направлена в причины
+        другого модуля — как было в живой ветке владельца.
+        """
+        tree = self._overlay(
+            nodes=[{
+                "node_id": "robot_errors_camera", "node_type": "choice",
+                "title": "Camera: what is wrong?", "next_node": None,
+                "hidden": False, "deleted": False,
+            }],
+            options=[
+                {"node_id": "robot_errors_camera", "option_id": "camera_dead",
+                 "label": "Camera is dead", "next_node": "ask_cause_qr_code",
+                 "hidden": False, "deleted": False, "sort_order": 10},
+            ],
+        )
+
+        targets = {o.next_node for o in tree.node("robot_errors_camera").options}
+
+        assert targets == {"ask_cause_qr_code"}, "подмена не сработала"
+        assert targets != {"ask_cause_camera"}, (
+            "проверка не отличает свои причины от чужих — сторож бесполезен"
+        )
 
 
 class TestEditorExplainsTheStructure:
