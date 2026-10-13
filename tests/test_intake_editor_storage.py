@@ -1165,6 +1165,98 @@ class WebCreatedBlocksAreEditable(EditorStorageTestCase):
         )
 
 
+class CauseTemplateLinksDoNotLeak(EditorStorageTestCase):
+    """
+    🔴 Связь заготовки не «утекает» между модулями.
+
+    **Дефект, найденный на живой базе 13.10.2026 — 32 утечки.** У причин id
+    повторяются: `human_error` и `software_fault` есть у девяти модулей,
+    `mechanical_wear` — у восьми. Карта связей держала **голый ключ по
+    `option_id`**, поэтому связь, выставленная у одной причины, применялась ко
+    всем одноимённым: шасси с причиной «Mechanical wear» получало шаблон
+    безопасности 65 («Robot safety device triggered») — не свою ошибку.
+
+    Утечка появилась не сама: пока заготовки висели на кнопках **ошибок**, их id
+    были уникальны (11 кнопок, 0 повторов), и голый ключ был безопасен. После
+    переноса заготовок на **причины** он стал неоднозначным.
+
+    Голый ключ оставлен только для слоя ошибок — там он по-прежнему однозначен.
+    """
+
+    def test_bare_key_is_kept_for_errors_only(self):
+        """
+        Голый ключ есть у ошибки (совместимость) и **нет** у причины.
+
+        Совместимость обязательна: связи ошибок уже сохранены в базе этой схемой,
+        и их потеря «выключила бы» заготовки у владельца.
+        """
+        storage.link_option_to_template("robot_errors_chassis", "chassis_went_off_road", 120)
+        storage.link_option_to_template("ask_cause_safety", "mechanical_wear", 65)
+        storage.reset_links_cache()
+
+        links = storage.option_template_links()
+
+        self.assertEqual(links.get("chassis_went_off_road"), 120, "связь ошибки потерялась")
+        self.assertEqual(links.get("ask_cause_safety::mechanical_wear"), 65)
+        self.assertNotIn(
+            "mechanical_wear", links,
+            "голый ключ причины снова появился — связь утечёт в другие модули",
+        )
+
+    def test_cause_does_not_inherit_another_modules_template(self):
+        """
+        Причина одного модуля не берёт заготовку одноимённой причины другого.
+        """
+        from equipment_intake.error_templates import linked_template
+
+        # 🔴 **Заготовка обязана быть в справочнике.** Без неё `resolve` не
+        # найдёт строку по `template_id` и вернёт `None` **независимо от
+        # утечки** — проверка проходила бы и на сломанном коде. Поймано
+        # негативной проверкой: при откате фикса тест оставался зелёным.
+        self.db.rows[storage.TEMPLATES_TABLE] = [
+            {"id": 65, "employee_title": "Robot safety device triggered"},
+        ]
+
+        storage.link_option_to_template("ask_cause_safety", "mechanical_wear", 65)
+        storage.reset_links_cache()
+        links = storage.option_template_links()
+
+        # Одноимённая причина **другого** модуля: своей связи нет.
+        # Без защиты она нашла бы 65 по голому ключу и утекла бы в рог.
+        found = linked_template(
+            [{"node_id": "robot_errors_horn", "option_id": "horn_cant_extend",
+              "label": "Can't extend/expand the HORN"},
+             {"node_id": "ask_cause_horn", "option_id": "mechanical_wear",
+              "label": "Mechanical wear"}],
+            self.db.rows[storage.TEMPLATES_TABLE],
+            links,
+        )
+
+        self.assertIsNone(found, "причина рога взяла заготовку безопасности")
+
+    def test_cause_uses_its_own_template(self):
+        """Обратная сторона: своя связь причины работает."""
+        from equipment_intake.error_templates import linked_template
+
+        self.db.rows[storage.TEMPLATES_TABLE] = [
+            {"id": 65, "employee_title": "Robot safety device triggered"},
+        ]
+
+        storage.link_option_to_template("ask_cause_safety", "sensor_fault", 65)
+        storage.reset_links_cache()
+        links = storage.option_template_links()
+
+        found = linked_template(
+            [{"node_id": "ask_cause_safety", "option_id": "sensor_fault",
+              "label": "Sensor fault"}],
+            self.db.rows[storage.TEMPLATES_TABLE],
+            links,
+        )
+
+        self.assertIsNotNone(found, "своя связь причины не сработала")
+        self.assertEqual(found["id"], 65)
+
+
 class EditorCreatesStubChecks(EditorStorageTestCase):
     """`/tree` при добавлении ошибки заводит заготовку в `issue_templates`.
 
