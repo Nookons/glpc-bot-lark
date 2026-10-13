@@ -1066,6 +1066,105 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class WebCreatedBlocksAreEditable(EditorStorageTestCase):
+    """
+    🔴 Блоки и кнопки, **созданные из веба**, полностью редактируемы.
+
+    Оба дефекта ниже воспроизведены на живом стенде 13.10.2026, и оба — про одно
+    и то же: проверка «узел существует» смотрела **только в код**
+    (`DEFAULT_TREE`), а блок, созданный из веба, живёт строкой в базе.
+
+    Требование владельца, ради которого это нужно, дословно: «на лету добавлять
+    удалять новые блоки с вопросами или кнопками… максимально гибко настраивать
+    бота как только я хочу через веб а не только через код».
+    """
+
+    def _web_block(self) -> str:
+        """Блок, созданный из веба; убирается после теста в любом случае."""
+        node_id = storage.add_node(
+            title="Web block",
+            node_type="choice",
+            after_node_id="root",
+            after_option_id="robot",
+            created_by="web",
+        )
+
+        self.assertIsNotNone(node_id, "блок из веба не создался")
+        self.addCleanup(storage.delete_node, node_id, updated_by="cleanup")
+
+        return node_id
+
+    def test_web_block_is_absent_from_the_code_tree(self):
+        """
+        Признак, на котором ломались проверки: в коде блока **нет**.
+
+        Без этой проверки следующие две проходили бы и по другой причине — если
+        `add_node` вдруг стал бы править `DEFAULT_TREE`, они бы «работали», а
+        проверяли не то.
+        """
+        node_id = self._web_block()
+
+        self.assertIsNone(DEFAULT_TREE.node(node_id))
+        self.assertIn(node_id, storage._known_node_ids(DEFAULT_TREE))
+
+    def test_web_block_can_be_dragged(self):
+        """
+        🔴 Дефект: блок виден на карте, но перетащить его было нельзя.
+
+        `update_node_position` проверял узел по коду и отвечал `False`, холст
+        показывал «unknown node» (HTTP 400), и позиция не сохранялась. В журнале
+        бота это выглядело как **пять отказов подряд** после создания блока.
+        """
+        node_id = self._web_block()
+
+        saved = storage.update_node_position(node_id, 123.0, 45.0, updated_by="web")
+
+        self.assertTrue(saved, "блок из веба не перетаскивается")
+
+        row = next(
+            r for r in self.db.rows["telegram_intake_nodes"]
+            if r.get("node_id") == node_id
+        )
+
+        self.assertEqual(row.get("position_x"), 123.0)
+        self.assertEqual(row.get("position_y"), 45.0)
+
+    def test_web_option_can_be_linked_to_a_template(self):
+        """
+        🔴 Дефект: у кнопки на блоке из веба выбор заготовки молча не сохранялся.
+
+        `link_option_to_template` тоже проверял узел по коду и возвращал `False`.
+        В редакторе это выглядело как «выбрал заготовку, а связи нет» — без
+        ошибки и без подсказки.
+        """
+        node_id = self._web_block()
+        option_id = storage.add_option(node_id, "Web cause", created_by="web")
+
+        self.assertIsNotNone(option_id, "кнопка на блоке из веба не создалась")
+
+        linked = storage.link_option_to_template(
+            node_id, option_id, 53, updated_by="web"
+        )
+
+        self.assertTrue(linked, "связь с заготовкой на блоке из веба не сохранилась")
+
+    def test_linking_is_not_weakened_for_unknown_nodes(self):
+        """
+        Обратная сторона: **несуществующий** узел по-прежнему отвергается.
+
+        Без этой проверки ослабление валидации прошло бы незамеченным: связь
+        завелась бы на узел-опечатку, и её не показал бы ни один экран.
+        """
+        self.assertFalse(
+            storage.link_option_to_template("no_such_node", "x", 53),
+            "связь завелась на несуществующий узел",
+        )
+        self.assertFalse(
+            storage.update_node_position("no_such_node", 1.0, 2.0),
+            "позиция записалась несуществующему узлу",
+        )
+
+
 class EditorCreatesStubChecks(EditorStorageTestCase):
     """`/tree` при добавлении ошибки заводит заготовку в `issue_templates`.
 
