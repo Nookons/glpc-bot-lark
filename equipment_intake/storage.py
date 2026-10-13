@@ -723,6 +723,35 @@ def link_option_to_template(
     if entry is None:
         return False
 
+    # 🔴 **Заготовка обязана существовать.**
+    #
+    # Воспроизведено 13.10.2026: `link_option_to_template(..., 999999)` отвечал
+    # `True`, хотя заготовки с таким id нет. В базу попадала ссылка на
+    # несуществующую строку, и человек видел «связь есть», а в отчёт **ничего не
+    # подставлялось** — тип ошибки, «что сделано» и время решения оставались
+    # пустыми. Понять причину по интерфейсу было нельзя: связь выглядела
+    # выставленной.
+    #
+    # `None` — осмысленное «снять связь», его проверять не нужно.
+    #
+    # 🔴 **Проверка мягкая: сверяем только когда есть с чем.** `load_templates`
+    # возвращает пустой список и для «заготовок нет», и для «справочник
+    # недоступен» — по её документации это одно и то же. Отвергать связь на
+    # пустом списке значило бы **запретить привязку при недоступной базе**: то
+    # есть сбой чтения выглядел бы как «нельзя сохранить», и человек не понял бы
+    # почему. Мягкая деградация здесь — то же правило, что у валидации номера:
+    # «неизвестно» ≠ «неправильно».
+    if template_id not in (None, ""):
+        known_ids = {row.get("id") for row in load_templates() or []}
+
+        if known_ids and template_id not in known_ids:
+            logger.warning(
+                "intake storage: заготовки %r нет в справочнике — связь "
+                "%s.%s не выставлена",
+                template_id, node_id, option_id,
+            )
+            return False
+
     row: Dict[str, Any] = {
         "node_id": node_id,
         "option_id": option_id,
@@ -1466,6 +1495,21 @@ def add_option(
     if next_node and next_node not in _known_node_ids(base):
         return None
 
+    # 🔴 **Новая кнопка тоже не может вести на свой узел.** У `update_option`
+    # такая проверка есть, но `add_option` — отдельный путь записи: без неё
+    # петля создавалась одним вызовом, и оператор зацикливался (отчёт не
+    # писался, выйти можно было только кнопкой Cancel).
+    #
+    # Исключение — `MULTI`: там кнопка лишь отмечает вариант галочкой и никуда
+    # не ведёт, поэтому самоссылка безвредна.
+    if next_node == node_id and node.type in (NodeType.CHOICE, NodeType.YESNO):
+        logger.warning(
+            "intake storage: новая кнопка %s не может вести на свой же узел — "
+            "оператор зациклится",
+            node_id,
+        )
+        return None
+
     base_id = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_")[:24] or "option"
 
     from sendToDataBase import rest_get, rest_post
@@ -1643,6 +1687,27 @@ def update_option(
     # направить в блок, созданный из веба, — `update_option` молча отвечал бы
     # `False`, и вставка нового блока всегда откатывалась.
     if target and target not in _known_node_ids(base):
+        return False
+
+    # 🔴 **Кнопка не может вести на свой же узел — оператор зациклится.**
+    #
+    # Воспроизведено 13.10.2026: `update_option("ask_cause_tray", "overload",
+    # next_node="ask_cause_tray")` возвращал `True`. Оператор, выбрав «Tray
+    # overloaded», снова видел тот же вопрос — глубина пути росла 6, 7, 8, 9 без
+    # конца, а **отчёт не писался**. Выйти можно было только кнопкой Cancel.
+    #
+    # Валидатор дерева (`DecisionTree.validate`) такую петлю теперь отвергает,
+    # но он не вызывается на каждую правку из веба — проверка обязана стоять и
+    # здесь, у самой записи. Иначе «валидатор есть» не значит «петли нет».
+    #
+    # Исключение — `MULTI`: там кнопка лишь отмечает вариант галочкой и никуда
+    # не ведёт, поэтому самоссылка безвредна.
+    if target == node_id and node.type in (NodeType.CHOICE, NodeType.YESNO):
+        logger.warning(
+            "intake storage: кнопка %s.%s не может вести на свой же узел — "
+            "оператор зациклится",
+            node_id, option_id,
+        )
         return False
 
     row: Dict[str, Any] = {
@@ -2066,6 +2131,37 @@ def update_node(
 MAX_POSITION = 1_000_000.0
 
 
+def _position_is_valid(value) -> bool:
+    """
+    Годится ли координата для **записи**: `None`/`""` — да, мусор — нет.
+
+    🔴 **Зачем отдельно от `_clean_position`.** Та возвращает `None` и для
+    «вернуть блок в автоматическую раскладку» (`None`), и для мусора (`"abc"`).
+    Различить их она не может по построению, поэтому запись опиралась на неё —
+    и **опечатка в координате молча стирала расстановку**: `update_node_position(
+    "root", "abc", "xyz")` отвечал `True` и записывал `(None, None)`, то есть
+    «человек этот блок не двигал».
+
+    Воспроизведено 13.10.2026 на живой базе: блок `root` после такого вызова
+    терял позицию `(-977.18, 459.31)` и уезжал в авто-раскладку.
+
+    При **чтении** строк базы мягкость остаётся правильной: чужая битая запись
+    не должна ломать карту — там по-прежнему `_clean_position`.
+    """
+    if value is None or value == "":
+        return True
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+
+    if number != number or number in (float("inf"), float("-inf")):
+        return False
+
+    return abs(number) < MAX_POSITION
+
+
 def _clean_position(value) -> Optional[float]:
     """
     Координата холста или `None`.
@@ -2126,6 +2222,19 @@ def update_node_position(
     base = base or DEFAULT_TREE
 
     if node_id not in _known_node_ids(base):
+        return False
+
+    # 🔴 **Мусор в координате — отказ, а не «сброс позиции».**
+    #
+    # `_clean_position` возвращает `None` и для мусора, и для осмысленного
+    # «вернуть в авто-раскладку». Пока запись опиралась только на неё, опечатка
+    # стирала расстановку молча (см. `_position_is_valid`).
+    if not _position_is_valid(position_x) or not _position_is_valid(position_y):
+        logger.warning(
+            "intake storage: узел %s — координата не число (%r, %r), позиция "
+            "не изменена",
+            node_id, position_x, position_y,
+        )
         return False
 
     row: Dict[str, Any] = {

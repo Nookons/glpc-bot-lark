@@ -1264,6 +1264,140 @@ class NewModuleGetsItsOwnErrorAndCauseNodes(EditorStorageTestCase):
         )
 
 
+class NoLoopsAndNoSilentDataLoss(EditorStorageTestCase):
+    """
+    🔴 Правки из веба не должны создавать петли и молча терять данные.
+
+    Четыре дефекта, найденные 13.10.2026 при аудите. У всех одна природа:
+    **запись отвечала «получилось» там, где получалось неверное дерево или
+    потеря уже сохранённого**. Снаружи это выглядело как успешное действие.
+    """
+
+    def test_option_cannot_lead_back_to_its_own_node(self):
+        """
+        Петля: опция ведёт на **свой же** узел — оператор ходит по кругу.
+
+        Воспроизведено на живых данных: `update_option("ask_cause_tray",
+        "overload", next_node="ask_cause_tray")` возвращал `True`, и обход давал
+        глубину 6, 7, 8, 9 — без конца. Отчёт при этом **не писался**, а выйти
+        можно было только кнопкой Cancel.
+        """
+        self.assertFalse(
+            storage.update_option(
+                "ask_cause_tray", "overload",
+                next_node="ask_cause_tray", updated_by="test",
+            ),
+            "петля на свой узел принята — оператор зациклится",
+        )
+
+        # И нормальная цель по-прежнему проходит: проверка не должна ломать
+        # обычную работу.
+        self.assertTrue(
+            storage.update_option(
+                "ask_cause_tray", "overload", next_node="summary", updated_by="test"
+            )
+        )
+
+    def test_new_option_cannot_lead_back_to_its_own_node(self):
+        """
+        Тот же случай, но через **создание** кнопки.
+
+        `add_option` — отдельный путь записи: проверка только в `update_option`
+        оставляла эту дверь открытой, и петля создавалась одним вызовом.
+        """
+        self.assertIsNone(
+            storage.add_option(
+                "ask_cause_tray", "Loop", next_node="ask_cause_tray", created_by="test"
+            ),
+            "новая кнопка с петлёй создана",
+        )
+
+    def test_garbage_coordinate_does_not_erase_the_position(self):
+        """
+        🔴 Мусор в координате — отказ, а **не** «сброс в авто-раскладку».
+
+        `_clean_position` возвращает `None` и для мусора (`"abc"`), и для
+        осмысленного «вернуть блок в авто-раскладку». Пока запись опиралась
+        только на неё, опечатка **стирала расстановку молча**: на живой базе
+        блок `root` потерял `(-977.18, 459.31)` после вызова с `"abc"`.
+        """
+        self.assertFalse(
+            storage.update_node_position("root", "abc", "xyz", updated_by="test"),
+            "мусор в координате принят — позиция блока стёрта молча",
+        )
+
+        # Осмысленные случаи обязаны работать: сброс и настоящие числа.
+        self.assertTrue(
+            storage.update_node_position("root", None, None, updated_by="test"),
+            "«вернуть в авто-раскладку» перестало работать",
+        )
+        self.assertTrue(
+            storage.update_node_position("root", 10.5, 20.25, updated_by="test")
+        )
+
+    def test_nan_coordinate_is_rejected(self):
+        """
+        `NaN` — тоже мусор.
+
+        Он проходит сравнения (`nan != nan` — единственное исключение), поэтому
+        проверяется отдельно: без этого `NaN` попал бы в базу и сломал и
+        раскладку, и `JSON` в ответе API.
+        """
+        self.assertFalse(
+            storage.update_node_position("root", float("nan"), 1, updated_by="test"),
+            "NaN принят как координата",
+        )
+
+    def test_link_to_a_missing_template_is_rejected(self):
+        """
+        🔴 Ссылка на **несуществующую** заготовку не выставляется.
+
+        Воспроизведено: `link_option_to_template(..., 999999)` отвечал `True`.
+        Человек видел «связь ��сть», а в отчёт **ничего не подставлялось** — тип
+        ошибки, «что сделано» и время решения оставались пустыми, и понять
+        причину по интерфейсу было нельзя.
+        """
+        self.db.rows[storage.TEMPLATES_TABLE] = [
+            {"id": 38, "employee_title": "Equipment"},
+        ]
+
+        self.assertFalse(
+            storage.link_option_to_template(
+                "ask_cause_tray", "overload", 999999, updated_by="test"
+            ),
+            "связь с несуществующей заготовкой выставлена",
+        )
+        self.assertTrue(
+            storage.link_option_to_template(
+                "ask_cause_tray", "overload", 38, updated_by="test"
+            ),
+            "связь с существующей заготовкой не выставилась",
+        )
+        # `None` — осмысленное «снять связь», его проверять нечем.
+        self.assertTrue(
+            storage.link_option_to_template(
+                "ask_cause_tray", "overload", None, updated_by="test"
+            )
+        )
+
+    def test_link_still_works_when_the_catalogue_is_unreachable(self):
+        """
+        Обратная сторона: **пустой справочник не запрещает связь.**
+
+        `load_templates` отдаёт пустой список и для «заготовок нет», и для
+        «база недоступна». Отвергать связь на пустом списке значило бы запретить
+        привязку при сбое чтения — человек не понял бы, почему «не сохраняется».
+       """
+        self.db.rows[storage.TEMPLATES_TABLE] = []
+
+        self.assertTrue(
+            storage.link_option_to_template(
+                "ask_cause_tray", "overload", 38, updated_by="test"
+            ),
+            "связь запрещена из-за недоступного справочника — мягкая деградация сломана",
+        )
+
+
 class WebButtonStaysAnAddition(EditorStorageTestCase):
     """
     🔴 **Кнопка из веба остаётся «добавленной», а не «правкой встроенной».**

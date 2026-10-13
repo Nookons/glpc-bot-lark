@@ -369,6 +369,23 @@ class DecisionTree:
                 "Unreachable tree nodes: " + ", ".join(sorted(unreachable))
             )
 
+        # 🔴 **Петля, из которой нет выхода.** Опция, ведущая на **свой же**
+        # узел, оставляет оператора в бесконечном круге: выбрав «Tray
+        # overloaded», он снова видит тот же вопрос. Отчёт при этом **не
+        # пишется**, а выйти можно только кнопкой Cancel.
+        #
+        # Проверка обязана стоять здесь, а не только в редакторе: правку можно
+        # внести и из веба (`storage.update_option`), и через API, и руками в
+        # базе. Воспроизведено 13.10.2026: `update_option(..., next_node=сам_себя)`
+        # возвращал `True`, и обход в цикле давал глубину 6, 7, 8, 9 — без конца.
+        for node in self.nodes.values():
+            for option in node.options:
+                if option.next_node == node.id and node.type != NodeType.MULTI:
+                    raise ValueError(
+                        f"Node {node.id!r}: option {option.id!r} leads back to "
+                        f"its own node — the operator would loop forever"
+                    )
+
 
 def choice_node(node_id: str, title: str, *options: Option, **kwargs) -> Node:
     """
