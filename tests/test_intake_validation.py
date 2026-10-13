@@ -358,7 +358,9 @@ class FormatValidationChecks(unittest.TestCase):
         session.select("robot")
         session.submit_text("3780")
 
-        for option in ("k50h", "safety", "safety_front_button", "obstacle"):
+        # Причина — из списка **своего модуля**: у `safety` есть `human_error`,
+        # а `obstacle` (посторонний предмет на пути) к нему не относится.
+        for option in ("k50h", "safety", "safety_front_button", "human_error"):
             session.select(option)
 
         self.assertTrue(session.is_completed)
@@ -709,7 +711,7 @@ class ReviewMarkingChecks(unittest.TestCase):
         for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
         with mock.patch.object(intake_flow, "unregistered_numbers", return_value=["Robot 3780"]):
@@ -740,7 +742,7 @@ class ReviewMarkingChecks(unittest.TestCase):
         for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
         intake_flow.reset_state()
@@ -774,7 +776,7 @@ class ReviewMarkingChecks(unittest.TestCase):
         for option in ("k50h", "safety", "safety_front_button"):
             session.select(option)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({
             "warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5,
             "review_ack": True,

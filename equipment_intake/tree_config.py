@@ -96,6 +96,22 @@ ASK_CHARGING_ROBOT = "ask_charging_robot"
 #: вопрос»**. Отвечает на «почему это случилось», а не «что сломалось»:
 #: описание проблемы и её причина — разные вещи, и раньше причину не спрашивали
 #: вовсе, поэтому в отчётах её не было.
+#:
+#: 🔴 **Узел причин — свой на КАЖДЫЙ модуль** (`ask_cause_lift`, `ask_cause_chassis`,
+#: …), а не один общий. Требование владельца 13.10.2026, дословно: «сделай Block
+#: What caused it? на каждый модуль». Причина «погнул вилы» бессмысленна у
+#: шасси, а «наехал на посторонний предмет» — у камеры; общий список заставлял
+#: оператора выбирать неточное и портил статистику.
+#:
+#: **Почему отдельные узлы, а не `only_for`.** Тот же довод, что у узлов модулей
+#: (см. комментарий к `ROBOT_MODULES`): `only_for` фильтрует варианты **одного**
+#: узла, а здесь у каждого модуля свой список причин и **своя связь с
+#: заготовкой** — а её нельзя выразить фильтром. Плюс валидатор запрещает
+#: одинаковые id вариантов внутри узла, и `only_for` тут не помогает.
+#:
+#: `ASK_CAUSE` остаётся **префиксом** id: `cause_node_id("lift")` →
+#: `ask_cause_lift`. Отдельная константа нужна, чтобы имя узла собиралось в одном
+#: месте — по нему ищут заготовку, позицию и правки редактора.
 ASK_CAUSE = "ask_cause"
 SUMMARY = "summary"
 
@@ -271,6 +287,24 @@ def error_node_id(module: str) -> str:
     return f"robot_errors_{module}"
 
 
+def cause_node_id(module: str) -> str:
+    """
+    id узла причин модуля: `chassis` → `ask_cause_chassis`.
+
+    **Контракт имён.** Так узел называется и в дереве, и в редакторе, и в связке
+    с заготовками. Одна функция на все места — чтобы префикс нельзя было
+    случайно написать по-разному в дереве и в проверке (тот же приём, что у
+    `error_node_id`).
+
+    🔴 **`module` — хвост узла ошибок**, а не подпись модуля: у K50H модуль
+    называется `Lifting`, а узел ошибок — `robot_errors_lift`, и причины
+    привязываются к **узлу ошибок**, а не к подписи. Иначе у одного железа
+    (`Lift`) появилось бы два узла причин — `ask_cause_lift` и
+    `ask_cause_lifting` — и правки разошлись бы.
+    """
+    return f"{ASK_CAUSE}_{module}"
+
+
 def _model_title(module_node_id: str) -> str:
     """
     Название модели для заголовка узла модулей.
@@ -281,6 +315,81 @@ def _model_title(module_node_id: str) -> str:
     нужен именно для того, чтобы модели различались глазами.
     """
     return module_node_id.replace("robot_module_", "").replace("_", " ").upper()
+
+
+#: Причины по модулям: **свой список у каждого**, потому что причина осмысленна
+#: только в контексте железа.
+#:
+#: 🔴 **Ключ — хвост узла ошибок** (`chassis`, `lift`, `qr_code`), а не подпись
+#: модуля (`Chassis`, `Lifting`): у K50H модуль называется `Lifting`, а узел
+#: ошибок — `robot_errors_lift`. Ключ по подписи завёл бы **два** узла причин для
+#: одного железа (`ask_cause_lift` и `ask_cause_lifting`), и правки разошлись бы.
+#:
+#: `_default` — набор для модуля, которого нет в таблице: он появится, если
+#: редактор добавит новый модуль. Тогда лучше показать общие причины, чем
+#: оставить узел без вариантов (это тупик для оператора).
+#:
+#: **Общие причины стоят у всех** (человек, износ, прошивка, питание) — они
+#: бывают у любого железа. Специфичные добавлены там, где осмысленны:
+#:   * `obstacle` — у движущихся модулей (шасси, подъём, поворот, вилы, камера);
+#:   * `dirty_code` — только у `qr_code`: это про навигацию по коду места;
+#:   * `tray_jam` / `hook_jam` — у своего модуля.
+CAUSE_OPTIONS = {
+    "_default": (
+        ("human_error", "Human error"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("software_fault", "Software fault"),
+        ("battery_charge", "Battery or charging"),
+    ),
+    "chassis": (
+        ("human_error", "Human error"),
+        ("obstacle", "Obstacle on the path"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("software_fault", "Software fault"),
+        ("battery_charge", "Battery or charging"),
+    ),
+    "lift": (
+        ("overload", "Load too heavy"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("human_error", "Human error"),
+        ("obstacle", "Obstacle under the fork"),
+        ("software_fault", "Software fault"),
+    ),
+    "rotate": (
+        ("obstacle", "Obstacle on the path"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("human_error", "Human error"),
+        ("software_fault", "Software fault"),
+    ),
+    "tray": (
+        ("overload", "Tray overloaded"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("human_error", "Human error"),
+        ("software_fault", "Software fault"),
+    ),
+    "horn": (
+        ("mechanical_wear", "Mechanical wear"),
+        ("software_fault", "Software fault"),
+        ("human_error", "Human error"),
+    ),
+    "hook": (
+        ("mechanical_wear", "Mechanical wear"),
+        ("human_error", "Human error"),
+        ("software_fault", "Software fault"),
+    ),
+    "qr_code": (
+        ("dirty_code", "Dirty or damaged floor code"),
+        ("wrong_code", "Wrong or missing code on the floor"),
+        ("software_fault", "Software fault"),
+        ("human_error", "Human error"),
+    ),
+    "safety": (
+        ("human_error", "Human error"),
+        ("mechanical_wear", "Mechanical wear"),
+        ("software_fault", "Software fault"),
+        ("sensor_fault", "Sensor fault"),
+    ),
+}
 
 
 def _build_nodes() -> dict:
@@ -409,10 +518,11 @@ def _build_nodes() -> dict:
             summary_label="Error",
             description="Choose the error you see.",
             options=tuple(
-                # **Ошибка ведёт сразу к причине.** Номер уже введён в начале
-                # пути (схема владельца 12.10.2026), а описание убрано с
-                # обычного пути: его спрашивают только при причине `Other`.
-                opt(option_id, label, ASK_CAUSE)
+                # **Ошибка ведёт сразу к причине — своей для этого модуля.**
+                # Номер уже введён в начале пути (схема владельца 12.10.2026), а
+                # описание убрано с обычного пути: его спрашивают только при
+                # причине `Other`.
+                opt(option_id, label, cause_node_id(error_module))
                 for option_id, label in error_options
             ),
         ))
@@ -494,8 +604,8 @@ def _build_nodes() -> dict:
         # 12.10.2026, поэтому развилка для неё не нужна — механизм оставлен в
         # `types.Node.next_node_by_kind` и включается возвратом ветки.
         next_node_by_kind=(
-            (KIND_QR_FLOOR, ASK_CAUSE),
-            (KIND_QR_SHELF, ASK_CAUSE),
+            (KIND_QR_FLOOR, cause_node_id("qr_code")),
+            (KIND_QR_SHELF, cause_node_id("qr_code")),
         ),
         next_node="robot_type",
     ))
@@ -519,7 +629,7 @@ def _build_nodes() -> dict:
     # **Владелец 12.10.2026, дословно:** «убери вопросы об описание ошибки оно
     # нужно **только если other выберет**».
     #
-    # Узел **не удалён** из дерева: он нужен ветке `Other` (см. `ASK_CAUSE`), и
+    # Узел **не удалён** из дерева: он нужен ветке `Other` (см. `CAUSE_OPTIONS`), и
     # тексты бота остаются прежними. Убран только **переход** на него с обычного
     # пути: после причины, отличной от `Other`, бот идёт сразу к `summary`.
     #
@@ -539,7 +649,7 @@ def _build_nodes() -> dict:
     ))
 
     # ------------------------------------------------------------
-    # Шаг 5: причина ошибки
+    # Шаг 5: причина ошибки — **свой узел на каждый модуль**
     # ------------------------------------------------------------
     # **Владелец: «добавить причину ошибки как ещё один вопрос».** Это не
     # повтор описания: описание отвечает «что не так» («не поднимает вилы»),
@@ -547,31 +657,52 @@ def _build_nodes() -> dict:
     # спрашивалась, поэтому в отчётах её не было, и разбор повторяющихся ошибок
     # упирался в догадки.
     #
-    # Список — стартовый набор из практики склада; правится через редактор
-    # (`/tree`), как и остальные узлы. «Other» оставлен намеренно: закрытый
-    # список без него заставляет выбирать неточное и портит статистику.
+    # **Владелец 13.10.2026: «сделай Block What caused it? на каждый модуль».**
+    # Причина осмысленна только в контексте железа: «погнул вилы» не бывает у
+    # шасси, а «наехал на посторонний предмет» — у камеры. Общий список заставлял
+    # оператора выбирать неточное и портил статистику.
+    #
+    # **Почему отдельные узлы, а не `only_for`.** Тот же довод, что у узлов
+    # модулей (см. `ROBOT_MODULES`): `only_for` фильтрует варианты **одного**
+    # узла, а здесь у каждого модуля свой список **и своя связь с заготовкой** —
+    # фильтром её не выразить. Плюс валидатор запрещает одинаковые id вариантов
+    # внутри узла, и разные узлы снимают это ограничение честно.
+    #
+    # **Список у каждого модуля свой, и это не «копия одного и того же».** В
+    # стартовом наборе общие причины (человек, износ, прошивка) стоят у всех —
+    # они действительно бывают везде; а «наехал на посторонний предмет» только у
+    # движущихся модулей, «повреждён код места» только у QR. Правится через
+    # редактор (`/tree` и веб), как и остальные узлы.
+    #
+    # «Other» оставлен у каждого модуля намеренно: закрытый список без него
+    # заставляет выбирать неточное и портит статистику.
     #
     # **Ведёт по-разному в зависимости от варианта** (решение владельца
     # 12.10.2026): `Other` — на свободное описание, все остальные причины —
     # сразу к итогу. Это и есть «описание нужно только если other выберет».
-    add(choice_node(
-        ASK_CAUSE,
-        "What caused it?",
-        key="cause",
-        summary_label="Cause",
-        description="Why it happened — helps to prevent a repeat.",
-        options=(
-            opt("human_error", "Human error", SUMMARY),
-            opt("obstacle", "Obstacle on the path", SUMMARY),
-            opt("dirty_code", "Dirty or damaged floor code", SUMMARY),
-            opt("mechanical_wear", "Mechanical wear", SUMMARY),
-            opt("software_fault", "Software fault", SUMMARY),
-            opt("battery_charge", "Battery or charging", SUMMARY),
-            # Единственная причина, ведущая на описание: своего варианта у неё
-            # нет, и слова оператора — единственный источник подробностей.
-            opt("other", "Other", ASK_DESCRIPTION),
-        ),
-    ))
+    #
+    # 🔴 **id причин повторяются между модулями** (`human_error` есть у всех).
+    # Это безопасно, потому что связь с заготовкой хранится **с узлом**
+    # (`node_id` + `option_id`), а не по одному `option_id`: иначе связь,
+    # выставленная на причине шасси, «уехала» бы на причину подъёма.
+    for cause_module in MODULE_ERRORS:
+        add(choice_node(
+            cause_node_id(cause_module),
+            f"{ERROR_MODULE_TITLES[cause_module]}: what caused it?",
+            key="cause",
+            summary_label="Cause",
+            description="Why it happened — helps to prevent a repeat.",
+            options=tuple(
+                opt(option_id, label, SUMMARY)
+                for option_id, label in CAUSE_OPTIONS.get(
+                    cause_module, CAUSE_OPTIONS["_default"]
+                )
+            ) + (
+                # Единственная причина, ведущая на описание: своего варианта у
+                # неё нет, и слова оператора — единственный источник подробностей.
+                opt("other", "Other", ASK_DESCRIPTION),
+            ),
+        ))
 
     # ------------------------------------------------------------
     # Финал

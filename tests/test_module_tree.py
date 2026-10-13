@@ -23,6 +23,7 @@ from equipment_intake.tree_config import (
     DEFAULT_TREE,
     MODULE_ERRORS,
     REMOVED_MODULES,
+    cause_node_id,
     error_node_id,
 )
 
@@ -220,12 +221,18 @@ class TestErrorLayer:
         # После номера — модель, а не описание: проверка на сервере стоит между.
         assert DEFAULT_TREE.node("ask_number").next_node == "robot_type"
 
-        # Ошибка ведёт сразу к причине: номер уже введён в начале пути.
+        # Ошибка ведёт сразу к причине **своего модуля**: номер уже введён в
+        # начале пути. Требование владельца 13.10.2026: «сделай Block What
+        # caused it? на каждый модуль».
         for module in MODULE_ERRORS:
             node = DEFAULT_TREE.node(error_node_id(module))
+            expected = cause_node_id(module)
 
             for option in node.options:
-                assert option.next_node == "ask_cause"
+                assert option.next_node == expected, (
+                    f"{module}: ошибка {option.id} ведёт в {option.next_node}, "
+                    f"а должна — в {expected}"
+                )
 
     def test_qr_branch_skips_the_robot_model(self) -> None:
         """У QR модели/модуля нет: код места/полки — уже всё, что известно.
@@ -237,8 +244,10 @@ class TestErrorLayer:
         node = DEFAULT_TREE.node("ask_number")
         kinds = dict(node.next_node_by_kind)
 
-        assert kinds.get("qr_floor") == "ask_cause"
-        assert kinds.get("qr_shelf") == "ask_cause"
+        # Причина — **своя у QR**, а не общая: «повреждён код места» бывает
+        # только здесь.
+        assert kinds.get("qr_floor") == cause_node_id("qr_code")
+        assert kinds.get("qr_shelf") == cause_node_id("qr_code")
 
     def test_error_answer_is_recorded_under_its_own_key(self) -> None:
         """Ответ об ошибке попадает в результат с ключом `error`."""
@@ -266,7 +275,7 @@ class TestErrorLayer:
         for step in ("a42t", "tray", "tray_cant_extend"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("overload")
 
         assert session.is_completed
         answers = session.answers()
@@ -275,7 +284,11 @@ class TestErrorLayer:
         assert answers["module"] == "Tray"
         assert answers["error"] == "Can't extend/expand the tray"
         assert answers["device_number"] == "3780"
-        assert answers["cause"] == "Obstacle on the path"
+        # Причина — из списка **этого модуля**: у вил её своя («перегруз»),
+        # потому что «наехал на посторонний предмет» к лотку не относится.
+        # Требование владельца 13.10.2026: «сделай Block What caused it? на
+        # каждый модуль».
+        assert answers["cause"] == "Tray overloaded"
         # Описание на обычном пути не спрашивается — оно только для `Other`.
         assert "description" not in answers
 
@@ -356,8 +369,61 @@ class TestKeyboardColumns:
 
 
 class TestCauseQuestion:
+    """
+    Причины ошибок — **свой узел на каждый модуль**.
+
+    Требование владельца 13.10.2026, дословно: «сделай Block What caused it? на
+    каждый модуль». Причина осмысленна только в контексте железа: «погнул вилы»
+    не бывает у шасси, а «наехал на посторонний предмет» — у камеры.
+    """
+
+    def test_every_module_error_leads_to_its_own_cause_node(self) -> None:
+        """
+        🔴 Ошибка каждого модуля ведёт в узел причин **своего** модуля.
+
+        Дефект, который это ловит: кнопки ошибок вели в один общий `ask_cause`.
+        Он и был исходной структурой, ради замены которой делалась работа.
+        """
+        for module in MODULE_ERRORS:
+            error_node = DEFAULT_TREE.node(error_node_id(module))
+            assert error_node is not None, f"нет узла ошибок модуля {module}"
+
+            targets = {option.next_node for option in error_node.options}
+            assert targets == {cause_node_id(module)}, (
+                f"ошибки модуля {module} ведут в {targets}, "
+                f"а должны — в {cause_node_id(module)}"
+            )
+
+    def test_each_module_has_its_own_cause_list(self) -> None:
+        """
+        Списки причин у модулей **разные**, а не копия одного.
+
+        Если бы все восемь узлов содержали одинаковый набор, разделение не дало
+        бы ничего: оператор по-прежнему выбирал бы неточное.
+        """
+        lists = {
+            module: tuple(o.id for o in DEFAULT_TREE.node(cause_node_id(module)).options)
+            for module in MODULE_ERRORS
+        }
+
+        # Как минимум два модуля отличаются составом — иначе смысла в разделении нет.
+        assert len(set(lists.values())) > 1, (
+            "у всех модулей одинаковый список причин — разделение не работает"
+        )
+
+        # И каждая причина осмысленна только там, где стоит: `dirty_code`
+        # (код места) — принадлежность QR, у шасси такого не бывает.
+        assert "dirty_code" in lists["qr_code"]
+        assert "dirty_code" not in lists["chassis"]
+
+    def test_old_shared_cause_node_is_gone(self) -> None:
+        """Общего узла `ask_cause` больше нет — иначе осталась бы вторая точка входа."""
+        assert DEFAULT_TREE.node("ask_cause") is None, (
+            "общий узел причин остался в дереве"
+        )
+
     def test_description_is_only_reached_through_other(self) -> None:
-        """Описание спрашивается **только** при причине `Other`.
+        """Описание спрашивается **только** при причине `Other` — у каждого модуля.
 
         **Владелец 12.10.2026, дословно:** «убери вопросы об описание ошибки оно
         нужно **только если other выберет**». Обычная причина ведёт сразу к
@@ -365,33 +431,38 @@ class TestCauseQuestion:
 
         Узел `ask_description` при этом **не удалён**: он ведёт к `summary`.
         """
-        options = {option.id: option for option in DEFAULT_TREE.node("ask_cause").options}
+        for module in MODULE_ERRORS:
+            node = DEFAULT_TREE.node(cause_node_id(module))
+            options = {option.id: option for option in node.options}
 
-        assert options["other"].next_node == "ask_description", (
-            "Other обязан вести на описание — иначе вопрос пропал бы совсем"
-        )
-
-        for option_id, option in options.items():
-            if option_id == "other":
-                continue
-            assert option.next_node == "summary", (
-                f"причина {option_id} должна вести сразу к итогу"
+            assert "other" in options, f"{module}: нет причины Other"
+            assert options["other"].next_node == "ask_description", (
+                f"{module}: Other обязан вести на описание"
             )
+
+            for option_id, option in options.items():
+                if option_id == "other":
+                    continue
+                assert option.next_node == "summary", (
+                    f"{module}: причина {option_id} должна вести сразу к итогу"
+                )
 
         # Описание из дерева не выброшено: оно завершает ветку `Other`.
         assert DEFAULT_TREE.node("ask_description").next_node == "summary"
 
     def test_cause_has_options(self) -> None:
-        options = DEFAULT_TREE.node("ask_cause").options
+        for module in MODULE_ERRORS:
+            options = DEFAULT_TREE.node(cause_node_id(module)).options
 
-        assert len(options) >= 4, "список причин пуст или слишком короткий"
-        # «Other» обязателен: закрытый список без него заставляет выбирать
-        # неточное и портит статистику.
-        assert any(option.id == "other" for option in options)
+            assert len(options) >= 4, f"{module}: список причин пуст или короткий"
+            # «Other» обязателен: закрытый список без него заставляет выбирать
+            # неточное и портит статистику.
+            assert any(option.id == "other" for option in options), f"{module}: нет Other"
 
     def test_cause_is_recorded_in_answers(self) -> None:
-        """Ответ о причине попадает в результат с ключом `cause`."""
-        assert DEFAULT_TREE.node("ask_cause").answer_key() == "cause"
+        """Ответ о причине попадает в результат с ключом `cause` — у каждого модуля."""
+        for module in MODULE_ERRORS:
+            assert DEFAULT_TREE.node(cause_node_id(module)).answer_key() == "cause"
 
 
 class TestEditorExplainsTheStructure:

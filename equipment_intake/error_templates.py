@@ -332,12 +332,22 @@ def linked_template(steps: Any, templates: Any,
         if not option_id:
             continue
 
+        # 🔴 **Точный ключ `node_id::option_id` ищется первым.** С 13.10.2026 у
+        # каждого модуля свой узел причин, и id причин повторяются
+        # (`human_error` есть у всех). Карта по одному `option_id` применила бы
+        # связь, выставленную на причине шасси, к причине подъёма.
+        #
+        # Старый ключ остаётся запасным: у ошибок (`robot_errors_*`) id
+        # уникальны, и уже сохранённые связи должны работать без миграции.
+        node_id = step.get("node_id")
+        exact = links.get(f"{node_id}::{option_id}")
+
         found = resolve(
             templates,
             option_id=option_id,
             label=step.get("label"),
-            node_id=step.get("node_id"),
-            template_id=links.get(str(option_id)),
+            node_id=node_id,
+            template_id=exact if exact not in (None, "") else links.get(str(option_id)),
         )
 
         if found is not None:

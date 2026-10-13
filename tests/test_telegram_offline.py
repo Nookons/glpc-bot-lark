@@ -1548,6 +1548,61 @@ def test_flask_endpoints():
     )
 
 
+def test_intake_tree_endpoint_is_closed_without_a_token():
+    """
+    `/intake/tree` без заданного токена — **404**, а не открытые данные.
+
+    🔴 Проверка намеренно негативная: ручка отдаёт внутреннее устройство приёма
+    ошибок, и «забыли переменную окружения» не должно означать «опубликовали
+    конфигурацию в интернет».
+    """
+    client = bot.app.test_client()
+    original = bot.INTAKE_VIEW_TOKEN
+
+    try:
+        bot.INTAKE_VIEW_TOKEN = ""
+
+        check(
+            "flask: /intake/tree выключен без токена (404)",
+            client.get("/intake/tree").status_code == 404,
+            client.get("/intake/tree").status_code,
+        )
+
+        bot.INTAKE_VIEW_TOKEN = "secret-token"
+
+        check(
+            "flask: /intake/tree без заголовка -> 403",
+            client.get("/intake/tree").status_code == 403,
+            client.get("/intake/tree").status_code,
+        )
+        check(
+            "flask: /intake/tree с неверным токеном -> 403",
+            client.get(
+                "/intake/tree", headers={"X-Intake-View-Token": "wrong"}
+            ).status_code
+            == 403,
+            client.get(
+                "/intake/tree", headers={"X-Intake-View-Token": "wrong"}
+            ).status_code,
+        )
+
+        response = client.get(
+            "/intake/tree", headers={"X-Intake-View-Token": "secret-token"}
+        )
+        payload = response.get_json()
+
+        check(
+            "flask: /intake/tree с верным токеном отдаёт дерево",
+            response.status_code == 200
+            and payload.get("root_id") == "root"
+            and len(payload.get("nodes") or []) == 20
+            and len(payload.get("links") or []) > 0,
+            (response.status_code, len(payload.get("nodes") or [])),
+        )
+    finally:
+        bot.INTAKE_VIEW_TOKEN = original
+
+
 # ============================================================
 # FORUM TOPICS
 # ============================================================

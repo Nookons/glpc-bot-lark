@@ -378,7 +378,10 @@ class SubstitutionChecks(unittest.TestCase):
         row = self._row(steps, description="zzz unknown wording")
 
         self.assertIsNone(row["template_id"])
-        self.assertEqual(row["raw_solving_time"], 0)
+        # Снимок времени — `None`, не `0`: шаблона нет, значит времени решения
+        # никто не измерял. Читатель отдаёт снимок в приоритете, поэтому `0`
+        # навсегда скрывал бы заполненный шаблон.
+        self.assertIsNone(row["raw_solving_time"])
         self.assertIsNone(row["raw_recovery"])
 
     def test_empty_template_time_keeps_end_equal_to_start(self):

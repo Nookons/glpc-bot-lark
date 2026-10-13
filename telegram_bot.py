@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import hmac
 import os
 import re
 import signal
@@ -310,6 +311,13 @@ IMAGES_RETENTION_DAYS = _env_int("IMAGES_RETENTION_DAYS", 7)
 
 # Необязательный токен для HTTP-эндпоинта /shift_stats.
 STATS_TOKEN = os.environ.get("STATS_TOKEN", "").strip()
+
+# Токен для `/intake/tree` — дерево приёма ошибок для веб-просмотра (`tk-new`).
+#
+# **Пустое значение выключает ручку** (404), а не открывает её: ручка отдаёт
+# внутреннее устройство приёма, и забытая переменная окружения не должна
+# публиковать его в интернет.
+INTAKE_VIEW_TOKEN = os.environ.get("INTAKE_VIEW_TOKEN", "").strip()
 
 # Сколько секунд дать текущему апдейту дописаться при остановке контейнера.
 SHUTDOWN_GRACE_SECONDS = _env_int("SHUTDOWN_GRACE_SECONDS", 3)
@@ -5521,6 +5529,382 @@ def photo_redirect(object_name):
         return jsonify({"error": "not found"}), 404
 
     return redirect(url, code=302)
+
+
+def _intake_authorized():
+    """
+    Проверка общего секрета для ручек дерева приёма.
+
+    Возвращает `None`, если доступ разрешён, иначе — готовый ответ с ошибкой.
+    **Общая для чтения и записи:** расхождение проверок означало бы, что одна
+    ручка защищена слабее другой, и заметить это можно было бы только
+    целенаправленной проверкой. Пустой токен закрывает ручки (404), а не
+    открывает их — иначе забытая переменная окружения не только опубликовала бы
+    конфигурацию приёма, но и позволила бы менять поведение бота кому угодно.
+    """
+    if not INTAKE_VIEW_TOKEN:
+        return jsonify({"error": "not found"}), 404
+
+    supplied = (
+        request.headers.get("X-Intake-View-Token") or request.args.get("token") or ""
+    )
+
+    if not hmac.compare_digest(str(supplied), INTAKE_VIEW_TOKEN):
+        return jsonify({"error": "forbidden"}), 403
+
+    return None
+
+
+@app.route("/intake/tree", methods=["GET"])
+def intake_tree_endpoint():
+    """
+    Дерево приёма ошибок для веб-просмотра (`tk-new`).
+
+    **Почему отдаёт бот, а не API.** Слияние «встроенное дерево + правки из
+    `telegram_intake_options`» реализовано здесь (`storage.apply_overlay`) и
+    покрыто тестами. Копия в API или в вебе неизбежно разошлась бы с ботом, и
+    веб показывал бы не то дерево, по которому идёт приём, — ровно тот класс
+    дефекта, который в проекте ловит сторож `test_cross_parity`.
+
+    **Доступ — по общему секрету.** Ручка отдаёт внутреннее устройство приёма и
+    не должна быть открыта в интернет: `INTAKE_VIEW_TOKEN`. Пустой токен =
+    ручка выключена (404), а не «открыта всем»: забытая переменная не должна
+    публиковать данные. Тот же приём, что у `/shift_stats`, но с отказом вместо
+    разрешения при незаданном токене — там ручка читает открытые сменные числа,
+    здесь — конфигурацию приёма.
+    """
+    denied = _intake_authorized()
+
+    if denied is not None:
+        return denied
+
+    try:
+        from equipment_intake import tree_view
+
+        payload = tree_view.build_tree_payload_from_db()
+    except Exception:
+        logger.exception("Не удалось собрать дерево приёма для веба")
+
+        return jsonify({"error": "tree unavailable"}), 503
+
+    return jsonify(payload)
+
+
+@app.route("/intake/node/position", methods=["POST"])
+def intake_node_position_endpoint():
+    """
+    Сохраняет положение блока на холсте веб-редактора.
+
+    Тело: `{"node_id": "...", "x": 123.5, "y": 40}`. `x`/`y` могут быть `null` —
+    это «вернуть блок в автоматическую раскладку».
+
+    **Почему позиция пишется отдельной ручкой.** Перетаскивание блока — частое
+    действие, а строка узла содержит и заголовок, и подсказку, и скрытие. Если
+    бы перетаскивание сохраняло узел целиком, оно затирало бы правки из
+    Telegram-редактора — этот дефект в `update_node` уже был (правка заголовка
+    стирала описание). Здесь пишутся **только координаты**, а
+    `merge-duplicates` сохраняет остальные колонки.
+    """
+    denied = _intake_authorized()
+
+    if denied is not None:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    node_id = str(body.get("node_id") or "").strip()
+
+    if not node_id:
+        return jsonify({"error": "node_id is required"}), 400
+
+    from equipment_intake import storage
+    from equipment_intake.tree_config import DEFAULT_TREE
+
+    try:
+        saved = storage.update_node_position(
+            node_id,
+            body.get("x"),
+            body.get("y"),
+            updated_by=str(body.get("updated_by") or "") or None,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить позицию узла %s", node_id)
+
+        return jsonify({"error": "save failed"}), 503
+
+    if not saved:
+        # Причины две, и лечатся они по-разному: неизвестный узел (опечатка или
+        # id из чужого дерева) и неприменённая миграция `0114` (сохранять
+        # некуда). Разделяем их, чтобы не гадать по коду ответа.
+        known = DEFAULT_TREE.node(node_id) is not None
+
+        return (
+            jsonify(
+                {
+                    "error": "unknown node" if not known else "positions unsupported",
+                    "node_id": node_id,
+                    "position_supported": bool(storage.position_supported()),
+                }
+            ),
+            400 if not known else 503,
+        )
+
+    return jsonify({"ok": True, "node_id": node_id})
+
+
+@app.route("/intake/node", methods=["POST"])
+def intake_node_save_endpoint():
+    """
+    Создаёт, правит или удаляет **блок вопроса** (узел дерева).
+
+    Тело: `{"action": "add"|"update"|"delete"|"restore", "node_id": "...", ...}`
+
+    Для `add` обязателен `title`; `node_type` — один из `choice`/`input`/
+    `unavailable`. Чтобы блок был **достижим**, указывают `after_node_id` и
+    `after_option_id`: новый вопрос встаёт в переход этой кнопки
+    (`кнопка → новый блок → прежнее продолжение`). Без этого блок никто не
+    вызовет, и оператор его не увидит.
+
+    🔴 **Почему тип ограничен.** `final` — это запись отчёта: свободно создавая
+    такие узлы, человек получил бы несколько «итоговых экранов», и одну ошибку
+    можно было бы записать дважды. Разрешены типы, которые отчёт не пишут.
+    """
+    denied = _intake_authorized()
+
+    if denied is not None:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").strip().lower()
+    node_id = str(body.get("node_id") or "").strip()
+    author = str(body.get("updated_by") or "") or None
+
+    from equipment_intake import storage
+
+    try:
+        if action == "add":
+            title = str(body.get("title") or "").strip()
+
+            if not title:
+                return jsonify({"error": "title is required"}), 400
+
+            created = storage.add_node(
+                title,
+                node_type=str(body.get("node_type") or "choice"),
+                description=str(body.get("description") or ""),
+                next_node=(str(body["next_node"]) if body.get("next_node") else None),
+                after_node_id=(str(body["after_node_id"]) if body.get("after_node_id") else None),
+                after_option_id=(str(body["after_option_id"]) if body.get("after_option_id") else None),
+                created_by=author,
+            )
+
+            if created is None:
+                return (
+                    jsonify(
+                        {
+                            "error": "could not create the block",
+                            "hint": (
+                                "check node_type (choice, input, unavailable) and that "
+                                "the button you attach it to exists"
+                            ),
+                        }
+                    ),
+                    400,
+                )
+
+            return jsonify({"ok": True, "node_id": created})
+
+        if not node_id:
+            return jsonify({"error": "node_id is required"}), 400
+
+        if action == "update":
+            saved = storage.update_node(
+                node_id,
+                **{
+                    key: body[key]
+                    for key in ("title", "description", "placeholder", "next_node")
+                    if key in body
+                },
+                updated_by=author,
+            )
+        elif action == "delete":
+            saved = storage.delete_node(node_id, updated_by=author)
+
+            if not saved:
+                return (
+                    jsonify(
+                        {
+                            "error": "cannot delete this block",
+                            "hint": (
+                                "the entry block, the final block and blocks whose buttons "
+                                "lead to different places cannot be deleted"
+                            ),
+                            "node_id": node_id,
+                        }
+                    ),
+                    400,
+                )
+        elif action == "restore":
+            saved = storage.restore_node(node_id, updated_by=author)
+        else:
+            return jsonify({"error": f"unknown action {action!r}"}), 400
+    except Exception:
+        logger.exception("Не удалось выполнить %s узла %s", action, node_id)
+
+        return jsonify({"error": "save failed"}), 503
+
+    if not saved:
+        return jsonify({"error": f"{action} failed", "node_id": node_id}), 400
+
+    return jsonify({"ok": True, "node_id": node_id})
+
+
+@app.route("/intake/option", methods=["POST"])
+def intake_option_save_endpoint():
+    """
+    Добавляет или правит вариант (кнопку) узла — «блок ошибки» на карте.
+
+    Тело: `{"action": "add"|"update"|"hide"|"link"|"move"|"delete",
+            "node_id": "...", "option_id": "...", ...}`
+
+    **Почему действия в одной ручке.** Все они меняют **одну** таблицу
+    (`telegram_intake_options`) и требуют **одной** проверки секрета. Отдельная
+    ручка на действие размножила бы проверку доступа, а расхождение проверок —
+    ровно тот класс дефекта, из-за которого эту систему уже чинили.
+    """
+    denied = _intake_authorized()
+
+    if denied is not None:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").strip().lower()
+    node_id = str(body.get("node_id") or "").strip()
+    option_id = str(body.get("option_id") or "").strip()
+    author = str(body.get("updated_by") or "") or None
+
+    if not node_id:
+        return jsonify({"error": "node_id is required"}), 400
+
+    from equipment_intake import storage
+    from equipment_intake.tree_config import DEFAULT_TREE
+
+    # 🔴 **Узел ищется по ОБОИМ источникам: код и веб.** Раньше проверка шла
+    # только по `DEFAULT_TREE`, и в блок, созданный через веб, нельзя было
+    # добавить кнопку: ручка отвечала «unknown node», хотя блок только что
+    # создан той же страницей. Со стороны это выглядело как «блок создаётся
+    # пустым и наполнить его нельзя».
+    if node_id not in storage._known_node_ids(DEFAULT_TREE):
+        return jsonify({"error": "unknown node", "node_id": node_id}), 400
+
+    try:
+        if action == "add":
+            # Пустая подпись — не «добавить безымянную кнопку»: в дереве
+            # появился бы пункт, который оператор не сможет прочитать.
+            label = str(body.get("label") or "").strip()
+
+            if not label:
+                return jsonify({"error": "label is required"}), 400
+
+            created = storage.add_option(
+                node_id,
+                label,
+                description=str(body.get("description") or ""),
+                icon=str(body.get("icon") or ""),
+                # `only_for` — для причин: «показывать только у этих модулей».
+                only_for=body.get("only_for") or (),
+                next_node=(str(body["next_node"]) if body.get("next_node") else None),
+                created_by=author,
+            )
+
+            if not created:
+                return jsonify({"error": "could not add option"}), 400
+
+            # Связь с шаблоном — вторым шагом: `add_option` пишет только колонки
+            # v1, чтобы работать и до миграции `0109`. Неудачная связь не отменяет
+            # создания кнопки, поэтому и не считается ошибкой.
+            template_id = body.get("template_id")
+
+            if template_id not in (None, ""):
+                storage.link_option_to_template(
+                    node_id, created, template_id, updated_by=author
+                )
+
+            return jsonify({"ok": True, "option_id": created})
+
+        if action in ("update", "hide", "link", "move", "delete", "restore") and not option_id:
+            return jsonify({"error": "option_id is required"}), 400
+
+        if action == "update":
+            saved = storage.update_option(
+                node_id,
+                option_id,
+                **{
+                    key: body[key]
+                    for key in ("label", "description", "icon", "next_node", "only_for")
+                    if key in body
+                },
+                updated_by=author,
+            )
+        elif action == "hide":
+            saved = storage.set_option_hidden(
+                node_id, option_id, bool(body.get("hidden")), updated_by=author
+            )
+        elif action == "link":
+            saved = storage.link_option_to_template(
+                node_id, option_id, body.get("template_id"), updated_by=author
+            )
+        elif action == "move":
+            saved = storage.move_option(
+                node_id, option_id, str(body.get("direction") or ""), updated_by=author
+            )
+        elif action == "delete":
+            # 🔴 **Удаляется любая кнопка, включая встроенную** (требование
+            # владельца 13.10.2026: «нужно чтобы полностью мог менять удалять
+            # кнопки все»). Встроенная помечается `deleted = true` (миграция
+            # `0115`) — её определение лежит в коде бота, и строку из базы не
+            # убрать; добавленная удаляется строкой.
+            #
+            # Отдельного «нельзя» здесь нет: причину отказа называет `storage`,
+            # и она одна — «это последняя кнопка узла». Оставить узел без
+            # вариантов нельзя: бот показал бы только «Cancel», и оператор не
+            # смог бы записать ошибку (то же ограничение проверяет валидатор
+            # дерева в самом боте).
+            saved = storage.delete_option(
+                node_id, option_id, updated_by=author
+            )
+
+            if not saved:
+                return (
+                    jsonify(
+                        {
+                            "error": "cannot delete the last visible button of a block",
+                            "hint": "add another button first, or hide this one instead",
+                            "node_id": node_id,
+                            "option_id": option_id,
+                        }
+                    ),
+                    400,
+                )
+        elif action == "restore":
+            # Возврат удалённой кнопки. Существует потому, что удаление
+            # встроенной — пометка: человек, удаливший кнопку по ошибке, должен
+            # смочь её вернуть.
+            saved = storage.restore_option(
+                node_id, option_id, updated_by=author
+            )
+        else:
+            return jsonify({"error": f"unknown action {action!r}"}), 400
+    except Exception:
+        logger.exception(
+            "Не удалось выполнить %s варианта %s узла %s", action, option_id, node_id
+        )
+
+        return jsonify({"error": "save failed"}), 503
+
+    if not saved:
+        return jsonify({"error": f"{action} failed", "node_id": node_id}), 400
+
+    return jsonify({"ok": True, "node_id": node_id, "option_id": option_id or None})
 
 
 @app.route("/shift_stats", methods=["GET"])

@@ -568,12 +568,16 @@ class RowMappingChecks(unittest.TestCase):
     def test_end_time_follows_the_table_convention(self):
         """
         `error_end_time = error_start_time + solving_time` across the live table
-        (verified on 23393 rows). With no issue template `solving_time` is 0, so
-        the expected end equals the start — NULL would be the odd one out here.
+        (verified on 23393 rows). With no issue template the solving time is
+        **unknown** (`None`, not `0`), so the end equals the start — the
+        convention still holds, because «unknown» adds nothing.
         """
         row = row_for(resolved=None)
 
-        self.assertEqual(row["raw_solving_time"], 0)
+        # 🔴 Снимок — `None`, а не `0` (правка 13.10.2026): незаполненный
+        # справочник не утверждает «решили мгновенно». Читатель отдаёт снимок в
+        # приоритете, поэтому `0` навсегда скрывал бы заполненный шаблон.
+        self.assertIsNone(row["raw_solving_time"])
         self.assertTrue(row["start_time"])
         self.assertEqual(row["end_time"], row["start_time"])
 
@@ -2012,7 +2016,7 @@ class ConfirmationTextChecks(unittest.TestCase):
         for step in ("k50h", "safety", "safety_front_button"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update(
             {"warehouse": warehouse, "image": "/tmp/p.jpg", "message_id": 5}
         )
@@ -2306,7 +2310,8 @@ class TemplateMatchingChecks(unittest.TestCase):
         self.assertEqual(row["equipment_category"], "robot")
         self.assertEqual(row["raw_template_title"], "Lifting")   # модуль из answers()
         self.assertIsNone(row["raw_recovery"])
-        self.assertEqual(row["raw_solving_time"], 0)
+        # Снимок времени — `None` (не `0`): шаблона нет, значит и времени нет.
+        self.assertIsNone(row["raw_solving_time"])
 
     def test_no_match_keeps_end_equal_to_start(self):
         from datetime import datetime
@@ -2327,7 +2332,9 @@ class TemplateMatchingChecks(unittest.TestCase):
             row = self._row("driver component exception")
 
         self.assertEqual(row["equipment_category"], "robot")
-        self.assertEqual(row["raw_solving_time"], 0)
+        # Снимок времени — `None` (не `0`): справочник не прочитан, значит
+        # «время решения неизвестно», а не «решили мгновенно».
+        self.assertIsNone(row["raw_solving_time"])
         self.assertIsNone(row["template_id"])
         # Самое важное: отчёт состоялся и сырой текст на месте.
         self.assertIn("driver component exception", row["raw_description"])
@@ -2348,15 +2355,28 @@ class TemplateMatchingChecks(unittest.TestCase):
         self.assertIn("driver component exception", row["raw_description"])
 
     def test_solving_time_is_coerced_to_int(self):
-        """Справочник может вернуть строку или мусор — запись не должна падать."""
+        """Справочник может вернуть строку или мусор — запись не должна падать.
+
+        **Пустое или битое значение даёт `None`, а не `0`** (правка 13.10.2026).
+        Ноль — это утверждение «решили за 0 минут», которого справочник не
+        делает, а читатель отдаёт снимок `raw_solving_time` **в приоритете** над
+        шаблоном: `0` навсегда перебил бы заполненный `solving_time`. `None`
+        передаёт ход справочнику, и заполненная заготовка появится и в старых
+        строках.
+        """
         self._with_templates([dict(self.TEMPLATE, solving_time="8")])
         self.assertEqual(self._row("driver component exception")["raw_solving_time"], 8)
 
         self._with_templates([dict(self.TEMPLATE, solving_time=None)])
-        self.assertEqual(self._row("driver component exception")["raw_solving_time"], 0)
+        self.assertIsNone(self._row("driver component exception")["raw_solving_time"])
 
         self._with_templates([dict(self.TEMPLATE, solving_time="abc")])
-        self.assertEqual(self._row("driver component exception")["raw_solving_time"], 0)
+        self.assertIsNone(self._row("driver component exception")["raw_solving_time"])
+
+        # Пустая строка — то же «значения нет», что и `None`: база хранит её
+        # вместо NULL в части колонок.
+        self._with_templates([dict(self.TEMPLATE, solving_time="")])
+        self.assertIsNone(self._row("driver component exception")["raw_solving_time"])
 
     def test_template_without_sub_type_does_not_leave_first_column_empty(self):
         """У шаблона id 122 `issue_sub_type` пуст — колонка не должна опустеть."""
@@ -2770,7 +2790,7 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         for step in ("k50h", "safety", "safety_front_button"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({"warehouse": "GLP-C", "image": "/tmp/x.jpg", "message_id": 5})
 
         with mock.patch.object(flow, "_bot"), \
@@ -2785,7 +2805,9 @@ class IncompleteSessionIsNotWritten(unittest.TestCase):
         self.assertTrue(save.called, "завершённый путь должен записываться")
         report = save.call_args.args[0]
         self.assertEqual(report["answers"]["device_number"], "3780")
-        self.assertEqual(report["answers"]["cause"], "Obstacle on the path")
+        # Причина из списка **своего модуля** (`safety`): у него есть `human_error`,
+        # потому что причина осмысленна только в контексте железа.
+        self.assertEqual(report["answers"]["cause"], "Human error")
 
 
 class StatsRobotTopIsLonger(unittest.TestCase):
@@ -2985,7 +3007,7 @@ class ConfirmShowsProgress(unittest.TestCase):
         for step in ("k50h", "safety", "safety_front_button"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update(
             {
                 "warehouse": "GLP-C",

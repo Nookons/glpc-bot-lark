@@ -726,7 +726,15 @@ def _template_values(template: Optional[Dict[str, Any]], category: str, module: 
             "equipment_category": category,
             "raw_template_title": module or device_type,
             "raw_recovery": None,
-            "raw_solving_time": 0,
+            # 🔴 **`None`, а не `0`.** Ноль — это «решили мгновенно», то есть
+            # утверждение о времени, которого никто не делал. Читатель
+            # (`journal.py`, `exception_rows.py`) предпочитает снимок `raw_*`
+            # справочнику, поэтому `0` **перебивал бы** заполненный
+            # `solving_time` шаблона: даже после заполнения заготовки строка
+            # навсегда показывала бы `0:00`. Проверено на живой базе: все 192
+            # строки бота имеют `raw_solving_time = 0`, и метрика «сколько
+            # решается ошибка» считала эти нули измерениями.
+            "raw_solving_time": None,
             "template_id": None,
         }
 
@@ -738,6 +746,8 @@ def _template_values(template: Optional[Dict[str, Any]], category: str, module: 
         "equipment_category": template.get("issue_type"),
         "raw_template_title": template.get("employee_title"),
         "raw_recovery": template.get("recovery_title") or None,
+        # Пустое значение справочника остаётся пустым снимком — см. объяснение
+        # выше: незаполненная заготовка не должна выглядеть решённой за 0 минут.
         "raw_solving_time": _solving_time(template.get("solving_time")),
         # Ссылка на справочник. `id` есть у каждого шаблона; при его отсутствии
         # (усечённый SELECT) остаётся `None` — ссылку не выдумываем.
@@ -745,18 +755,29 @@ def _template_values(template: Optional[Dict[str, Any]], category: str, module: 
     }
 
 
-def _solving_time(value: Any) -> int:
+def _solving_time(value: Any) -> int | None:
     """
-    Время решения в минутах — целое.
+    Время решения в минутах — целое, либо `None`, если в справочнике пусто.
+
+    **Почему `None`, а не `0`.** Ноль означает «решение заняло 0 минут» — это
+    утверждение о факте, которого в справочнике нет. Читатели отдают снимок
+    `raw_solving_time` в приоритете над справочником, поэтому `0` **скрывал бы**
+    заполненный шаблон навсегда. `None` же передаёт ход справочнику, и после
+    заполнения заготовки значение появится и в старых строках.
 
     В базе колонка целочисленная, а `error_end_time` считается как
-    `error_start_time + solving_time`. Нечисловое значение приводим к нулю:
-    испорченный справочник не должен ронять запись отчёта.
+    `error_start_time + solving_time`; `None` значит «время решения неизвестно»,
+    и конец ошибки тогда равен началу — как и раньше при нуле.
+    Нечисловое значение справочника тоже даёт `None`: испорченный справочник не
+    должен ронять запись отчёта и не должен подставлять выдуманное число.
     """
+    if value is None or value == "":
+        return None
+
     try:
         return max(0, int(float(value)))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def build_row(
@@ -951,10 +972,12 @@ def build_rows(
 
     # Время решения берём из шаблона; конец ошибки считается по конвенции
     # журнала (`error_end_time = error_start_time + solving_time`), проверенной
-    # на 23 384 из 23 400 строк. Без шаблона `solving_time = 0`, и конец равен
-    # началу — как было раньше.
+    # на 23 384 из 23 400 строк. **Если справочник время не задал, конец равен
+    # началу** — это не «решили мгновенно», а «время решения неизвестно»:
+    # снимок остаётся `None` (см. `_solving_time`), и после того как человек
+    # заполнит заготовку, значение появится и в отчёте.
     solving_time = template_columns["raw_solving_time"]
-    error_end = received + timedelta(minutes=solving_time)
+    error_end = received + timedelta(minutes=solving_time or 0)
 
     # **Разделение номеров: по строке на каждое устройство.**
     #

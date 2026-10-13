@@ -22,7 +22,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import equipment_intake.storage as storage  # noqa: E402
-from equipment_intake.tree_config import DEFAULT_TREE  # noqa: E402
+from equipment_intake.tree_config import (
+    DEFAULT_TREE,
+    MODULE_ERRORS,
+    cause_node_id,
+    error_node_id,
+)  # noqa: E402
 
 
 class FakeDB:
@@ -140,6 +145,11 @@ def _install(db: FakeDB) -> None:
     # отказывал бы, и тесты связи проверяли бы не то.
     storage._link_state = True
     storage._link_checked_at = float("inf")
+    # Пометка удаления (`0115`) в тестовой базе тоже есть: без этой строки
+    # `delete_option` для встроенной кнопки отказывал бы «колонки нет», и тесты
+    # удаления проверяли бы не то, что заявляют.
+    storage._deleted_state = True
+    storage._deleted_checked_at = float("inf")
 
 
 def _uninstall() -> None:
@@ -175,9 +185,20 @@ class EditorStorageTestCase(unittest.TestCase):
 
         Здесь берётся узел, все варианты которого ведут в одно место, — на нём
         и проверяется сброс `hidden`.
+
+        🔴 **И у которого вариантов БОЛЬШЕ ОДНОГО.** С 13.10.2026 последнюю
+        видимую кнопку узла скрыть нельзя: узел-выбор без вариантов — тупик для
+        оператора (осталась бы только «Cancel»), и это же отвергает валидатор
+        дерева в боте. Первым в обходе идёт `robot_errors_chassis` с **одной**
+        кнопкой, и тест падал на защите, работающей правильно. Условие «≥2»
+        делает выбор узла честным: тест проверяет сброс `hidden`, а не границу
+        защиты.
         """
         for node in DEFAULT_TREE.nodes.values():
             if not node.options or node.id == DEFAULT_TREE.root_id:
+                continue
+            # Меньше двух вариантов — скрывать нечего проверять: защита не даст.
+            if len(node.options) < 2:
                 continue
             targets = {option.next_node for option in node.options}
             targets.discard(None)
@@ -378,6 +399,18 @@ class EditorStorageTestCase(unittest.TestCase):
         и проверяется отдельно, чтобы её отсутствие не выглядело как «редактор не
         готов». Здесь важно, что обе пробы делаются на **первом** вызове, а дальше
         читается только v1.
+
+        🔴 **С 13.10.2026 проб со `template_id` стало ДВЕ, и это не дефект.** Набор
+        с пометкой удаления (`0115`) содержит `template_id`, поэтому считается
+        этой же веткой счётчика: холодный вызов сначала пробует полный набор
+        (`0115` + `0109`), затем набор без удаления, затем v2, затем v1. Каждая
+        миграция — **своя** проба: PostgREST отвергает запрос целиком из-за одной
+        неизвестной колонки, и общая проба означала бы, что неприехавшая `0115`
+        снимает заодно связь с шаблонами.
+
+        **Что здесь действительно важно:** число проб не растёт с числом вызовов.
+        Поэтому проверка сравнивает холодный вызов и повторные, а не жёсткое «1»:
+        иначе тест ловил бы не дефект кэша, а добавление новой миграции.
         """
         probes = {"link": 0, "v2": 0, "v1": 0}
         module = types.ModuleType("sendToDataBase")
@@ -403,11 +436,24 @@ class EditorStorageTestCase(unittest.TestCase):
         self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
-        for _ in range(5):
+        storage.load_option_rows()
+        cold = dict(probes)
+
+        for _ in range(4):
             storage.load_option_rows()
 
-        self.assertEqual(probes["v2"], 1, "колонки v2 проверяются заново на каждый вызов")
-        self.assertEqual(probes["link"], 1, "проверка связи template_id идёт каждый раз")
+        # Пробы — только на холодном вызове.
+        self.assertEqual(
+            probes["v2"], cold["v2"], "колонки v2 проверяются заново на каждый вызов"
+        )
+        self.assertEqual(
+            probes["link"], cold["link"], "проверка связи template_id идёт каждый раз"
+        )
+        # Холодный вызов укладывается в пробники: по одному на миграцию.
+        self.assertLessEqual(cold["link"], 2, "лишние пробы на холодном вызове")
+        self.assertGreaterEqual(cold["link"], 1, "связь обязана проверяться")
+        # Откат к v1 — каждый раз: строки читаются по старому набору, пока
+        # колонок v2 нет.
         self.assertEqual(probes["v1"], 5, "откат к v1 должен происходить каждый раз")
 
     def test_missing_nodes_table_is_not_queried_on_every_call(self):
@@ -415,6 +461,19 @@ class EditorStorageTestCase(unittest.TestCase):
 
         `load_node_rows` при отсутствии таблицы возвращает пустой список — это
         нормально, но сам запрос даёт 404 в логе. На каждое сообщение.
+
+        🔴 **Первый вызов делает НЕСКОЛЬКО пробников — и это не дефект.** Набор
+        колонок узла приезжает **тремя** миграциями: `0116` (тип узла и пометка
+        удаления), `0114` (координаты холста) и `v2` (правки узлов). PostgREST
+        отвергает запрос целиком из-за одной неизвестной колонки, поэтому
+        отличить «нет таблицы» от «нет колонок типа» одним запросом нельзя: оба
+        дают отказ. Пробники идут от полного набора к усечённому, и только после
+        них состояние запоминается.
+
+        **Что здесь действительно важно и что сторожит тест:** число запросов
+        **не растёт с числом вызовов**. Проверка на точное «1» ловила бы не
+        дефект кэша, а изменившееся число пробников, поэтому проверяются оба
+        свойства: холодный вызов укладывается в пробники, а повторные — молчат.
         """
         queries = {"nodes": 0}
         module = types.ModuleType("sendToDataBase")
@@ -434,10 +493,25 @@ class EditorStorageTestCase(unittest.TestCase):
         self.addCleanup(_uninstall)
         storage.reset_capability_cache()
 
-        for _ in range(5):
+        # Холодный вызов: по одному пробнику на миграцию (`0116` → `0114` →
+        # v2 → v1). Каждая приезжает своей миграцией, и PostgREST отвергает
+        # запрос целиком из-за одной неизвестной колонки — общая проба означала
+        # бы, что неприехавшая `0116` снимает заодно координаты и правки.
+        storage.load_node_rows()
+        cold = queries["nodes"]
+
+        self.assertLessEqual(cold, 4, "холодный вызов делает лишние пробники")
+        self.assertGreaterEqual(cold, 1, "холодный вызов обязан спросить таблицу")
+
+        # 🔴 Главное: повторные вызовы не добавляют запросов вовсе.
+        for _ in range(4):
             storage.load_node_rows()
 
-        self.assertEqual(queries["nodes"], 1, "отсутствующая таблица запрашивается каждый раз")
+        self.assertEqual(
+            queries["nodes"],
+            cold,
+            "отсутствующая таблица запрашивается каждый раз",
+        )
 
     def test_full_edit_is_refused_when_migration_not_applied(self):
         """Без `sql/intake_editor_v2.sql` правки запрещены, а не «тихо сохранены»."""
@@ -532,6 +606,246 @@ class MissingMigrationNoiseTests(unittest.TestCase):
             any("intake_editor_v2" in m for m in records),
             "исчезло сообщение о том, что нужно применить миграцию",
         )
+
+
+class DeleteAnyOptionChecks(EditorStorageTestCase):
+    """
+    Удаление **любой** кнопки и защита последней.
+
+    Требование владельца 13.10.2026: «нужно чтобы полностью мог менять удалять
+    кнопки все и переподвязывать их». Раньше удалить можно было только
+    добавленную кнопку, а встроенную предлагалось скрыть.
+
+    🔴 **Почему эти проверки живут на уровне `storage`, а не на ручке.** Первая
+    версия проверяла только, что ручка вызывает `storage` — и **проходила даже
+    со снятой защитой**: подменённая `delete_option` всегда отвечала успехом.
+    То есть тест сторожил вызов, а не поведение. Здесь вызывается настоящая
+    логика на базе в памяти, поэтому снятие защиты роняет проверку.
+    """
+
+    def _node_with_two_options(self):
+        """Узел, у которого кнопок ≥2 — на нём удаление и скрытие разрешены."""
+        for node in DEFAULT_TREE.nodes.values():
+            if len(node.options) >= 2 and node.id != DEFAULT_TREE.root_id:
+                return node
+        self.fail("в дереве нет узла с двумя вариантами")
+
+    def _node_with_one_option(self):
+        """Узел ровно с одной кнопкой — на нём проверяется защита."""
+        for node in DEFAULT_TREE.nodes.values():
+            if len(node.options) == 1 and node.id != DEFAULT_TREE.root_id:
+                return node
+        self.fail("в дереве нет узла с одним вариантом")
+
+    def test_builtin_option_is_marked_deleted(self):
+        """🔴 Встроенная кнопка удаляется пометкой, а не удалением строки.
+
+        Её определение лежит в коде бота: удаление строки вернуло бы кнопку к
+        исходному виду, и «удаление» выглядело бы неработающим.
+        """
+        node = self._node_with_two_options()
+        option = node.options[0]
+
+        self.assertTrue(
+            storage.delete_option(node.id, option.id),
+            "встроенную кнопку должно быть можно удалить",
+        )
+
+        row = next(
+            r for r in self.db.rows["telegram_intake_options"]
+            if r["node_id"] == node.id and r["option_id"] == option.id
+        )
+        self.assertTrue(row["deleted"], "пометки удаления нет — кнопка останется в дереве")
+
+        # И она действительно исчезает из рабочего дерева.
+        item = next(
+            i for i in storage.effective_options(DEFAULT_TREE, node.id, self.db.rows["telegram_intake_options"])
+            if i["id"] == option.id
+        )
+        self.assertTrue(item["deleted"])
+
+    def test_restore_brings_the_button_back(self):
+        """Удаление обратимо: `restore_option` возвращает кнопку."""
+        node = self._node_with_two_options()
+        option = node.options[0]
+
+        storage.delete_option(node.id, option.id)
+        self.assertTrue(storage.restore_option(node.id, option.id))
+
+        item = next(
+            i for i in storage.effective_options(DEFAULT_TREE, node.id, self.db.rows["telegram_intake_options"])
+            if i["id"] == option.id
+        )
+        self.assertFalse(item["deleted"], "кнопка не вернулась из удаления")
+
+    def test_added_option_is_removed_from_the_table(self):
+        """Добавленная кнопка живёт только строкой — её убираем совсем."""
+        node = self._node_with_two_options()
+        created = storage.add_option(node.id, "Temp added")
+
+        self.assertTrue(storage.delete_option(node.id, created))
+
+        left = [
+            r for r in self.db.rows["telegram_intake_options"]
+            if r["node_id"] == node.id and r["option_id"] == created
+        ]
+        self.assertEqual(left, [], "строка добавленной кнопки осталась в базе")
+
+    def test_last_visible_option_cannot_be_deleted(self):
+        """🔴 Последнюю кнопку узла удалить нельзя — узел стал бы тупиком.
+
+        Без вариантов бот показал бы оператору только «Cancel», и записать
+        ошибку было бы нечем. Это же отвергает валидатор дерева
+        (`types.py::validate`: `choice` без вариантов — ошибка).
+        """
+        node = self._node_with_one_option()
+
+        self.assertFalse(
+            storage.delete_option(node.id, node.options[0].id),
+            "последняя кнопка удалена — оператор упёрся бы в тупик",
+        )
+        self.assertEqual(
+            storage.visible_options_count(node.id), 1, "кнопка пропала из дерева"
+        )
+
+    def test_last_visible_option_cannot_be_hidden(self):
+        """🔴 Скрыть последнюю кнопку тоже нельзя: тупик тот же.
+
+        Проверка стоит на **обоих** путях намеренно: удаление и скрытие ведут к
+        одному состоянию («у узла нет кнопок»), и защита на одном из них
+        оставила бы второй открытым.
+        """
+        node = self._node_with_one_option()
+
+        self.assertFalse(
+            storage.set_option_hidden(node.id, node.options[0].id, True),
+            "последняя кнопка скрыта — оператор упёрся бы в тупик",
+        )
+        self.assertEqual(storage.visible_options_count(node.id), 1)
+
+    def test_hiding_a_non_last_option_still_works(self):
+        """Защита не мешает обычному скрытию, когда кнопок больше одной."""
+        node = self._node_with_two_options()
+        option = node.options[0]
+
+        self.assertTrue(storage.set_option_hidden(node.id, option.id, True))
+        # И обратно показывается.
+        self.assertTrue(storage.set_option_hidden(node.id, option.id, False))
+
+    def test_deleting_twice_is_not_an_error(self):
+        """Повторное удаление — тот же результат, а не отказ.
+
+        Иначе повторное нажатие (или две вкладки) показывало бы ошибку на уже
+        достигнутом состоянии.
+        """
+        node = self._node_with_two_options()
+        option = node.options[0]
+
+        self.assertTrue(storage.delete_option(node.id, option.id))
+        self.assertTrue(storage.delete_option(node.id, option.id))
+
+
+class CauseScopeChecks(EditorStorageTestCase):
+    """
+    Причины привязаны к модулю **самим узлом**, а не фильтром `only_for`.
+
+    Требование владельца 13.10.2026: «сделай Block What caused it? на каждый
+    модуль». Раньше узел причин был один (`ask_cause`), а причины ограничивались
+    по модулям полем `only_for` — и это требовало сторожа «не оставить модуль без
+    причин». Теперь у каждого модуля **свой узел** со своим списком, и сторож не
+    нужен: пустой список невозможен по построению (см. `test_module_tree.py`).
+
+    🔴 **Почему проверки на уровне `storage`.** Здесь проверяется то, что видит
+    оператор: кнопка ошибки ведёт в узел причин своего модуля и **не** в чужой.
+    """
+
+    def test_error_buttons_lead_to_their_own_module_cause_node(self):
+        """
+        Кнопка ошибки ведёт в узел причин **своего** модуля.
+
+        Дефект, который это ловит: все ошибки вели в один общий `ask_cause`, и
+        оператор на шасси видел причины камеры.
+        """
+        for module in MODULE_ERRORS:
+            node = DEFAULT_TREE.node(error_node_id(module))
+            expected = cause_node_id(module)
+
+            for option in node.options:
+                self.assertEqual(
+                    option.next_node,
+                    expected,
+                    f"{module}: ошибка {option.id} ведёт не в свой узел причин",
+                )
+
+    def test_cause_lists_differ_between_modules(self):
+        """Списки причин у модулей разные — иначе разделение бессмысленно."""
+        chassis = tuple(o.id for o in DEFAULT_TREE.node(cause_node_id("chassis")).options)
+        qr = tuple(o.id for o in DEFAULT_TREE.node(cause_node_id("qr_code")).options)
+
+        self.assertNotEqual(chassis, qr)
+        # «Код места повреждён» бывает только у QR.
+        self.assertIn("dirty_code", qr)
+        self.assertNotIn("dirty_code", chassis)
+
+    def test_template_link_is_per_node_not_per_option_id(self):
+        """
+        🔴 Связь заготовки различается по узлу, а не только по `option_id`.
+
+        Это **дефект, найденный при разделении**: карта связей ключевалась одним
+        `option_id`, а id причин повторяются (`human_error` есть у всех модулей).
+        Связь, выставленная на причине шасси, «уехала» бы на причину подъёма —
+        проверено запуском: обе ветки получали один и тот же `template_id`.
+
+        Теперь связь хранится с узлом, и старая схема ключа остаётся запасной —
+        у ошибок (`robot_errors_*`) id уникальны, и уже сохранённые связи
+        работают без миграции.
+        """
+        from equipment_intake import error_templates as et
+
+        templates = [
+            {"id": 10, "employee_title": "Human error chassis"},
+            {"id": 20, "employee_title": "Human error lift"},
+        ]
+        # Связь выставлена ТОЛЬКО у причины шасси.
+        links = {"ask_cause_chassis::human_error": 10}
+
+        chassis_steps = [
+            {"node_id": "robot_errors_chassis", "option_id": "chassis_went_off_road", "label": "Went off the road"},
+            {"node_id": "ask_cause_chassis", "option_id": "human_error", "label": "Human error"},
+        ]
+        lift_steps = [
+            {"node_id": "robot_errors_lift", "option_id": "lift_cant_lift", "label": "Can't lift"},
+            {"node_id": "ask_cause_lift", "option_id": "human_error", "label": "Human error"},
+        ]
+
+        found = et.linked_template(chassis_steps, templates, links)
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], 10)
+
+        # У подъёма связи нет — и он НЕ получает связь шасси.
+        self.assertIsNone(
+            et.linked_template(lift_steps, templates, links),
+            "связь причины шасси применилась к причине подъёма",
+        )
+
+    def test_old_option_id_key_still_works_for_errors(self):
+        """
+        Старая схема ключа (`option_id`) продолжает работать для ошибок.
+
+        Совместимость обязательна: связи ошибок уже сохранены в базе этой схемой,
+        и ломать их нельзя — иначе у владельца «пропали» бы заготовки.
+        """
+        from equipment_intake import error_templates as et
+
+        templates = [{"id": 10, "employee_title": "Went off the road"}]
+        steps = [
+            {"node_id": "robot_errors_chassis", "option_id": "chassis_went_off_road", "label": "Went off the road"}
+        ]
+
+        found = et.linked_template(steps, templates, {"chassis_went_off_road": 10})
+
+        self.assertIsNotNone(found, "связь ошибки по старому ключу перестала работать")
+        self.assertEqual(found["id"], 10)
 
 
 class FailureNoticeTests(unittest.TestCase):

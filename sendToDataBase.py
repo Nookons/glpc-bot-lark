@@ -759,6 +759,29 @@ def find_best_template(
     return templates[index]
 
 
+def _solving_time_or_none(value):
+    """
+    Время решения из справочника: целое число минут или `None`.
+
+    **Почему `None`, а не `0`.** Ноль означает «решение заняло 0 минут» — это
+    утверждение о факте, которого в справочнике нет. Читатели
+    (`journal.py`, `exception_rows.py`) отдают снимок `raw_solving_time`
+    **в приоритете** над шаблоном, поэтому `0` навсегда скрывал бы заполненный
+    `solving_time`. Пустое значение передаёт ход справочнику: как только
+    человек заполнит заготовку, время появится и в старых строках.
+
+    Нечисловое значение тоже даёт `None`: испорченный справочник не должен
+    ронять запись отчёта и не должен подставлять выдуманное число.
+    """
+    if value is None or value == "":
+        return None
+
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 # ============================================================
 # SAVE EXCEPTION
 # ============================================================
@@ -1126,7 +1149,12 @@ def send_to_data_base(
         "raw_template_title": best_match.get("employee_title"),
         "raw_description": best_match.get("issue_description"),
         "raw_recovery": best_match.get("recovery_title"),
-        "raw_solving_time": int(best_match.get("solving_time") or 0),
+        # 🔴 **`None`, а не `0`.** Ноль — утверждение «решили мгновенно», а
+        # незаполненный справочник такого не говорит. Читатель отдаёт снимок
+        # `raw_solving_time` в приоритете над шаблоном, поэтому `0` **перебивал
+        # бы** заполненный `solving_time` навсегда. Та же правка, что в
+        # `equipment_intake/report_writer.py::_solving_time`.
+        "raw_solving_time": _solving_time_or_none(best_match.get("solving_time")),
         "equipment_category": best_match.get("issue_type"),
         "operating_day": shift_date,
         "employee": employee.get("user_name"),

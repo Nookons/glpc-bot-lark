@@ -382,7 +382,9 @@ class IntegrationChecks(unittest.TestCase):
                 # в свободном тексте.
                 "error": "Can't lift up/down the fork",
                 "device_number": "9182",
-                "cause": "Obstacle on the path"})
+                # Причина — из списка **этого модуля** (`lifting`): у подъёма
+                # она своя, потому что препятствие тут под вилами, а не на пути.
+                "cause": "Obstacle under the fork"})
 
             flow._confirm(-100123, sender, session, 900)
             deliver.assert_called_once()
@@ -498,7 +500,7 @@ class IntegrationChecks(unittest.TestCase):
         for step in ("k50h", "safety", "safety_front_button"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({"warehouse": "", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
 
@@ -530,7 +532,7 @@ class IntegrationChecks(unittest.TestCase):
         for step in ("k50h", "safety", "safety_front_button"):
             session.select(step)
 
-        session.select("obstacle")
+        session.select("human_error")
         session.data.update({"warehouse": "SMALL-P3", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
 
