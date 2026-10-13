@@ -1066,6 +1066,204 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class NewModuleGetsItsOwnErrorAndCauseNodes(EditorStorageTestCase):
+    """
+    🔴 **Добавил модуль — блоков `robot_errors_…` и причин хватает.**
+
+    Требование владельца 13.10.2026, дословно: «окей я если я допустим добавил
+    новый модуль на робота и теперь хочу добавить robots_error_что то там».
+
+    **Что ломалось.** id нового блока выводился **только из заголовка**, а узлы
+    ошибок и причин связаны **именами**: `robot_errors_<модуль>` →
+    `ask_cause_<модуль>`. Заголовок «Fingers: what is wrong?» давал
+    `fingers_what_is_wrong`, и причины для нового модуля не находились.
+
+    Воспроизведено на **живой ветке владельца**: у созданного им
+    `robot_errors_fingers` единственная ошибка вела в `ask_cause_qr_code`, и
+    оператор, выбрав «Fingers stuck open/close», видел причины QR-кода
+    («Dirty or damaged floor code»). Это не косметика: причина уходит в отчёт и
+    определяет метрику по ошибкам.
+    """
+
+    def test_add_node_creates_the_contract_id(self):
+        """
+        🔴 **Сквозная проверка: `add_node` создаёт узел с контрактным id.**
+
+        ⚠️ **Почему именно так, а не только проверка `_node_id_for_insertion`.**
+        Первая версия этих тестов звала `_node_id_for_insertion` **напрямую**, и
+        негативная проверка её не поймала: сломанным оказался вызов внутри
+        `add_node` (id по-прежнему брался из заголовка), а сама функция
+        оставалась целой. Тест обязан идти через **тот же путь**, что и веб.
+
+        Модуль `camera` выбран потому, что узла `robot_errors_camera` в дереве
+        **нет** — иначе проверка не отличила бы «id выведен из места вставки» от
+        «узел уже существовал» (на этом упала соседняя проверка про `tray`).
+        """
+        # Кнопка модуля, которую вставляет веб перед созданием узла ошибок.
+        # `add_option` берёт **подпись**, а `option_id` выводит из неё.
+        option_id = storage.add_option(
+            "robot_module_a42t", "Camera",
+            next_node="ask_number", created_by="test",
+        )
+        self.assertEqual(option_id, "camera", "id кнопки модуля не тот")
+        self.addCleanup(
+            storage.delete_option, "robot_module_a42t", option_id, updated_by="cleanup"
+        )
+
+        node_id = storage.add_node(
+            title="Camera: what is wrong?",
+            node_type="choice",
+            after_node_id="robot_module_a42t",
+            after_option_id="camera",
+            created_by="test",
+        )
+
+        self.assertIsNotNone(node_id, "узел не создался")
+        self.addCleanup(storage.delete_node, node_id, updated_by="cleanup")
+
+        self.assertEqual(
+            node_id, "robot_errors_camera",
+            "id узла ошибок не следует контракту имён",
+        )
+
+    def test_add_node_gives_the_cause_node_its_contract_id(self):
+        """
+        🔴 Сквозная проверка узла **причин**: вставка за кнопкой ошибки.
+
+        Это исправление ветки `Fingers` владельца: причина обязана быть своей
+        (`ask_cause_…`), а не вести в причины чужого модуля.
+        """
+        option_id = storage.add_option(
+            "robot_module_a42t", "Camera",
+            next_node="ask_number", created_by="test",
+        )
+        self.addCleanup(
+            storage.delete_option, "robot_module_a42t", option_id, updated_by="cleanup"
+        )
+
+        module = storage.add_node(
+            title="Camera: what is wrong?",
+            node_type="choice",
+            after_node_id="robot_module_a42t",
+            after_option_id=option_id,
+            created_by="test",
+        )
+
+        self.assertEqual(module, "robot_errors_camera")
+        self.addCleanup(storage.delete_node, module, updated_by="cleanup")
+
+        error_id = storage.add_option(
+            module, "Camera is dead", next_node="ask_number", created_by="test",
+        )
+        self.addCleanup(storage.delete_option, module, error_id, updated_by="cleanup")
+
+        cause = storage.add_node(
+            title="Why did it happen?",
+            node_type="choice",
+            after_node_id=module,
+            after_option_id=error_id,
+            created_by="test",
+        )
+
+        self.assertIsNotNone(cause, "узел причин не создался")
+        self.addCleanup(storage.delete_node, cause, updated_by="cleanup")
+
+        self.assertEqual(
+            cause, "ask_cause_camera",
+            "id узла причин не следует контракту имён",
+        )
+
+    def test_error_node_gets_the_contract_id(self):
+        """Вставка за кнопкой модуля даёт `robot_errors_<хвост>`."""
+        node_id = storage._node_id_for_insertion(
+            "Camera: what is wrong?", storage._known_node_ids(DEFAULT_TREE),
+            after_node_id="robot_module_a42t", after_option_id="camera",
+        )
+
+        self.assertEqual(node_id, "robot_errors_camera")
+
+    def test_module_tail_follows_the_map_not_the_label(self):
+        """
+        Хвост берётся из карты модулей: `Lifting` у K50H → `lift`, не `lifting`.
+
+        У K50H модуль подписан `Lifting`, а узел ошибок — `robot_errors_lift`.
+        Слепое `error_node_id("lifting")` создало бы **второй** узел для того же
+        железа, и правки разошлись бы.
+
+        ⚠️ **Проверяется сама карта, а не создание узла.** `robot_errors_lift`
+        уже есть в дереве, поэтому `_node_id_for_insertion` законно вернул бы
+        id из заголовка (второй узел не создаётся) — и тест не отличил бы
+        «хвост взят из карты» от «узел уже был». Первая версия этой проверки
+        именно на этом и упала.
+        """
+        from equipment_intake.tree_config import module_tail_for_option
+
+        self.assertEqual(
+            module_tail_for_option("robot_module_k50h", "lifting"), "lift"
+        )
+        # Модуль, добавленный из веба, в карте отсутствует -> хвост из option_id.
+        self.assertEqual(
+            module_tail_for_option("robot_module_a42t", "fingers"), "fingers"
+        )
+
+    def test_cause_node_gets_the_contract_id(self):
+        """
+        Вставка за кнопкой **узла ошибок** даёт узел причин того же модуля.
+
+        Это и есть исправление ветки `Fingers`: причина обязана быть своей.
+        """
+        node_id = storage._node_id_for_insertion(
+            "Why did it happen?", storage._known_node_ids(DEFAULT_TREE),
+            after_node_id="robot_errors_fingers",
+            after_option_id="fingers_stuck_open_close",
+        )
+
+        self.assertEqual(node_id, "ask_cause_fingers")
+
+    def test_explicit_title_still_wins(self):
+        """Явный заголовок по контракту уважается — прежние блоки не ломаются."""
+        node_id = storage._node_id_for_insertion(
+            "robot_errors_camera", storage._known_node_ids(DEFAULT_TREE),
+            after_node_id="robot_module_a42t", after_option_id="camera",
+        )
+
+        self.assertEqual(node_id, "robot_errors_camera")
+
+    def test_ordinary_block_keeps_the_old_behaviour(self):
+        """Обычная вставка «за кнопкой» работает как раньше — id из заголовка."""
+        node_id = storage._node_id_for_insertion(
+            "Which cable is damaged?", storage._known_node_ids(DEFAULT_TREE),
+            after_node_id="root", after_option_id="robot",
+        )
+
+        self.assertEqual(node_id, "which_cable_is_damaged")
+
+    def test_existing_error_node_is_not_duplicated(self):
+        """
+        Если узел ошибок модуля **уже есть**, второй не создаётся.
+
+        Живой случай: владелец сам создал `robot_errors_fingers` из веба. Вставка
+        «ещё одного» дала бы два узла на один модуль, и правки разошлись бы —
+        ровно то, от чего предостерегает `cause_node_id`.
+        """
+        known = storage._known_node_ids(DEFAULT_TREE)
+
+        # Берётся узел **из кода** (`robot_errors_tray`): он есть в дереве
+        # всегда. `robot_errors_fingers` создан владельцем в живой базе, и в
+        # офлайновой подмене его нет — проверка на нём падала бы не по делу.
+        self.assertIn("robot_errors_tray", known, "нет узла для проверки")
+
+        node_id = storage._node_id_for_insertion(
+            "Tray: what is wrong?", known,
+            after_node_id="robot_module_a42t", after_option_id="tray",
+        )
+
+        self.assertNotEqual(
+            node_id, "robot_errors_tray",
+            "второй узел ошибок для того же модуля",
+        )
+
+
 class WebCreatedBlocksAreEditable(EditorStorageTestCase):
     """
     🔴 Блоки и кнопки, **созданные из веба**, полностью редактируемы.

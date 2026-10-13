@@ -287,6 +287,48 @@ def error_node_id(module: str) -> str:
     return f"robot_errors_{module}"
 
 
+def module_tail_for_option(module_node_id: str, option_id: str) -> str:
+    """
+    Хвост узла ошибок для кнопки модуля: `("robot_module_k50h", "lifting")` → `lift`.
+
+    **Почему не сам `option_id`.** У K50H модуль подписан `Lifting`, а узел
+    ошибок называется `robot_errors_lift` — подпись и хвост **намеренно разные**
+    (см. `cause_node_id`). Слепое `error_node_id("lifting")` создало бы второй
+    узел для того же железа, и правки разошлись бы.
+
+    **Модуль, добавленный из веба, в карте отсутствует** — тогда возвращается
+    `option_id` как есть: человек сам назвал модуль, и другого источника правды
+    о его хвосте нет. Так работает сценарий «добавил модуль → добавляю
+    `robot_errors_…`».
+    """
+    for row in ROBOT_MODULES.get(str(module_node_id or ""), ()):
+        if len(row) >= 3 and str(row[0]) == str(option_id):
+            return str(row[2])
+
+    return str(option_id or "").strip().casefold()
+
+
+def module_of_error_node(node_id: str) -> str:
+    """
+    Обратная операция к `error_node_id`: `robot_errors_lift` → `lift`.
+
+    Нужна, чтобы по **месту вставки** понять, какой узел создаётся: если новый
+    блок вставляется за кнопкой узла ошибок, то это узел **причин** этого модуля,
+    и его id обязан быть `ask_cause_<модуль>`, а не выведенным из заголовка.
+
+    Возвращается пустая строка, если узел не является узлом ошибок: вызывающий
+    код тогда работает по-старому (id из заголовка).
+    """
+    prefix = "robot_errors_"
+
+    text = str(node_id or "")
+
+    if not text.startswith(prefix):
+        return ""
+
+    return text[len(prefix):]
+
+
 def cause_node_id(module: str) -> str:
     """
     id узла причин модуля: `chassis` → `ask_cause_chassis`.

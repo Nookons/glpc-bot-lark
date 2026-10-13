@@ -31,7 +31,15 @@ import time
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .tree_config import DEFAULT_TREE
+from .tree_config import (
+    ASK_CAUSE,
+    DEFAULT_TREE,
+    ROBOT_MODULES,
+    cause_node_id,
+    error_node_id,
+    module_of_error_node,
+    module_tail_for_option,
+)
 from .types import DecisionTree, Node, NodeType, Option
 
 logger = logging.getLogger(__name__)
@@ -2156,6 +2164,76 @@ def node_overrides() -> Dict[str, Dict[str, Any]]:
 MAX_NODE_ID = 40
 
 
+def _node_id_for_insertion(
+    title: str,
+    known: set,
+    after_node_id: Optional[str] = None,
+    after_option_id: Optional[str] = None,
+    base: DecisionTree = None,
+) -> str:
+    """
+    id нового узла: по **месту вставки**, если оно задаёт контракт имён.
+
+    🔴 **Зачем.** Владелец: «если я допустим добавил новый модуль на робота и
+    теперь хочу добавить `robots_error_` что то там». Узлы ошибок и причин
+    связаны **именами**: `robot_errors_<модуль>` → `ask_cause_<модуль>`. Пока id
+    выводился только из заголовка, вставка блока за кнопкой ошибки давала
+    `fingers_what_is_wrong` вместо `ask_cause_fingers`, и причины для нового
+    модуля **не находились** — оператор попадал в чужие (это и случилось с
+    вашей веткой `Fingers`).
+
+    **Правило.** Смотрим, за какой **кнопкой** вставляем:
+
+      * кнопка узла `robot_errors_<модуль>` → создаём узел **причин** этого
+        модуля, id `ask_cause_<модуль>`;
+      * кнопка узла модулей модели → создаём узел **ошибок**, и модуль берём из
+        `option_id` (он уже назван по контракту: `fingers`, `chassis`, …), id
+        `robot_errors_<модуль>`;
+      * во всех остальных случаях — прежнее поведение (id из заголовка).
+
+    **Заголовок остаётся приоритетным, если он уже даёт правильный id:** человек,
+    набравший `ask_cause_fingers` руками, получает ровно его. Это важно и для
+    совместимости — старые блоки создавались именно так.
+    """
+    base = base or DEFAULT_TREE
+
+    # 1. Явный контракт в заголовке — уважаем его.
+    from_title = _slug_node_id(title, known)
+
+    if from_title.startswith("robot_errors_") or from_title.startswith(ASK_CAUSE):
+        return from_title
+
+    if not after_node_id:
+        return from_title
+
+    # 2. Вставка за кнопкой узла ОШИБОК -> это узел ПРИЧИН того же модуля.
+    module = module_of_error_node(after_node_id)
+
+    if module:
+        candidate = cause_node_id(module)
+
+        return candidate if candidate not in known else _slug_node_id(title, known)
+
+    # 3. Вставка за кнопкой узла МОДУЛЕЙ -> это узел ОШИБОК этого модуля.
+    #
+    # 🔴 **Хвост берётся из карты модулей, а не из `option_id`.** У K50H модуль
+    # называется `Lifting`, а узел ошибок — `robot_errors_lift`: подпись и хвост
+    # **намеренно разные** (`cause_node_id` предупреждает об этом же). Слепое
+    # `error_node_id("lifting")` дало бы `robot_errors_lifting` — второй узел для
+    # того же железа, и правки разошлись бы.
+    #
+    # **Модуль, добавленный из веба, в карте отсутствует** — тогда хвост берётся
+    # из `option_id` (его и задал человек). Ровно ваш случай: «добавил новый
+    # модуль на робота и хочу добавить `robot_errors_…`».
+    if after_node_id in ROBOT_MODULES and after_option_id:
+        tail = module_tail_for_option(after_node_id, str(after_option_id))
+        candidate = error_node_id(tail)
+
+        return candidate if candidate not in known else _slug_node_id(title, known)
+
+    return from_title
+
+
 def _slug_node_id(title: str, taken: set) -> str:
     """
     Идентификатор узла из заголовка: `Мой вопрос?` → `moy_vopros`.
@@ -2231,7 +2309,28 @@ def add_node(
         return None
 
     known = _known_node_ids(base)
-    node_id = _slug_node_id(title, known)
+
+    # 🔴 **id выводится из МЕСТА ВСТАВКИ, а не только из заголовка.**
+    #
+    # Контракт имён в дереве: узел ошибок модуля — `robot_errors_<модуль>`, узел
+    # причин — `ask_cause_<модуль>`. От этих имён зависят **связи**:
+    # `error_node_id`/`cause_node_id` собирают их программно, редактор `/tree`
+    # ищет причины по префиксу `ask_cause`, а заготовки (`error_templates`)
+    # проверяют префикс `robot_errors_`.
+    #
+    # Раньше id всегда выводился из заголовка, и это ломало вашу задачу
+    # «добавил модуль — хочу добавить `robot_errors_…`»: заголовок
+    # «Fingers: what is wrong?» давал id `fingers_what_is_wrong`, а не
+    # `robot_errors_fingers`, и связь с причинами по имени не складывалась.
+    #
+    # **Заголовок остаётся приоритетным**, если он уже даёт правильный id: так
+    # человек, набравший `robot_errors_fingers` руками, получает ровно его.
+    node_id = _node_id_for_insertion(
+        title, known,
+        after_node_id=after_node_id,
+        after_option_id=after_option_id,
+        base=base,
+    )
 
     # Продолжение ветки: если не сказано — ведём в финал, чтобы узел не был
     # тупиком (иначе оператор застрянет на новом вопросе).
