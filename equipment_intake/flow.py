@@ -728,8 +728,16 @@ def unregistered_numbers(session: Session) -> List[str]:
     Возвращается список подписей вида `Robot 9999`; пустой список — либо всё
     найдено, либо справочник недоступен (`lookup` вернул `None`). Второе — не
     «не найдено»: обвинять верный номер из-за упавшего чтения нельзя.
+
+    🔴 **Назван КОНКРЕТНЫЙ ненайденный номер, а не вся строка ввода.**
+    Требование владельца 13.10.2026: «в таких случаях 3544/1234 должно делить на
+    двух роботов и проверять двух сразу и более». Дефект был виден на живом
+    примере: оператор вводил `3544/1234`, робот `3544` в справочнике **есть**, а
+    `1234` — нет, и предупреждение говорило `Robot 3544/1234`. Из него
+    **невозможно понять, который из двух** не найден, — а исправить надо ровно
+    один номер. Теперь предупреждение называет только `Robot 1234`.
     """
-    from .validation import lookup
+    from .validation import parts_with_lookup
 
     warehouse = str(session.data.get("warehouse") or "")
     missing: List[str] = []
@@ -741,10 +749,13 @@ def unregistered_numbers(session: Session) -> List[str]:
             continue
 
         kind = session.number_kind_for_step(step)
-        found = lookup(kind, warehouse, step.value)
 
-        if found is False:
-            missing.append(f"{_kind_label(kind)} {str(step.value).strip()}")
+        # Проверяем **каждое устройство отдельно**: в одной строке их бывает
+        # несколько (`3544/1234`, `3545/314/141`), и найденное не должно попадать
+        # в предупреждение вместе с ненайденным.
+        for part, found in parts_with_lookup(kind, warehouse, step.value):
+            if found is False:
+                missing.append(f"{_kind_label(kind)} {part}")
 
     return missing
 

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,31 @@ def lookup(kind: str, warehouse: str, value) -> Optional[bool]:
         results.append(found)
 
     return all(results)
+
+
+def parts_with_lookup(kind: str, warehouse: str, value) -> List[Tuple[str, Optional[bool]]]:
+    """
+    Каждое устройство из ввода и результат его проверки по справочнику.
+
+    🔴 **Зачем по отдельности.** В одной строке оператор называет несколько
+    устройств: `3544/1234` — два робота, `3545/314/141` — три. Требование
+    владельца 13.10.2026: «должно делить на двух роботов и проверять двух сразу
+    и более».
+
+    Раньше проверка отвечала одним `True`/`False` на всю строку, и в
+    предупреждении оказывалась **вся** строка ввода: при `3544/1234` (робот
+    `3544` есть, `1234` — нет) оператор видел `Robot 3544/1234` и не мог понять,
+    который из двух не найден. Исправлять же надо ровно один.
+
+    `None` в результате — «неизвестно» (справочник недоступен): это **не**
+    «нет в справочнике», и обвинять верный номер из-за упавшего чтения нельзя.
+
+    Для QR-кода список всегда из одного элемента: слэш в коде места или полки —
+    ошибка оператора, а не второе устройство (`_parts`).
+    """
+    parts = _parts(kind, value)
+
+    return [(part, _lookup_one(kind, warehouse, part)) for part in parts]
 
 
 def _lookup_one(kind: str, warehouse: str, code: str) -> Optional[bool]:

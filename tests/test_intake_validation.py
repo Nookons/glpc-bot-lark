@@ -460,6 +460,256 @@ class RegistryLookupChecks(unittest.TestCase):
 # ДЕФЕКТ №3: ЗАРЯДКА — СНАЧАЛА СТАНЦИЯ, ПОТОМ РОБОТ
 # ============================================================
 
+class SplitLookupChecks(unittest.TestCase):
+    """
+    🔴 **`3544/1234` проверяется по каждому роботу отдельно.**
+
+    Требование владельца 13.10.2026, дословно: «не проверяет номер робота через
+    сервер и в таких случаях 3544/1234 должно делить на двух роботов и
+    проверять двух сразу и более».
+
+    Дефект был виден на живом примере: робот `3544` в справочнике **есть**, а
+    `1234` — нет, и предупреждение говорило `Robot 3544/1234`. Из него
+    **невозможно понять, который из двух** не найден, — а исправить надо ровно
+    один номер.
+    """
+
+    def test_parts_with_lookup_checks_every_device(self):
+        """Каждое устройство строки проверяется **своим** запросом."""
+        calls = []
+
+        def fake(table, params, optional=False):
+            code = params.get("equipment_code", "").replace("eq.", "")
+            calls.append(code)
+            return [{"id": 1}] if code == "3544" else []
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            result = v.parts_with_lookup(v.KIND_ROBOT, "GLP-C", "3544/1234")
+
+        self.assertEqual([part for part, _ in result], ["3544", "1234"])
+        self.assertEqual([found for _, found in result], [True, False])
+        self.assertEqual(calls, ["3544", "1234"], "проверены не оба робота")
+
+    def test_three_devices_are_all_checked(self):
+        """Больше двух: `3545/314/141` — три проверки."""
+        calls = []
+
+        def fake(table, params, optional=False):
+            calls.append(params.get("equipment_code", "").replace("eq.", ""))
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            result = v.parts_with_lookup(v.KIND_ROBOT, "GLP-C", "3545/314/141")
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(calls, ["3545", "314", "141"])
+
+    def test_unknown_registry_stays_unknown_per_part(self):
+        """
+        Справочник недоступен — `None` у **каждой** части, а не `False`.
+
+        `False` означало бы «номера нет», и запись пометилась бы «на разбор» из-за
+        упавшего чтения — обвинение верного номера.
+        """
+        with mock.patch("sendToDataBase.rest_get", return_value=None):
+            result = v.parts_with_lookup(v.KIND_ROBOT, "GLP-C", "3544/1234")
+
+        self.assertEqual([found for _, found in result], [None, None])
+
+    def test_qr_code_is_never_split(self):
+        """
+        QR-код слэшем не делится: код места и полки содержат дефисы.
+
+        Слэш там — ошибка оператора, и создавать из неё второе устройство
+        значило бы выдумать то, которого нет (решение владельца 12.10.2026).
+        """
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]):
+            result = v.parts_with_lookup(v.KIND_QR_FLOOR, "GLP-C", "SS512/abc")
+
+        self.assertEqual([part for part, _ in result], ["SS512/abc"])
+
+
+class WarningNamesTheMissingRobot(unittest.TestCase):
+    """
+    🔴 **Предупреждение называет конкретный ненайденный номер.**
+
+    Требование владельца 13.10.2026. Раньше в предупреждение попадала **вся**
+    строка ввода (`Robot 3544/1234`), и по ней нельзя было понять, что
+    исправлять.
+    """
+
+    def _session(self, value):
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(DEFAULT_TREE)
+        session.select("robot")
+        session.submit_text(value)
+        session.data["warehouse"] = "GLP-C"
+
+        return session
+
+    def _flow(self):
+        from equipment_intake import flow
+
+        return flow
+
+    def test_only_the_missing_robot_is_named(self):
+        """`3544` есть, `1234` нет -> в предупреждении только `Robot 1234`."""
+        def fake(table, params, optional=False):
+            code = params.get("equipment_code", "").replace("eq.", "")
+            return [{"id": 1}] if code == "3544" else []
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            missing = self._flow().unregistered_numbers(self._session("3544/1234"))
+
+        self.assertEqual(missing, ["Robot 1234"])
+
+    def test_found_robot_is_not_named(self):
+        """
+        Обратная сторона: найденный робот в предупреждение **не** попадает.
+
+        Без этого проверка выше проходила бы и при полной строке в подписи —
+        достаточно было бы убедиться, что `1234` там упомянут.
+        """
+        def fake(table, params, optional=False):
+            return [{"id": 1}]
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            missing = self._flow().unregistered_numbers(self._session("3544/1234"))
+
+        self.assertEqual(missing, [], "оба робота есть — предупреждения быть не должно")
+
+    def test_single_unknown_number_still_named(self):
+        """Обычный случай не сломан: один неизвестный номер называется."""
+        with mock.patch("sendToDataBase.rest_get", return_value=[]):
+            missing = self._flow().unregistered_numbers(self._session("9999"))
+
+        self.assertEqual(missing, ["Robot 9999"])
+
+
+class RobotIdIsWritten(unittest.TestCase):
+    """
+    🔴 **Запись получает `robot_id`.**
+
+    Требование владельца 13.10.2026: «на сервере не храниться robot_id на
+    записях». Проверено на живой базе: из **275** записей бота `robot_id` был
+    заполнен у **нуля** — писался только числовой `robot_number`, а он
+    повторяется между складами.
+    """
+
+    def _result(self, number):
+        return {
+            "answers": {"object": "Robot", "device_number": number},
+            "path": [],
+            "employee": "Tester",
+        }
+
+    def test_each_split_row_gets_its_own_robot_id(self):
+        """У `3544/1234` — **своя** ссылка в каждой строке, не общая."""
+        def fake(table, params, optional=False):
+            if table == rw.ROBOTS_TABLE:
+                code = params.get("robot_number", "").replace("eq.", "")
+                return [{"id": 3520}] if code == "3544" else []
+            return None
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            rows = rw.build_rows(
+                self._result("3544/1234"), "GLP-C",
+                include_optional=True, include_split=True,
+                include_review=True, include_robot=True,
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["robot_id"], 3520)
+        self.assertIsNone(rows[1]["robot_id"], "второй робот не найден -> None")
+
+    def test_robot_lookup_is_scoped_to_the_warehouse(self):
+        """
+        Ссылка ищется **со складом**.
+
+        Номера роботов повторяются между складами (`121`, `122`, `123` есть и в
+        GLP-C, и в SMALL-P3), поэтому подбор без склада вернул бы чужого робота.
+        """
+        rw.reset_robot_cache()
+        calls = []
+
+        def fake(table, params, optional=False):
+            if table == rw.ROBOTS_TABLE:
+                calls.append(params.get("warehouse"))
+                return [{"id": 1, "sub_warehouse": "E"}]
+            return None
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            rw.build_rows(
+                self._result("3544"), "SMALL-P3",
+                include_optional=False, include_split=False,
+                include_review=False, include_robot=True,
+            )
+
+        self.assertTrue(calls, "справочник роботов не читался вовсе")
+        self.assertEqual(set(calls), {"eq.SMALL-P3"}, "поиск ушёл без склада или на чужой")
+
+    def test_robot_row_is_read_once_for_zone_and_id(self):
+        """
+        🔴 **Зона и ссылка читают строку робота ОДИН раз.**
+
+        Обе спрашивают про одного и того же робота по одной и той же паре
+        (склад, номер). Два отдельных запроса — это два обращения к базе на
+        каждую строку отчёта, а отчётов за смену сотни. Проверка держит кэш
+        `robot_row`: без него запросов стало бы два (поймано на этой проверке).
+        """
+        rw.reset_robot_cache()
+        calls = []
+
+        def fake(table, params, optional=False):
+            if table == rw.ROBOTS_TABLE:
+                calls.append(params.get("robot_number"))
+                return [{"id": 3520, "sub_warehouse": "D"}]
+            return None
+
+        with mock.patch("sendToDataBase.rest_get", side_effect=fake):
+            zone = rw.device_zone("SMALL-P3", "3544")
+            robot_id = rw.robot_id_for("3544", "SMALL-P3")
+
+        self.assertEqual(zone, "D")
+        self.assertEqual(robot_id, 3520)
+        self.assertEqual(len(calls), 1, f"справочник прочитан {len(calls)} раза вместо одного")
+
+    def test_no_warehouse_means_no_guess(self):
+        """Склад не задан — ссылки нет, а не «первый попавшийся робот»."""
+        self.assertIsNone(rw.robot_id_for(3544, ""))
+
+    def test_non_numeric_and_non_ascii_are_not_resolved(self):
+        """
+        Составной и не-ASCII номер ссылки не дают.
+
+        `str.isdecimal()` принимает и не-ASCII (`١٢٣`), и такой номер молча стал
+        бы **другим** роботом. Та же проверка живёт в API — сверяется
+        паритет-сторожем `test_cross_repo_parity.py`.
+        """
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]):
+            self.assertIsNone(rw.robot_id_for("H108/1834", "GLP-C"))
+            self.assertIsNone(rw.robot_id_for("١٢٣", "GLP-C"))
+
+    def test_column_may_be_absent(self):
+        """
+        Колонки `robot_id` нет — отчёт пишется **без** неё.
+
+        PostgREST отвергает запрос **целиком** из-за одной неизвестной колонки, а
+        этот дефект уже был 11.10.2026: неп��иехавшая миграция `0080` унесла
+        `cause` (1663 строки). Поэтому набор — отдельный, и его можно выключить.
+        """
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 3520}]):
+            rows = rw.build_rows(
+                self._result("3544"), "GLP-C",
+                include_optional=False, include_split=False,
+                include_review=False, include_robot=False,
+            )
+
+        self.assertNotIn("robot_id", rows[0])
+
+
 class ChargingOrderChecks(unittest.TestCase):
     """Зарядная ветка **закрыта** владельцем, но её машинерия цела.
 

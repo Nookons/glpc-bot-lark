@@ -117,8 +117,37 @@ REVIEW_COLUMNS = (
     "review_reason",
 )
 
-#: Оба набора — для читаемости и для мест, которым нужен полный список.
-ALL_ANALYTICS_COLUMNS = OPTIONAL_COLUMNS + SPLIT_COLUMNS + REVIEW_COLUMNS
+#: **Ссылка на карточку робота** (`robot_id`).
+#:
+#: 🔴 Требование владельца 13.10.2026: «на сервере не храниться robot_id на
+#: записях». Проверено на живой базе: из **275** записей бота `robot_id` был
+#: заполнен у **нуля** — писался только числовой `robot_number`.
+#:
+#: **Чем это плохо.** `robot_number` — то, что оператор назвал руками; он
+#: повторяется **между складами** (`121`, `122`, `123` есть и в GLP-C, и в
+#: SMALL-P3), поэтому по нему нельзя надёжно открыть карточку робота. `robot_id`
+#: — внешний ключ на `robots_maintenance_list` (проверено: FK
+#: `exceptions_robot_id_fkey`), и он однозначен.
+#:
+#: **Почему отдельный набор.** Колонка может появиться не сразу, а PostgREST
+#: отвергает запрос **целиком** из-за одной неизвестной колонки. Общий набор
+#: уронил бы вместе с ней и аналитику — этот дефект уже был 11.10.2026, когда
+#: неприехавшая миграция `0080` унесла `cause` (1663 строки).
+ROBOT_COLUMNS = ("robot_id",)
+
+#: Наборы колонок **по отдельности**. Один источник правды для проверок: наборы
+#: приезжают разными миграциями, и пробы у каждого свои. Тесты считают число
+#: проб по этому списку, а не вписывают число — иначе каждый новый набор ломал
+#: бы их по причине, к сути не относящейся.
+ALL_ANALYTICS_COLUMN_SETS = (
+    OPTIONAL_COLUMNS,
+    SPLIT_COLUMNS,
+    REVIEW_COLUMNS,
+    ROBOT_COLUMNS,
+)
+
+#: Все наборы — для читаемости и для мест, которым нужен полный список.
+ALL_ANALYTICS_COLUMNS = OPTIONAL_COLUMNS + SPLIT_COLUMNS + REVIEW_COLUMNS + ROBOT_COLUMNS
 
 # How long the "columns are missing" answer is remembered. Short TTL, same
 # reasoning as the intake editor's schema cache: after the migration is applied
@@ -132,6 +161,9 @@ _optional_columns_checked_at: float = 0.0
 _split_columns_state: Optional[bool] = None
 _split_columns_checked_at: float = 0.0
 _review_columns_state: Optional[bool] = None
+#: Состояние набора `ROBOT_COLUMNS` — своё, как и у остальных.
+_robot_columns_state: Optional[bool] = None
+_robot_columns_checked_at: float = 0.0
 _review_columns_checked_at: float = 0.0
 
 #: Зона по умолчанию — для складов, у которых разбиения на зоны нет.
@@ -152,6 +184,16 @@ WAREHOUSES_WITH_ZONES = ("SMALL-P3",)
 
 #: Справочник оборудования роботов — источник `sub_warehouse`.
 ROBOTS_TABLE = "robots_maintenance_list"
+
+#: Кэш «(склад, номер) → строка робота». Нужен потому, что зона и `robot_id`
+#: спрашиваются про одного робота, а строк в отчёте бывает много.
+#: Сбрасывается `reset_robot_cache()` — в тестах и при долгой работе процесса.
+_ROBOT_ROW_CACHE: Dict[Any, Any] = {}
+
+
+def reset_robot_cache() -> None:
+    """Сброс кэша справочника роботов — для тестов."""
+    _ROBOT_ROW_CACHE.clear()
 
 # Categories that can be resolved against the canonical equipment inventory.
 INVENTORY_CATEGORIES = ("robot", "workstation", "charging")
@@ -358,31 +400,16 @@ def device_zone(warehouse: str, code: str) -> Optional[str]:
     if warehouse not in WAREHOUSES_WITH_ZONES or not code:
         return None
 
-    # Только числовой номер: `sub_warehouse` ищется по `robot_number`, а
-    # составные номера (`H108/1834`) в этом справочнике не лежат.
-    number = _robot_number(code)
+    # **Та же строка справочника, что и для `robot_id`** (`robot_row`): зона и
+    # ссылка читаются одним запросом, а не двумя. Только числовой номер:
+    # `sub_warehouse` ищется по `robot_number`, а составные номера (`H108/1834`)
+    # в этом справочнике не лежат.
+    row = robot_row(code, warehouse)
 
-    if number is None:
+    if not row:
         return None
 
-    from sendToDataBase import rest_get
-
-    # `optional=True`: сбой справочника не должен ронять запись отчёта.
-    rows = rest_get(
-        ROBOTS_TABLE,
-        {
-            "select": "sub_warehouse",
-            "warehouse": f"eq.{warehouse}",
-            "robot_number": f"eq.{number}",
-            "limit": "1",
-        },
-        optional=True,
-    )
-
-    if not rows:
-        return None
-
-    zone = str(rows[0].get("sub_warehouse") or "").strip()
+    zone = str(row.get("sub_warehouse") or "").strip()
 
     return zone or None
 
@@ -466,6 +493,96 @@ def _robot_number(code: str) -> Optional[int]:
     value = int(text)
 
     return value if value <= 9_223_372_036_854_775_807 else None
+
+
+def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
+    """
+    Строка робота из справочника: `id` и `sub_warehouse` — **одним запросом**.
+
+    **Почему одна функция, а не две.** Зона (`device_zone`) и ссылка
+    (`robot_id_for`) читают **одну и ту же** строку `robots_maintenance_list` по
+    одной и той же паре (склад, номер). Два отдельных запроса — это два
+    обращения к базе на каждую строку отчёта, хотя данные одни. Владелец просил
+    и то, и другое, поэтому строка читается **один раз** и отдаётся обоим.
+
+    Возвращается `None`, если робота нет или справочник недоступен: и зона, и
+    ссылка тогда пустые, но отчёт записывается в любом случае.
+
+    **Результат кэшируется на процесс.** Зона и ссылка спрашиваются про одного и
+    того же робота, а отчётов за смену сотни: без кэша каждая запись делала бы
+    два одинаковых чтения. Справочник роботов меняется редко (номер и склад
+    робота — не то, что правят в течение дня), поэтому короткий кэш безопасен.
+    """
+    number = _robot_number(number)
+
+    if number is None or not warehouse:
+        return None
+
+    key = (str(warehouse), number)
+
+    if key in _ROBOT_ROW_CACHE:
+        return _ROBOT_ROW_CACHE[key]
+
+    from sendToDataBase import rest_get
+
+    # `optional=True`: сбой справочника не должен ронять запись отчёта.
+    rows = rest_get(
+        ROBOTS_TABLE,
+        {
+            "select": "id,sub_warehouse",
+            "warehouse": f"eq.{warehouse}",
+            "robot_number": f"eq.{number}",
+            "limit": "1",
+        },
+        optional=True,
+    )
+
+    if not rows:
+        # «Не найден» тоже запоминаем: неизвестный номер иначе заставлял бы
+        # ходить в базу на каждой строке отчёта.
+        _ROBOT_ROW_CACHE[key] = None
+        return None
+
+    row = rows[0]
+
+    found = row if isinstance(row, dict) else None
+    _ROBOT_ROW_CACHE[key] = found
+
+    return found
+
+
+def _robot_id_from_row(row: Optional[Dict[str, Any]]) -> Optional[int]:
+    """`id` робота из уже прочитанной строки справочника."""
+    if not row:
+        return None
+
+    robot_id = row.get("id")
+
+    return robot_id if isinstance(robot_id, int) else None
+
+
+def robot_id_for(number, warehouse: str = "") -> Optional[int]:
+    """
+    Ссылка на карточку робота (`robots_maintenance_list.id`) или `None`.
+
+    🔴 **Требование владельца 13.10.2026:** «на сервере не храниться robot_id на
+    записях». Проверено на живой базе: из **275** записей бота `robot_id` был
+    заполнен у **нуля** — писался только числовой `robot_number`.
+
+    **Чем это плохо.** `robot_number` — то, что оператор назвал руками, и он
+    **повторяется между складами** (`121`, `122`, `123` есть и в GLP-C, и в
+    SMALL-P3). Поэтому по номеру нельзя надёжно открыть карточку робота; `robot_id`
+    — внешний ключ (`exceptions_robot_id_fkey`), и он однозначен.
+
+    🔴 **Склад обязателен.** Без него подбор вернул бы id робота с чужого склада —
+    ровно та ловушка, на которой уже спотыкались при выводе зон (номера
+    повторяются между складами). Склад пуст — `None`, а не догадка.
+
+    `None` — не ошибка: робота нет в справочнике (тогда запись помечается «на
+    разбор»), номер составной (`H108/1834`) или справочник недоступен. Отчёт
+    обязан записаться в любом случае: ссылку не выдумываем.
+    """
+    return _robot_id_from_row(robot_row(number, warehouse))
 
 
 def device_numbers(code: str, category: str = "") -> list[str]:
@@ -786,6 +903,7 @@ def build_row(
     include_optional: bool = True,
     include_split: bool = True,
     include_review: bool = True,
+    include_robot: bool = True,
 ) -> Dict[str, Any]:
     """Первая (и обычно единственная) строка журнала для отчёта.
 
@@ -799,6 +917,7 @@ def build_row(
         include_optional=include_optional,
         include_split=include_split,
         include_review=include_review,
+        include_robot=include_robot,
     )
 
     return rows[0] if rows else {}
@@ -810,6 +929,7 @@ def build_rows(
     include_optional: bool = True,
     include_split: bool = True,
     include_review: bool = True,
+    include_robot: bool = True,
 ) -> list[Dict[str, Any]]:
     """
     Map an intake result onto the columns of the unified journal (`exceptions`).
@@ -1132,6 +1252,23 @@ def build_rows(
                 str(result.get("review_reason") or "").strip() or None
             )
 
+        # **Ссылка на карточку робота** (`robot_id`).
+        #
+        # 🔴 Требование владельца 13.10.2026: «на сервере не храниться robot_id на
+        # записях». Проверено на живой базе: из 275 записей бота он был заполнен у
+        # **нуля** — писался только `robot_number`, а он повторяется между
+        # складами, поэтому карточку робота по нему надёжно не открыть.
+        #
+        # Отдельный набор колонок: PostgREST отвергает запрос **целиком** из-за
+        # одной неизвестной колонки, и общий набор уронил бы вместе с ней всю
+        # аналитику (дефект 11.10.2026 — 1663 строки без `cause`).
+        #
+        # **Своё значение у каждой строки.** У отчёта про `3544/1234` это две
+        # строки, и у каждой — id **своего** р��бота: общий id привязал бы вторую
+        # ошибку к первому роботу.
+        if include_robot:
+            row["robot_id"] = robot_id_for(number, warehouse)
+
         rows.append(row)
 
     return rows
@@ -1264,11 +1401,27 @@ def _review_columns_available() -> bool:
     )
 
 
+def _robot_columns_available() -> bool:
+    """Есть ли ссылка на карточку робота (`robot_id`).
+
+    Отдельная проверка по той же причине, что и у остальных наборов: запрос с
+    неизвестной колонкой PostgREST отвергает **целиком**, и общий набор уронил бы
+    вместе с ней всю аналитику (этот дефект уже был 11.10.2026).
+    """
+    return _columns_available(
+        GLPC_TABLE,
+        ROBOT_COLUMNS,
+        "_robot_columns_state",
+        "_robot_columns_checked_at",
+    )
+
+
 def reset_schema_cache() -> None:
     """Сброс памяти о колонках — только для тестов."""
     global _optional_columns_state, _optional_columns_checked_at
     global _split_columns_state, _split_columns_checked_at
     global _review_columns_state, _review_columns_checked_at
+    global _robot_columns_state, _robot_columns_checked_at
 
     _optional_columns_state = None
     _optional_columns_checked_at = 0.0
@@ -1276,6 +1429,8 @@ def reset_schema_cache() -> None:
     _split_columns_checked_at = 0.0
     _review_columns_state = None
     _review_columns_checked_at = 0.0
+    _robot_columns_state = None
+    _robot_columns_checked_at = 0.0
 
 
 def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> bool:
@@ -1307,6 +1462,7 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     include_optional = _analytics_columns_available()
     include_split = _split_columns_available()
     include_review = _review_columns_available()
+    include_robot = _robot_columns_available()
 
     from sendToDataBase import rest_upsert
 
@@ -1329,6 +1485,7 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
         include_optional=include_optional,
         include_split=include_split,
         include_review=include_review,
+        include_robot=include_robot,
     )
     # Номера устройств нужны для логов и переживают пересборку ниже.
     row_numbers = [str(row.get("device_number") or "?") for row in rows]
@@ -1343,7 +1500,7 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     # платили за проверку. Наборы снимаются **по одному**: неприехавшая
     # миграция `0080` не должна заодно стирать `cause` (именно это и дало
     # 1663 пустые причины на живой базе).
-    if saved is None and (include_optional or include_split or include_review):
+    if saved is None and (include_optional or include_split or include_review or include_robot):
         logger.warning(
             "Write to %s failed with the analytics columns (%s); retrying without them",
             GLPC_TABLE,
@@ -1353,6 +1510,7 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
                     ("optional", include_optional),
                     ("split", include_split),
                     ("review", include_review),
+                    ("robot", include_robot),
                 )
                 if present
             ),
@@ -1367,11 +1525,15 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
         if include_review:
             _remember_columns("_review_columns_state", "_review_columns_checked_at", False)
 
+        if include_robot:
+            _remember_columns("_robot_columns_state", "_robot_columns_checked_at", False)
+
         rows = build_rows(
             result, title,
             include_optional=False,
             include_split=False,
             include_review=False,
+            include_robot=False,
         )
         row_numbers = [str(row.get("device_number") or "?") for row in rows]
         payload = _wire_payload(rows)

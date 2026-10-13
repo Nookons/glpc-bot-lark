@@ -811,6 +811,12 @@ class DeviceSplitChecks(unittest.TestCase):
         self.assertEqual(len(self.rows_for("3561/3561")), 1)
 
 
+#: Сколько запросов делает отчёт **помимо** проб колонок.
+#:
+#: Замерено на живом коде: справочник связей, справочник шаблонов и склады.
+NON_PROBE_READS = 3
+
+
 class AnalyticsColumnChecks(unittest.TestCase):
     """
     The analytics columns arrive with a migration that may lag the deploy.
@@ -949,9 +955,10 @@ class AnalyticsColumnChecks(unittest.TestCase):
         Это состояние базы, где не применена ни одна из миграций, — писатель
         обязан работать и там, иначе отчёт теряется целиком.
 
-        Наборов теперь **три**: старые аналитические (`0067`–`0075`),
-        разложенные пункты (`0080`) и пометка «на разбор» (`needs_review` /
-        `review_reason`, которых в единой таблице пока нет). Отключаются они
+        Наборов теперь **четыре**: старые аналитические (`0067`–`0075`),
+        разложенные пункты (`0080`), пометка «на разбор» (`needs_review` /
+        `review_reason`, которых в единой таблице пока нет) и ссылка на карточку
+        робота (`robot_id`, требование владельца 13.10.2026). Отключаются они
         по отдельности — и вместе тоже.
         """
         with mock.patch.object(rw, "canonical_type", return_value=None), \
@@ -959,6 +966,7 @@ class AnalyticsColumnChecks(unittest.TestCase):
             row = rw.build_row(
                 result(), "GLP-C",
                 include_optional=False, include_split=False, include_review=False,
+                include_robot=False,
             )
 
         for column in rw.ALL_ANALYTICS_COLUMNS:
@@ -1007,27 +1015,87 @@ class AnalyticsColumnChecks(unittest.TestCase):
     def test_missing_columns_are_remembered_not_probed_per_report(self):
         """Otherwise every report pays for extra requests and logs an error.
 
-        Наборов колонок теперь **три** (см. `test_all_sets_can_be_dropped_together`),
-        поэтому и проб три. На каждый неудачный ответ идёт ещё проверка
-        доступности базы — итого 6 запросов на первый отчёт. Второй отчёт
-        **не** пробует снова: негативный ответ запомнен.
+        🔴 **Число проб считается, а не вписано числом.** Раньше здесь стояло
+        «3 набора × 2 = 6», и добавление набора (`robot_id`, 13.10.2026) ломало
+        проверку по причине, к сути не относящейся. Такой тест заставляет
+        править себя при каждом новом наборе и постепенно теряет смысл: он уже
+        не проверяет, что пробы **не повторяются** на втором отчёте.
         """
+        calls_made = []
+
         def fake_get(table, params, optional=False):
             select = str(params.get("select"))
+            calls_made.append((table, select))
 
             if any(name in select for name in rw.ALL_ANALYTICS_COLUMNS):
                 return None  # ни одного набора колонок в таблице
 
             return [{"id": 1}]
 
+        # 🔴 **Сбрасываем ВСЕ кэши, а не только колонок.** Иначе проверка
+        # зависит от порядка тестов: если предыдущий тест уже прочитал шаблоны
+        # или связи, первый отчёт сделает меньше запросов, и «число проб»
+        # разойдётся. Именно так этот тест и упал в полном прогоне (8 вместо 11),
+        # проходя в одиночку.
+        rw.reset_schema_cache()
+        rw.reset_robot_cache()
+        rw.reset_templates_cache()
+
+        from equipment_intake import storage
+
+        storage.reset_links_cache()
+        storage.reset_capability_cache()
+
         with mock.patch("sendToDataBase.rest_get", side_effect=fake_get) as get, \
              mock.patch("sendToDataBase.rest_upsert", return_value=[{"id": 1}]), \
              mock.patch.object(rw, "canonical_type", return_value=None):
             rw.write_exception(result(), "GLP-C")
-            rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
+            first_report_calls = get.call_count
 
-        # 3 набора × (неудачная проба + проверка доступности базы) = 6.
-        self.assertEqual(get.call_count, 6)
+            rw.write_exception(result(chat_id=-100124, message_id=778), "GLP-C")
+            second_report_calls = get.call_count - first_report_calls
+
+        # У каждого набора — неудачная проба **и** проверка доступности базы.
+        # 🔴 **Считаем пробы колонок, а не все запросы.** Общее число зависит от
+        # того, прогрет ли кэш справочников предыдущим тестом (склады читаются
+        # раз на процесс), и в полном прогоне давало 10 вместо 11. Проверять
+        # надо то, ради чего тест написан: **каждый набор пробуется один раз**.
+        probes = [
+            select for table, select in calls_made
+            if table == "exceptions"
+            and any(name in select for name in rw.ALL_ANALYTICS_COLUMNS)
+        ]
+        self.assertEqual(
+            len(probes), len(rw.ALL_ANALYTICS_COLUMN_SETS),
+            f"наборы пробуются не по одному разу: {probes}",
+        )
+        # 🔴 **Сравниваем набор целиком, а не вхождение имени.** Первая версия
+        # искала `columns[0]` подстрокой, и `"module"` (из старого набора)
+        # находился внутри `"module_text"` (из набора разложенных пунктов) —
+        # проверка сообщала о «двойной пробе» там, где проба одна. Это дефект
+        # **теста**, а не кода; списки колонок сравниваются как множества.
+        for columns in rw.ALL_ANALYTICS_COLUMN_SETS:
+            with self.subTest(columns=columns[0]):
+                exact = sum(
+                    1 for select in probes
+                    if set(select.split(",")) == set(columns)
+                )
+                self.assertEqual(
+                    exact, 1,
+                    f"набор {columns[0]} пробуется {exact} раз вместо одного",
+                )
+
+        # 🔴 Главное: второй отчёт **не** пробует снова — негативный ответ
+        # запомнен. Это и есть смысл теста, и раньше он терялся за числом.
+        second_probes = [
+            select for table, select in calls_made[first_report_calls:]
+            if table == "exceptions"
+            and any(name in select for name in rw.ALL_ANALYTICS_COLUMNS)
+        ]
+        self.assertEqual(
+            second_probes, [],
+            "второй отчёт снова пробует колонки — память не работает",
+        )
 
     def test_unreachable_database_is_not_mistaken_for_missing_columns(self):
         """
