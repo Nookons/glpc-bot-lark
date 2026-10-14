@@ -297,3 +297,82 @@ def test_real_overlay_rows_are_read_from_db_or_skipped():
     assert payload["link_supported"] is True, (
         "база отвечает, но связь template_id не видна: миграция 0109 не применена?"
     )
+
+
+def test_node_transition_is_drawn_as_a_link():
+    """
+    🔴 **Переход самого узла обязан быть ребром** — дефект 14.10.2026.
+
+    Владелец: «с момента фотографии логика канваса немного поломана, Device
+    number и QR code number так неправильно соединено».
+
+    Причина: `tree_view` строил рёбра **только из кнопок**. У текстовых шагов
+    кнопки нет — оператор вводит номер, и узел сам ведёт дальше. Так идут
+    `ask_number → robot_type`, `ask_charging_number → ask_charging_robot` и ещё
+    шесть переходов: цепочка от фото **обрывалась** на карте, хотя в боте диалог
+    продолжается. Замер: **8** переходов узла из 118 связей не рисовались.
+    """
+    payload = _payload()
+    pair = {(l["from"], l["to"]) for l in payload["links"]}
+
+    assert ("ask_number", "robot_type") in pair
+    assert ("ask_charging_number", "ask_charging_robot") in pair
+    assert ("ask_charging_robot", "charging_problem") in pair
+
+
+def test_node_transition_is_marked_unconditional():
+    """
+    Переход узла **без** развилки по виду помечается `node`, а не `kind`.
+
+    Различать обязательно: веб рисует `kind` пунктиром как **условный**. Если
+    пометить условным обычный шаг, человек решит, что он срабатывает не всегда.
+    """
+    payload = _payload()
+    link = next(
+        l
+        for l in payload["links"]
+        if l["from"] == "ask_charging_number" and l["to"] == "ask_charging_robot"
+    )
+
+    assert link["kind"] == "node"
+    # Подписи у перехода узла нет: подписывать нечем, кнопки-то нет.
+    assert link["label"] == ""
+
+
+def test_kind_transition_is_drawn_and_labelled():
+    """
+    🔴 **Переход по виду обязан быть ребром с подписью** — вторая половина
+    дефекта от 14.10.2026.
+
+    `ask_number` ведёт на `robot_type`, **но только для ветки робота**: для кода
+    полки и кода места срабатывает `next_node_by_kind`. Пока карта рисовала
+    переход узла сплошной линией без подписи, выглядело так, будто после кода
+    места бот спрашивает модель робота. На самом деле — не спрашивает.
+
+    Поэтому переход узла у такого блока помечается **условным** (`kind`) и
+    подписывается видом, к которому относится.
+    """
+    payload = _payload()
+    links = {l["to"]: l for l in payload["links"] if l["from"] == "ask_number"}
+
+    # Все три перехода от «Device number» — условные, каждый со своим видом.
+    assert links["robot_type"]["kind"] == "kind"
+    assert links["robot_type"]["label"] == "robot"
+    assert links["ask_cause_qr_code"]["kind"] == "kind"
+    assert links["ask_cause_qr_code"]["label"] in ("qr_floor", "qr_shelf")
+
+
+def test_payload_carries_transitions_the_canvas_needs():
+    """
+    Поля переходов обязаны доехать до веба: без них рёбра не построить.
+
+    `next_node` — текстовый шаг; `next_node_by_kind` — развилка по виду;
+    `answer_kind` — вид узла, которым подписывается условный переход.
+    """
+    payload = _payload()
+    node = next(n for n in payload["nodes"] if n["id"] == "ask_number")
+
+    assert node["next_node"] == "robot_type"
+    assert node["answer_kind"] == "robot"
+    assert ["qr_floor", "ask_cause_qr_code"] in node["next_node_by_kind"]
+    assert ["qr_shelf", "ask_cause_qr_code"] in node["next_node_by_kind"]

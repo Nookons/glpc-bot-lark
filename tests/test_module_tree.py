@@ -575,6 +575,18 @@ class TestLiveOverlayLinksEveryErrorToItsOwnCauses:
 
         with patch("sendToDataBase.rest_get", side_effect=fake_get):
             storage.reset_capability_cache()
+            # 🔴 **Кэш строк узлов тоже обязан сбрасываться.**
+            #
+            # Дефект найден 14.10.2026: тест падал **через раз** в полном прогоне и
+            # проходил в одиночку. Причина — кэш `telegram_intake_nodes`
+            # (`_NODE_ROWS_TTL_SECONDS = 1.5`), добавленный для скорости карты:
+            # если строки уже прочитаны чужим тестом в пределах TTL, подмена
+            # `rest_get` **не вызывается вовсе**, и тест получает **чужие** узлы.
+            #
+            # Проверять такой тест отдельно бессмысленно: он и должен падать
+            # только в окружении, где кэш уже прогрет. Поэтому сброс стоит здесь,
+            # а не в вызывающем коде.
+            storage.reset_node_rows_cache()
 
             return storage.apply_overlay(DEFAULT_TREE)
 
