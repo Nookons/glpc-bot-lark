@@ -536,9 +536,31 @@ class IntegrationChecks(unittest.TestCase):
         session.data.update({"warehouse": "SMALL-P3", "image": "/tmp/x.jpg", "message_id": 5})
         captions = []
 
+        # 🔴 **Справочник изолирован от сети.**
+        #
+        # Дефект найден 14.10.2026: тест проходил **в одиночку** и падал в
+        # полном прогоне — причём от **любого** импорта сетевого модуля
+        # (`analytics`, `digests`, `robot_card`, `sendToDataBase`), даже без
+        # правок в них. Проверено на чистом коде: `1 failed, 43 passed`.
+        #
+        # **Причина.** `_confirm` спрашивает у справочника, есть ли робот
+        # `3780`, через `validation.parts_with_lookup` → `rest_get`. Пока кэш
+        # модуля холодный, запрос уходит в сеть; в полном прогоне кэш уже прогрет
+        # **другим** тестом, и ответ приходит иной — «нет в справочнике».
+        # Дальше `_confirm` показывает мягкое предупреждение и **ждёт ответа**,
+        # вместо того чтобы сохранить отчёт.
+        #
+        # **Почему это дефект теста, а не кода.** Тест проверяет **текст
+        # подписи** после успешного сохранения, а не работу справочника. Значит
+        # справочник ему не нужен вовсе, и подменять его обязательно: иначе
+        # результат зависит от того, какие тесты шли раньше.
         with patch.object(integrations, "persist_and_send", return_value={
                 "database_saved": True, "device_queued": False,
                 "lark_delivered": True, "glpc_saved": True, "glpc_error": None}), \
+             patch("equipment_intake.validation.parts_with_lookup",
+                   side_effect=lambda kind, warehouse, value: [
+                       (part, True) for part in str(value).split("/")
+                   ]), \
              patch.object(flow, "edit_caption",
                           side_effect=lambda *a, **k: captions.append(a[2])), \
              patch.dict(sys.modules, {"telegram_store": types.SimpleNamespace(

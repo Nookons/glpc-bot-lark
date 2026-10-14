@@ -161,6 +161,91 @@ def _pretty_date(shift_date: str) -> str:
         return shift_date
 
 
+def _gaps_line(metrics: dict) -> str:
+    """
+    Сколько записей смены осталось без «что сделано» и без времени решения.
+
+    🔴 **Зачем это в отчёте.** Аудит 14.10.2026: за смену 14.10 day по GLP-C
+    **56 из 121** записи (46 %) были без `raw_recovery`, и **10** — без времени
+    решения. Отчёт об этом молчал, поэтому незакрытая половина смены выглядела
+    как обычные строки, а «Booked repair time» считал по ним минуты.
+
+    Владельцу эта цифра нужна не для контроля ради контроля: она показывает,
+    **где заготовки не заполнены**, и после их заполнения в отчётах появится
+    «что сделано».
+
+    Пустая строка, когда терять нечего — не засоряем карточку.
+    """
+    total = metrics.get("total") or 0
+
+    if not total:
+        return ""
+
+    no_recovery = metrics.get("no_recovery") or 0
+    no_time = metrics.get("no_solving_time") or 0
+
+    if not no_recovery and not no_time:
+        return ""
+
+    parts = []
+
+    if no_recovery:
+        parts.append(
+            f"{no_recovery} without «what was done» "
+            f"({100 * no_recovery // total}%)"
+        )
+
+    if no_time:
+        parts.append(f"{no_time} without solving time")
+
+    return "📝 Not filled in: " + " · ".join(parts)
+
+
+def _zone_line(metrics: dict) -> str:
+    """
+    Разбивка смены по зонам — из `zone` (legacy-имя `issue_warehouse`).
+
+    🔴 **Зачем.** У SMALL-P3 зона выводится **из устройства** (`D`/`E`) и
+    используется во всех остальных отчётах, а в сменном её не было вовсе: по
+    GLP-C 121 из 121 строки — `C2`, по SMALL-P3 `E` 24 и `D` 7. Без разбивки
+    отчёт по складу не отвечает на вопрос «в какой части склада было хуже».
+    """
+    zones = metrics.get("zones") or {}
+
+    if not zones:
+        return ""
+
+    parts = [
+        f"{zone} {count}"
+        for zone, count in sorted(zones.items(), key=lambda kv: -kv[1])
+    ]
+
+    return "📍 Zones: " + " · ".join(parts)
+
+
+def _unassigned_line(metrics: dict) -> str:
+    """
+    Записи без номера робота — отдельной строкой, а не «роботом None».
+
+    🔴 **Что было.** `str(None)` давал строку `"None"`, и она попадала в топ
+    роботов **как робот**. На смене 04.10.2026 ночь таких записей было
+    **74 из 198 (37 %)**: карточка печатала «Top robots: None (74)» и звала
+    «робота None» на обслуживание, а читатель не видел главного — у 37 % смены
+    робот не указан.
+
+    Пустая строка, когда таких записей нет.
+    """
+    unassigned = metrics.get("unassigned") or 0
+
+    if not unassigned:
+        return ""
+
+    total = metrics.get("total") or 0
+    share = f" ({100 * unassigned // total}%)" if total else ""
+
+    return f"❔ No robot in the record: {unassigned}{share}"
+
+
 def format_duration(minutes) -> str:
     """95 -> '1h 35m', 40 -> '40m'."""
     minutes = int(minutes or 0)
@@ -510,11 +595,22 @@ def build_shift_summary(
         "",
         f"Total {total} exceptions · {len(metrics['robots'])} robots · "
         f"{len(metrics['employees'])} employees",
-        f"Downtime {format_duration(metrics['downtime_minutes'])} · "
+        # 🔴 **«Booked repair time», а не «Downtime».**
+        #
+        # Аудит 14.10.2026: это **сумма справочного `solving_time`** (по смене
+        # 14.10 day — 340 минут = 50×4 + 14×6 + 7×2), а не время, когда роботы
+        # стояли. Подпись «Downtime» утверждала обратное, и в той же карточке
+        # ниже стояло «MTTR: no robot came back online». Настоящий простой
+        # считает `downtime_line` (пары Offline→Online) — он ниже.
+        f"Booked repair time {format_duration(metrics['downtime_minutes'])} · "
         f"vs previous shift "
         f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
         f"{previous['shift'] or ''}) {format_delta(metrics['delta'])}",
         *([downtime_line(metrics)] if downtime_line(metrics) else []),
+        # Новые строки — только когда есть что сказать.
+        *([_unassigned_line(metrics)] if _unassigned_line(metrics) else []),
+        *([_zone_line(metrics)] if _zone_line(metrics) else []),
+        *([_gaps_line(metrics)] if _gaps_line(metrics) else []),
         "",
         f"⚠️ Maintenance ({MAINTENANCE_THRESHOLD}+ per shift): "
         f"{_maintenance_line(metrics['maintenance'])}",
@@ -577,11 +673,17 @@ def build_shift_card(
                 f"**Total** {total} exceptions · "
                 f"**robots** {len(metrics['robots'])} · "
                 f"**employees** {len(metrics['employees'])}\n"
-                f"**Downtime** {format_duration(metrics['downtime_minutes'])}\n"
+                # См. разбор в текстовой версии: это справочное время, а не
+                # простой. Настоящий простой — строкой ниже.
+                f"**Booked repair time** "
+                f"{format_duration(metrics['downtime_minutes'])}\n"
                 f"**vs previous shift** "
                 f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
                 f"{previous['shift'] or ''}): "
                 f"**{format_delta(metrics['delta'])}**"
+                + (f"\n{_unassigned_line(metrics)}" if _unassigned_line(metrics) else "")
+                + (f"\n{_zone_line(metrics)}" if _zone_line(metrics) else "")
+                + (f"\n{_gaps_line(metrics)}" if _gaps_line(metrics) else "")
             ),
         },
     })

@@ -115,14 +115,35 @@ def top_report(period: str = DEFAULT_PERIOD, now: datetime = None, warehouse: st
 
     issues = Counter()
     robots = Counter()
+    unassigned = 0
 
+    # 🔴 **Топ ошибок — по осмысленному полю, и робот без номера не «None».**
+    #
+    # Дефект найден аудитом 14.10.2026, подтверждён на живых данных.
+    #
+    # **Ошибки.** Здесь читалось `issue_type` — legacy-имя для
+    # `equipment_category`, то есть **категория оборудования**, а не тип
+    # неисправности. На неделе по GLP-C из 1 444 строк расходились **1 132
+    # (78 %)**: 303 строки с категорией `robot`, 151 — `Chassis` (это модуль),
+    # а «Unable to drive» и «Problem Cannot located» стояли **перепутанными**
+    # местами (238 и 207 записей). На длинной истории сверху добавлялся мусор
+    # `设备Equipment` — 14 277 строк из 24 674 (58 %).
+    #
+    # Правило выбора поля — как у писателя журнала и рапорта смены: снимок
+    # (`raw_*`) важнее справочника. Логика в `journal.meaningful_issue`, чтобы команды
+    # и отчёты не разошлись между собой.
+    #
+    # **Роботы.** `str(None)` даёт строку `"None"`, и она попадала в топ **как
+    # робот**. На смене 04.10.2026 ночь таких записей 74 из 198 (37 %), и
+    # «#None» возглавлял список, скрывая главное: у 37 % смены не указан робот.
     for row in rows:
-        issue = (row.get("issue_type") or "unknown").strip() or "unknown"
-        issues[issue] += 1
+        issues[journal.meaningful_issue(row)] += 1
 
         robot = row.get("error_robot")
 
-        if robot is not None:
+        if robot in (None, "", "None"):
+            unassigned += 1
+        else:
             robots[str(robot)] += 1
 
     return {
@@ -133,6 +154,9 @@ def top_report(period: str = DEFAULT_PERIOD, now: datetime = None, warehouse: st
         "total": len(rows),
         "issues": issues.most_common(TOP_LIMIT),
         "robots": robots.most_common(TOP_LIMIT),
+        # Записей без номера робота: их не показываем как «робота None», но и
+        # молчать нельзя — иначе сумма по роботам не сой��ётся с итогом.
+        "unassigned": unassigned,
     }
 
 
@@ -166,6 +190,18 @@ def format_top_report(report) -> str:
 
     for robot, count in report["robots"]:
         lines.append(f"  {count} · #{robot}")
+
+    # 🔴 **Строка «без робота» — чтобы сумма сходилась.**
+    #
+    # Аудит 14.10.2026: `str(None)` давал строку `"None"`, и она попадала в топ
+    # **как робот** — «#None» возглавлял список на смене, где у 37 % записей
+    # робот не указан. Теперь такие записи не выдумывают робота, но и молчать
+    # нельзя: без этой строки «31 · #3646» и итог 1442 не сходятся, и читатель
+    # решит, что данные потеряны.
+    unassigned = report.get("unassigned") or 0
+
+    if unassigned:
+        lines.append(f"  {unassigned} · (no robot in the record)")
 
     return "\n".join(lines)
 

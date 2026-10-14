@@ -676,15 +676,46 @@ def shift_report_data(
     by_employee: dict = {}
     downtime = 0
 
-    for exc in rows or []:
-        robot = str(exc.get("error_robot"))
-        by_robot[robot] = by_robot.get(robot, 0) + 1
+    # 🔴 **НОВЫЕ СЧЁТЧИКИ, КОТОРЫХ ОТЧЁТУ НЕ ХВАТАЛО** (аудит 14.10.2026).
+    #
+    # Все три считаются по тем же строкам, что уже прочитаны: дополнительных
+    # запросов к базе нет, поэтому отчёт не становится медленнее.
+    unassigned = 0      # записей без номера робота
+    no_recovery = 0     # записей без «что сделано»
+    no_solving_time = 0  # записей без времени решения
+    by_zone: dict = {}
 
-        issue_type = (
-            exc.get("issue_type")
-            or exc.get("first_column")
-            or "unknown"
-        )
+    for exc in rows or []:
+        # 🔴 **Пустой номер робота — НЕ робот по имени «None».**
+        #
+        # Дефект, найденный аудитом: `str(None)` даёт строку `"None"`, и она
+        # попадала в топ **как робот**. На живой смене 04.10.2026 ночь таких
+        # записей было **74 из 198 (37 %)**, и карточка печатала
+        # «Top robots: None (74)» и звала «робота None» на обслуживание.
+        # Читатель при этом не видел главного: у 37 % смены **не указан робот**.
+        raw_robot = exc.get("error_robot")
+
+        if raw_robot in (None, "", "None"):
+            unassigned += 1
+        else:
+            robot = str(raw_robot)
+            by_robot[robot] = by_robot.get(robot, 0) + 1
+
+        # 🔴 **Топ ошибок — по ОСМЫСЛЕННОЙ колонке.**
+        #
+        # Было: `issue_type`, а туда `journal.legacy_row` подставляет
+        # `equipment_category`. В этой колонке у **14 277 из 24 674** строк
+        # GLP-C (58 %) лежит мусор `设备Equipment`, ещё есть `环境Environment` и
+        # склейки вида `行走异常Unable to drive`. За смену 04.08.2026 ночь
+        # карточка показала «设备Equipment 119 (93 %) · Environment 9» — то есть
+        # **ни одного** различимого типа ошибки, хотя рядом лежали
+        # `Abnormal pick-up and delivery` 65 и `Unable to drive` 52.
+        #
+        # Порядок — как у читателей журнала: снимок (`raw_*`) важнее
+        # справочника, потому что правка заготовки не должна переписывать
+        # историю. `issue_type` оставлен последним запасным путём: у строк без
+        # снимка и без справочника он хоть что-то да значит.
+        issue_type = journal.meaningful_issue(exc)
         by_type[issue_type] = by_type.get(issue_type, 0) + 1
 
         employee = exc.get("employee") or "unknown"
@@ -692,8 +723,18 @@ def shift_report_data(
 
         solving_time = exc.get("solving_time")
 
-        if isinstance(solving_time, (int, float)):
+        if isinstance(solving_time, (int, float)) and solving_time:
             downtime += int(solving_time)
+        else:
+            no_solving_time += 1
+
+        if not (exc.get("recovery_title") or "").strip():
+            no_recovery += 1
+
+        zone = str(exc.get("issue_warehouse") or "").strip()
+
+        if zone:
+            by_zone[zone] = by_zone.get(zone, 0) + 1
 
     maintenance = [
         (robot, count)
@@ -708,6 +749,11 @@ def shift_report_data(
         "types": by_type,
         "employees": by_employee,
         "downtime_minutes": downtime,
+        # Новые метрики — читателю отчёта (см. объяснение выше).
+        "unassigned": unassigned,
+        "no_recovery": no_recovery,
+        "no_solving_time": no_solving_time,
+        "zones": by_zone,
         "maintenance": maintenance,
     }
 

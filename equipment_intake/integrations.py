@@ -220,6 +220,45 @@ def _identity_field(answers):
     return "Device number", value
 
 
+def _shift_line(result) -> str:
+    """
+    «Смена · дата» для карточки — считается **из времени отчёта**.
+
+    🔴 **Зачем карточке смена.** Владелец 14.10.2026: карточки должны быть под
+    новый стандарт ошибок. Смена и дата — первые вопросы при разборе: «это
+    вчерашняя ночь или сегодняшний день» и «сколько таких было за смену».
+    Раньше группа видела только оборудование и описание, а к какой смене
+    относится запись — определяла по времени сообщения в чате.
+
+    Считается по тому же правилу, что и запись в журнал (`get_current_shift` в
+    Варшаве), поэтому карточка и база не могут разойтись.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        from shift import get_current_shift
+
+        # 🔴 **Время берётся ТОЙ ЖЕ функцией, что и запись в журнал.**
+        #
+        # `_received_at` умеет то, о чём легко забыть: `flow._confirm` ставит
+        # `created_at` через `time.strftime` — это **наивное локальное** время
+        # хоста, а не UTC. Своя реализация здесь читала бы его как UTC и на
+        # не-UTC хосте (Railway) сдвигала бы смену; карточка и база разошлись бы
+        # на границе смены.
+        from .report_writer import _received_at
+
+        shift_date, shift_name = get_current_shift(
+            _received_at(result).astimezone(ZoneInfo("Europe/Warsaw"))
+        )
+
+        return f"{shift_date} · {shift_name}"
+    except Exception:
+        # Смена — украшение, а не суть: её отсутствие не повод ронять карточку.
+        logger.debug("Не удалось определить смену для карточки", exc_info=True)
+
+        return ""
+
+
 def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     a = result.get("answers") or {}; category = _category(a.get("object"))
     # Ключ `qr_code`, а не `qr`: `intake_category` канонизирует именно в
@@ -236,8 +275,36 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
         "qr": "QR code",
     }
     identity_label, identity_value = _identity_field(a)
-    fields = [("Warehouse",_escape_md(result.get("warehouse") or "Unknown")),("Equipment",f"{labels.get(category,category)} · {_escape_md(a.get('device_type') or '—')}"),(identity_label,_escape_md(identity_value))]
+
+    # 🔴 **Смена и дата — первым полем** (владелец 14.10.2026: «обнови карточки
+    # отправки в lark под новый стандарт ошибок»).
+    #
+    # Смена отвечает на первый вопрос при разборе: «это вчерашняя ночь или
+    # сегодняшний день». До этого группа определяла её по времени сообщения в
+    # чате, а при пересылке или разборе утром это уже неочевидно.
+    fields = []
+    shift = _shift_line(result)
+
+    if shift:
+        fields.append(("Shift", _escape_md(shift)))
+
+    fields.append(("Warehouse",_escape_md(result.get("warehouse") or "Unknown")))
+    fields.append(("Equipment",f"{labels.get(category,category)} · {_escape_md(a.get('device_type') or '—')}"))
+    fields.append((identity_label,_escape_md(identity_value)))
     if a.get("module"): fields.append(("Module",_escape_md(a["module"])))
+
+    # **Что именно произошло — отдельным полем, а не только заголовком.**
+    #
+    # В дереве ответ на вопрос ошибки лежит под ключом `error` (`robot_errors_*`)
+    # или `problem` (зарядка и рабочая станция). Раньше карточка их **не
+    # показывала вовсе**: группа видела оборудование и модуль, но не саму
+    # неисправность — «Chassis» без «Went off the road».
+    #
+    # Это и есть новый стандарт: модуль («где») и ошибка («что») — разные поля.
+    fault = str(a.get("error") or a.get("problem") or "").strip()
+
+    if fault:
+        fields.append(("What happened", _escape_md(fault)))
     # **Причина ошибки — в карточке.**
     #
     # Владелец 07.10.2026: «в парк так же нужно отправлять Reason для ошибки».
@@ -250,6 +317,43 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     # «почему», и читаются одним взглядом.
     if a.get("cause"):
         fields.append(("Reason", _escape_md(a["cause"])))
+
+    # ── **Что сделано и сколько заняло — ИЗ ЖУРНАЛА, а не из ответов.** ──────
+    #
+    # 🔴 Здесь легко ошибиться, и я ошибся с первого раза. «Что сделано» — это
+    # **не** `description` оператора: под этим ключом лежит описание проблемы,
+    # которое карточка уже показывает полем «Problem» ниже. Решение приходит
+    # **из заготовки** (`issue_templates.recovery_title` и `solving_time`), и
+    # писатель журнала кладёт его в `raw_recovery` / `raw_solving_time`.
+    #
+    # Поэтому значения берутся из `result["journal"]`, который заполняет
+    # `write_exception` **тем, что реально записал**. Считать шаблон второй раз
+    # здесь нельзя: у шаблонов-дублей подбор ошибается (id 5 и id 10 совпадают
+    # по `issue_sub_type`), и карточка показала бы не то, что в базе.
+    #
+    # Пустое значение не выводим: «—» читалось бы как «ничего не делали», хотя
+    # на самом деле заготовка просто не заполнена.
+    journal = result.get("journal") or {}
+
+    # Обратная совместимость: если запись в журнал не удалась, остаётся текст
+    # оператора — он в `description`, и это честный запасной вариант.
+    action = str(journal.get("raw_recovery") or "").strip()
+
+    if action:
+        fields.append(("What was done", _escape_md(action[:300])))
+
+    solving = journal.get("raw_solving_time")
+
+    if solving:
+        fields.append(("Solving time", f"{int(solving)} min"))
+
+    # **Причина не подобралась — говорим прямо.**
+    #
+    # Владелец должен видеть, что заготовки нет: тогда её заведут, и в отчётах
+    # появится «что сделано». Молчание читается как «сделано ничего».
+    if journal and not action:
+        fields.append(("What was done", "no template linked"))
+
     fields.append(("Reported by",_escape_md(result.get("employee") or result.get("username") or "Unknown")))
 
     # **`Intake details` убрано — владелец: «оно там не нужно».**

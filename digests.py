@@ -271,7 +271,24 @@ def _digest_section(warehouse: str, now: datetime):
             moment = parse_iso(row.get("created_at"))
             stamp = moment.astimezone(WARSAW_TZ).strftime("%d.%m %H:%M") if moment else "?"
 
-            lines.append(f"  #{row.get('robot_number')} · {stamp}")
+            # 🔴 **Номер заявки лежит в `device_number`, а не в `robot_number`.**
+            #
+            # Дефект найден аудитом 14.10.2026: в таблице очереди
+            # (`telegram_devices_to_add`) колонка называется `device_number`
+            # (объявлено как `NUMBER_FIELD` в `robot_queue`), а здесь читался
+            # `robot_number` — его в таблице нет. Дайджест печатал
+            # «#None · 14.10 21:51» по **каждой** заявке.
+            #
+            # Проверено на живой очереди: 138 заявок GLP-C, у всех заполнен
+            # `device_number` («3678/3548», «3775/3666»). То есть человек видел
+            # список из пяти безликих «#None» вместо номеров, которые надо
+            # разобрать.
+            #
+            # Запасной `robot_number` оставлен: он безвреден, а если таблицу
+            # когда-нибудь переименуют, номер не пропадёт молча.
+            number = row.get("device_number") or row.get("robot_number") or "?"
+
+            lines.append(f"  #{number} · {stamp}")
 
         if queue["open"] > QUEUE_TOP:
             lines.append(f"  … and {queue['open'] - QUEUE_TOP} more")

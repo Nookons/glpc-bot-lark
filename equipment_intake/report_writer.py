@@ -1090,6 +1090,32 @@ def build_rows(
     )
     template_columns = _template_values(template, category, module, device_type)
 
+    # 🔴 **Запись возвращает карточке то, что РЕАЛЬНО попало в журнал.**
+    #
+    # Владелец 14.10.2026: «обнови карточки отправки в lark под новый стандарт
+    # ошибок». Новый стандарт — это «что случилось», «что сделано» и «сколько
+    # заняло»; последние два берутся **из шаблона**, а не из ответов оператора.
+    #
+    # Карточка строится из `result`, и без этого переноса она показывала бы
+    # пустые «What was done» и «Solving time», хотя в журнале они заполнены.
+    # Обратный вариант — считать шаблон второй раз **в карточке** — хуже: два
+    # независимых разрешения могут дать разные шаблоны (у дублей подбор
+    # ошибается), и карточка разошлась бы с базой.
+    #
+    # `setdefault` намеренно: если вызывающий код уже положил своё значение,
+    # переписывать его нельзя.
+    result.setdefault("journal", {})
+    result["journal"].update(
+        {
+            "raw_fault": template_columns.get("raw_fault"),
+            "raw_template_title": template_columns.get("raw_template_title"),
+            "raw_recovery": template_columns.get("raw_recovery"),
+            "raw_solving_time": template_columns.get("raw_solving_time"),
+            "template_id": template_columns.get("template_id"),
+            "template_source": template_source,
+        }
+    )
+
     # Описание ошибки для колонки журнала — **только при точной связи**. У
     # заготовок оно равно названию ошибки словами владельца; у шаблонов с
     # заполненным `issue_description` берётся оно. Пустое значение означает

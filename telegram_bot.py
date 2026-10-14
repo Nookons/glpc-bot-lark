@@ -455,6 +455,12 @@ KNOWN_COMMANDS = (
     "reg", "unreg", "whoami", "stats", "robot", "digest", "top",
     "downtime", "week", "topics", "id", "help", "start", "offline",
     "online", "cancel",
+    # 🔴 **`/tree` добавлена в список.** Обработчик у неё есть давно
+    # (`_handle_command_inner` → `equipment_intake.editor`), а в списке её не
+    # было — поэтому даже подсказка «может, вы имели в виду…» её не предлагала,
+    # и о редакторе дерева знали только те, кому сказали отдельно.
+    # Найдено аудитом 14.10.2026.
+    "tree",
 )
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
@@ -544,11 +550,13 @@ HELP_TEXT = (
     "/top [day|week|month] — top issues and robots\n"
     "/downtime [days] — longest total downtime and MTTR\n"
     "/week — weekly report preview\n"
+    "/tree — edit the intake question tree (leaders)\n"
     "/topics — which topic is used for what\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
     "/cancel — cancel the current action\n"
     "/id — show chat/user IDs\n"
+    "/start — same as /help\n"
     "/help — this message"
 )
 

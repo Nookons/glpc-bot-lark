@@ -100,6 +100,70 @@ def allowed_zone(warehouse: Optional[str], zone: Optional[str]) -> Optional[str]
     return zone if zone in known else None
 
 
+#: Значения, которые НЕ являются типом ошибки, хотя лежат в полях ошибок.
+#:
+#: **Категории оборудования** (`equipment.category`: robot, charging,
+#: workstation, conveyor). Проверено на живой базе 14.10.2026: у 272 строк
+#: недели по GLP-C в `raw_fault` и `equipment_category` стоит `robot`, а
+#: настоящая неисправность — в `reported_error` («Unable to rotate», «No
+#: object»). Показать в топе «robot» значит ответить «что случилось?» словом
+#: «робот».
+#:
+#: **Локализованная категория** `设备Equipment` — 14 277 строк из 24 674 (58 %
+#: по GLP-C), плюс `环境Environment` и склейки вида `行走异常Unable to drive`.
+#:
+#: **Имена модулей** (`robot_module_*` в дереве приёма): у строк с
+#: `raw_template_title` = «Chassis» ошибка лежит в `reported_error`
+#: («Collision»). Модуль отвечает на «где», ошибка — на «что».
+NOT_AN_ISSUE = (
+    "设备", "环境", "Equipment", "Environment",
+    "robot", "charging", "workstation", "conveyor", "qr_code",
+    "Chassis", "Lifting", "Rotation", "Tray", "Horn", "Hook",
+    "QR Code", "Safety", "Network", "Fingers",
+)
+
+#: Китайские префиксы в склейке вида `行走异常Unable to drive`.
+ISSUE_PREFIXES = ("行走异常", "取放货异常", "驱动组件异常", "取放箱位置错误")
+
+
+def meaningful_issue(row: Dict[str, Any]) -> str:
+    """
+    Тип ошибки из строки журнала — или `unknown`.
+
+    🔴 **Одно правило на все команды и отчёты.** Дефект 14.10.2026 возник
+    именно из-за копий: `/top` брал `issue_type`, рапорт смены — то же, и оба
+    показывали **категорию оборудования** вместо неисправности. Когда правило
+    живёт в одном месте, команды не могут разойтись между собой.
+
+    **Порядок полей** — как у остальных читателей журнала: снимок (`raw_*`)
+    важнее справочника, потому что правка заготовки не должна переписывать
+    историю. `issue_type` (legacy-имя `equipment_category`) оставлен последним:
+    у строк без снимка он хоть что-то значит.
+
+    `unknown` — честный ответ: он виден в отчёте и показывает, что заготовка не
+    заполнена. Подставить вместо него категорию значило бы выдать её за ошибку.
+    """
+    for field in ("raw_template_title", "raw_fault", "reported_error", "issue_type"):
+        value = str(row.get(field) or "").strip()
+
+        if not value:
+            continue
+
+        # Склейка «китайское слово + английский перевод»: берём английскую часть.
+        for prefix in ISSUE_PREFIXES:
+            if value.startswith(prefix):
+                value = value[len(prefix):].strip() or value
+
+        if value in NOT_AN_ISSUE or (
+            any(mark in value for mark in NOT_AN_ISSUE) and len(value) <= 24
+        ):
+            continue
+
+        return value
+
+    return "unknown"
+
+
 def legacy_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Строка `exceptions` → историческая форма, которую читает код бота.
 
