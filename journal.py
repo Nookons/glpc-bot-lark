@@ -143,7 +143,18 @@ def meaningful_issue(row: Dict[str, Any]) -> str:
     `unknown` — честный ответ: он виден в отчёте и показывает, что заготовка не
     заполнена. Подставить вместо него категорию значило бы выдать её за ошибку.
     """
-    for field in ("raw_template_title", "raw_fault", "reported_error", "issue_type"):
+    # 🔴 **Порядок: `raw_fault` ПЕРВЫМ, а `raw_template_title` — после.**
+    #
+    # Проверено на живых данных 14.10.2026, и это неочевидно: `raw_template_title`
+    # хранит **название заготовки**, а не ошибку. У 262 строк GLP-C там стоит
+    # `Unknown reason` — при том что настоящая ошибка лежит рядом в `raw_fault`
+    # (`Problem Cannot located`). Показать «Unknown reason» вместо неё значит
+    # скрыть то, что известно.
+    #
+    # Это же подтверждает **старый код**: он читал `issue_type`, а запасным путём
+    # держал `first_column` — то есть `raw_fault` (см. `legacy_row`). Значит
+    # `raw_fault` и был основным полем, а порядок я сначала перепутал.
+    for field in ("raw_fault", "raw_template_title", "reported_error", "issue_type"):
         value = str(row.get(field) or "").strip()
 
         if not value:

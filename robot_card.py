@@ -392,12 +392,20 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         ]
 
         for row in recent[:LAST_ISSUES_LIMIT]:
-            # Строка уже приведена к исторической форме (`journal.legacy_rows`),
-            # поэтому тип и лечение лежат в `issue_type` / `recovery_title`:
-            # они собраны из снимка `raw_*` либо из справочника по `template_id`.
+            # 🔴 **Тип ошибки берётся общим правилом, а не `issue_type`.**
+            #
+            # Дефект найден 14.10.2026 (третья копия одного и того же): в
+            # `issue_type` лежит `equipment_category` — **категория
+            # оборудования**. В списке последних ошибок робота это выглядело как
+            # «14.10 19:08 · 设备Equipment · Yassine Si-Afif» или «· robot», то
+            # есть вместо неисправности карточка называла класс устройства.
+            #
+            # Правило — то же, что у `/top`, `/stats` и рапорта смены
+            # (`journal.meaningful_issue`): снимок `raw_*` важнее справочника,
+            # категории и модули отбрасываются.
             card["last_issues"].append({
                 "at": _pretty(row.get("start_time")),
-                "issue_type": row.get("issue_type") or "unknown",
+                "issue_type": journal.meaningful_issue(row),
                 "recovery": row.get("recovery_title") or None,
                 "by": row.get("employee") or "-",
             })

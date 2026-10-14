@@ -616,15 +616,22 @@ def shift_stats(shift_date: str, shift_name: str):
     by_robot = {}
     by_type = {}
 
+    # 🔴 **То же правило, что у рапорта смены и `/top`** (аудит 14.10.2026).
+    #
+    # Это **вторая копия** того же дефекта: здесь тоже читалось `issue_type` —
+    # legacy-имя `equipment_category`, то есть категория оборудования. Именно
+    # эту функцию использует `/stats` и ручка `/shift_stats`, поэтому обе
+    # показывали категории вместо ошибок. Копия прав��ла была и в
+    # `analytics.top_report`; теперь оно одно — `journal.meaningful_issue`.
+    #
+    # `str(None)` здесь тоже давал робота «None» (см. `shift_report_data`).
     for exc in data:
-        robot = str(exc.get("error_robot"))
-        by_robot[robot] = by_robot.get(robot, 0) + 1
+        robot = exc.get("error_robot")
 
-        issue_type = (
-            exc.get("issue_type")
-            or exc.get("first_column")
-            or "unknown"
-        )
+        if robot not in (None, "", "None"):
+            by_robot[str(robot)] = by_robot.get(str(robot), 0) + 1
+
+        issue_type = journal.meaningful_issue(exc)
         by_type[issue_type] = by_type.get(issue_type, 0) + 1
 
     return total, by_robot, by_type

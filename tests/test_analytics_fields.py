@@ -71,14 +71,37 @@ class MeaningfulIssueChecks(unittest.TestCase):
 
         self.assertEqual(journal.meaningful_issue(row), "Unable to drive")
 
-    def test_template_snapshot_wins_over_reference(self):
-        """Снимок важнее справочника: правка заготовки не переписывает историю."""
+    def test_fault_wins_over_template_title(self):
+        """
+        🔴 **`raw_fault` важнее `raw_template_title`** — проверено на данных.
+
+        Это неочевидно. В `raw_template_title` лежит **название заготовки**, а в
+        `raw_fault` — сама ошибка. У 262 строк GLP-C в названии стоит
+        `Unknown reason` («причина неизвестна»), тогда как рядом записана
+        конкретная ошибка `Problem Cannot located`; в другом случае название —
+        «Driver component exception», а подтип — «Speed error».
+
+        Показать название вместо ошибки значит скрыть то, что известно.
+
+        **Это же подтверждает старый код:** он читал `issue_type`, а запасным
+        путём держал `first_column` — то есть `raw_fault` (см. `legacy_row`).
+        Значит `raw_fault` и был основным полем.
+        """
         row = {
             "raw_template_title": "Driver component exception",
             "raw_fault": "Speed error",
         }
 
-        self.assertEqual(journal.meaningful_issue(row), "Driver component exception")
+        self.assertEqual(journal.meaningful_issue(row), "Speed error")
+
+    def test_unknown_reason_does_not_hide_the_real_fault(self):
+        """«Unknown reason» — название заготовки, а не ответ «неизвестно»."""
+        row = {
+            "raw_template_title": "Unknown reason",
+            "raw_fault": "Problem Cannot located",
+        }
+
+        self.assertEqual(journal.meaningful_issue(row), "Problem Cannot located")
 
     def test_nothing_meaningful_gives_unknown(self):
         """Когда осмысленного поля нет — `unknown`, а не категория.
