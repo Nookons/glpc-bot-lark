@@ -51,10 +51,18 @@ def test_every_tree_node_is_present():
 
     assert len(payload["nodes"]) == len(DEFAULT_TREE.nodes)
     assert payload["root_id"] == DEFAULT_TREE.root_id
-    # 27 узлов — живое дерево на 13.10.2026. Было 20: добавились **восемь**
-    # узлов причин (свой на каждый модуль) вместо одного общего `ask_cause`.
-    # Число держит регрессию «узел пропал из выдачи».
-    assert len(payload["nodes"]) == 27
+    # 🔴 **32 узла — живое дерево на 14.10.2026.** История числа:
+    # * 20 → 27: добавились **восемь** узлов причин (свой на каждый модуль)
+    #   вместо одного общего `ask_cause` (13.10.2026);
+    # * 27 → 32: ветки **зарядок и станций** стали рабочими (14.10.2026) —
+    #   у каждой узел проблем и узел причин (+4), у зарядки **два** узла номеров
+    #   (станция, потом робот), у станции один (+3), и ушли два тупика
+    #   «not available yet» (−2).
+    #
+    # Число держит регрессию «узел пропал из выдачи». Точное равенство
+    # намеренно: пропажа узла — дефект, и её надо замечать, а не сравнивать
+    # «примерно».
+    assert len(payload["nodes"]) == 32
 
 
 def test_builtin_options_survive_without_overlay_rows():
@@ -180,17 +188,43 @@ def test_non_option_nodes_have_no_options():
 
 def test_stub_nodes_expose_their_hint():
     """
-    Заглушки отдаются с `is_stub`/`stub_hint`.
+    Заглушка отдаётся с `is_stub`/`stub_hint` — на **созданном из веба** узле.
 
-    Ветка объявлена, но приём по ней не идёт («Workstations are not available
-    yet»). Это первое, что нужно видеть при проверке дерева, — иначе ветка
-    выглядит рабочей и её отсутствие в отчётах выглядит дефектом.
+    🔴 **Проверка переписана 14.10.2026.** Раньше здесь стоял узел
+    `workstation_unavailable` — «Workstations are not available yet». Ветки
+    станций и зарядок стали рабочими, и тот узел убран из дерева: держать
+    мёртвый тупик незачем, а валидатор запрещает недостижимые узлы.
+
+    Но **сам признак заглушки никуда не делся**, и проверять его надо: узел,
+    созданный в вебе и ещё не наполненный кнопками, обязан помечаться — иначе
+    карта покажет пустой блок как рабочий, и человек решит, что приём по ветке
+    идёт (ровно тот дефект, что был у ветки `Fingers`).
+
+    Узел создаётся на заглушке, а не берётся из живой базы: живая база может
+    быть недоступна на машине разработчика, и тест падал бы не по делу.
     """
-    payload = _payload()
-    ws = _node(payload, "workstation_unavailable")
+    from equipment_intake import storage
+    from equipment_intake.types import DecisionTree, Node, NodeType
 
-    assert ws["type"] == "unavailable"
-    assert ws["option_count"] == 0
+    empty = DecisionTree(
+        root_id="root",
+        nodes={
+            "root": Node(
+                id="root",
+                title="Root",
+                type=NodeType.CHOICE,
+                options=(),
+                is_stub=True,
+                stub_hint="Describe the problem in words",
+            )
+        },
+    )
+    payload = tree_view.build_tree_payload(empty, [], [])
+
+    ws = _node(payload, "root")
+
+    assert ws["is_stub"] is True, "пустой блок не помечен черновым"
+    assert ws["stub_hint"] == "Describe the problem in words"
 
 
 def test_capability_flags_are_reported():
@@ -249,8 +283,17 @@ def test_real_overlay_rows_are_read_from_db_or_skipped():
 
     payload = tree_view.build_tree_payload_from_db()
 
-    assert len(payload["nodes"]) == 27
-    # База ответила — значит и признак связи обязан быть доступен.
+    # 🔴 **Живая база может содержать узлы, созданные из веба**, поэтому число
+    # здесь не равно числу узлов кода: на 14.10.2026 их **33** против **31** —
+    # плюс ветка `Fingers`, заведённая владельцем в вебе (`robot_errors_fingers`
+    # и `ask_cause_fingers`). Это нормальное состояние оверлея, и требовать
+    # точного равенства значило бы запрещать владельцу добавлять блоки.
+    #
+    # Проверяется то, что действительно важно: узлов **не меньше**, чем в коде
+    # (ни один не пропал), и они отдаются из базы, а не только из кода.
+    assert len(payload["nodes"]) >= len(DEFAULT_TREE.nodes), (
+        "из выдачи пропали узлы кода — оверлей их потерял"
+    )
     assert payload["link_supported"] is True, (
         "база отвечает, но связь template_id не видна: миграция 0109 не применена?"
     )

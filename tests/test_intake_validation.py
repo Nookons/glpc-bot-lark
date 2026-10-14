@@ -119,24 +119,42 @@ class BranchDependentHintChecks(unittest.TestCase):
         self.assertIn("3780", hint)
         self.assertIn("H108/1834", hint)
 
-    def test_closed_branches_do_not_ask_for_a_number(self):
-        """Закрытые ветки **не спрашивают номер**: диалог по ним не идёт.
+    def test_device_branches_hint_their_own_number(self):
+        """🔴 Станции и зарядки подсказывают **свой** номер, а не робота.
 
-        Решение владельца 12.10.2026: Workstation и Charging station «ПОКА НЕ
-        РАБОТАЮТ». Прежние проверки требовали, чтобы эти ветки подсказывали
-        номер станции (`137`) и код рабочей станции (`C2-H143`). Ожидание
-        изменено: теперь выбор категории показывает сообщение о недоступности и
-        останавливается — номера в этих ветках нет вовсе.
+        **Ожидание изменилось 14.10.2026.** До этого обе ветки были закрыты
+        («ПОКА НЕ РАБОТАЮТ»), и проверка требовала обратного — что номер по ним
+        не спрашивается вовсе. Ветки построены, и теперь проверяется то, ради
+        чего механизм подсказок и делался: **пример ввода зависит от ветки**.
+
+        Это не косметика. Именно общая подсказка однажды дала 16 записей
+        `qr_code` с номерами роботов (`3492`, `2668`): оператор видел пример
+        робота и вводил робота. У станции и зарядки форматы разные, и спутать их
+        так же легко.
         """
-        for option in ("workstation", "charger"):
-            with self.subTest(option=option):
-                session = Session(tree=DEFAULT_TREE)
-                session.select(option)
+        # Станция: код вида `C2-H146`, не `3780`.
+        station = Session(tree=DEFAULT_TREE)
+        station.select("workstation")
+        self.assertTrue(station.is_number_step())
+        station_hint = station.text_example()
+        self.assertNotIn("3780", station_hint, "станции подсказывают номер робота")
 
-                self.assertFalse(session.is_number_step())
-                self.assertIsNone(session.current_node().options or None)
-                self.assertEqual(session.text_example(), "")
-                self.assertIn("not available yet", session.current_node().description)
+        # Зарядка: первым спрашивается **номер станции** (`137`), и только
+        # вторым — робот. Владелец 12.10.2026: «если зарядка то сначала
+        # спрашиваем зарядку потом номер робота».
+        charger = Session(tree=DEFAULT_TREE)
+        charger.select("charger")
+        self.assertTrue(charger.is_number_step())
+        self.assertEqual(charger.answer_kind(), v.KIND_STATION)
+        charger_hint = charger.text_example()
+        self.assertIn("137", charger_hint)
+        self.assertNotIn("3780", charger_hint, "станция и робот поменялись местами")
+
+        # И уже **второй** шаг подсказывает робота: формат другой, и оператор
+        # должен это видеть, иначе введёт станцию второй раз.
+        charger.submit_text("137")
+        self.assertEqual(charger.answer_kind(), v.KIND_ROBOT)
+        self.assertIn("3780", charger.text_example())
 
     def test_every_branch_has_its_own_kind(self):
         """Вид номера различается по веткам — иначе подсказка снова станет общей.
@@ -711,20 +729,27 @@ class RobotIdIsWritten(unittest.TestCase):
 
 
 class ChargingOrderChecks(unittest.TestCase):
-    """Зарядная ветка **закрыта** владельцем, но её машинерия цела.
+    """Зарядная ветка **снова рабочая** (14.10.2026) — порядок двух номеров.
 
-    **Что изменилось 12.10.2026.** Решение владельца: «Workstation и Charging
-    Station ПОКА НЕ РАБОТАЮТ». Прежние проверки ходили по дереву
-    (`charger → cs_k50h → ask_number → ask_charging_robot`) и требовали двух
-    номеров. Идти этим путём больше нельзя — выбор категории останавливает
-    диалог.
+    **Что изменилось.** До 14.10.2026 обе ветки были тупиками: выбор «Charging
+    station» вёл на узел «not available yet» без кнопок, и наполнить его из веба
+    было нельзя (`add_option` отказывает для типа `UNAVAILABLE`, а сменить тип
+    редактор не умеет). Владелец попросил подготовить ветки — они построены.
 
-    **Почему проверки не удалены, а переписаны.** Порядок «станция, потом
-    робот» — требование владельца и часть контракта записи: станция идёт в
-    `device_number`, робот — в `robot_number`. Когда ветку вернут, регресс
-    должен ловиться сразу, поэтому здесь сторожатся **обе** стороны:
-    1) по дереву зарядка не проходит; 2) вид номера и запись двух колонок
-    по-прежнему работают (`test_writer_files_both_numbers` ниже — без дерева).
+    **Что сторожится здесь.** Требование владельца 12.10.2026, дословно: «если
+    зарядка то сначала спрашиваем зарядку потом номер робота и храним данные на
+    сервере корректно». То есть:
+
+    1. порядок шагов — **станция, потом робот**, и только потом проблема;
+    2. станция идёт в `device_number`, робот — в `robot_number` (обе колонки);
+    3. **робот не подменяет станцию** — иначе в колонке робота окажется номер
+       зарядки, и связь «зарядка ↔ робот» пропадёт (ровно этот дефект и был
+       пойман при построении ветки: узел писал в `charging_robot`, а отчёт читал
+       `error_robot`, и `robot_number` выходил равным номеру станции).
+
+    **Почему проверки переписаны, а не удалены.** Прежняя версия проверяла
+    обратное — что ветка **не работает**. Её смысл («порядок номеров и запись
+    двух колонок — контракт») сохранён, но теперь проверяется на живой ветке.
     """
 
     def setUp(self):
@@ -732,40 +757,83 @@ class ChargingOrderChecks(unittest.TestCase):
         restore_real_send_to_database()
 
     def walk(self):
-        """Путь зарядки в дереве: доходит до узла «недоступно» и стоит."""
+        """Путь зарядки в дереве: выбирает зарядку и доходит до номера."""
         session = Session(tree=DEFAULT_TREE)
         session.select("charger")
         return session
 
-    def test_charging_branch_stops_at_the_unavailable_node(self):
-        """Выбор зарядки показывает отказ и **не** спрашивает номер."""
+    def test_charging_branch_asks_the_station_first(self):
+        """Первый вопрос зарядки — **номер станции**, а не робот и не отказ."""
         session = self.walk()
 
-        self.assertEqual(session.current_id, "charging_unavailable")
-        self.assertFalse(session.is_number_step())
-        self.assertFalse(session.is_text_step())
-        self.assertIn("not available yet", session.current_node().description)
+        self.assertEqual(session.current_id, "ask_charging_number")
+        self.assertTrue(session.is_number_step())
+        # Вид номера берётся из ветки: оператор видит пример станции (`137`), а
+        # не номер робота. На этом уже спотыкались на ветке QR — 16 записей с
+        # номерами роботов.
+        self.assertEqual(session.answer_kind(), v.KIND_STATION)
 
-    def test_charging_branch_cannot_be_continued(self):
-        """Из закрытой ветки нельзя ни выбрать вариант, ни ввести текст."""
+    def test_charging_asks_the_robot_second(self):
+        """Второй вопрос — робот, стоявший на станции (требование владельца)."""
         session = self.walk()
+        session.submit_text("137")
 
-        with self.assertRaises(EngineError):
-            session.select("cs_k50h")
+        self.assertEqual(session.current_id, "ask_charging_robot")
+        # Вид номера **меняется** на «робот»: подсказка и проверка формата
+        # должны быть для робота, иначе оператор введёт станцию второй раз.
+        self.assertEqual(session.answer_kind(), v.KIND_ROBOT)
 
-        with self.assertRaises(EngineError):
-            session.submit_text("137")
+    def test_charging_reaches_problem_and_cause(self):
+        """После двух номеров спрашивается проблема, затем причина, затем итог."""
+        session = self.walk()
+        session.submit_text("137")
+        session.submit_text("3780")
+
+        self.assertEqual(session.current_id, "charging_problem")
+
+        session.select("connects_not_charging")
+        self.assertEqual(session.current_id, "ask_cause_charging")
+
+        session.select("mechanical_wear")
+        self.assertEqual(session.current_id, "summary")
+
+    def test_charging_robot_key_matches_what_the_writer_reads(self):
+        """🔴 Узел пишет робота в тот ключ, который читает отчёт.
+
+        Это и был дефект: узел писал в `charging_robot`, а `build_rows` берёт
+        `answers["error_robot"]`. Номер робота терялся, и в колонке
+        `robot_number` оказывался номер **станции**.
+        """
+        node = DEFAULT_TREE.node("ask_charging_robot")
+
+        self.assertIsNotNone(node, "узел номера робота исчез")
+        self.assertEqual(node.key, "error_robot")
+        # И ключ обязан быть среди «номерных»: иначе текст на этом шаге не
+        # проверится по формату и не подскажется пример.
+        from equipment_intake.engine import NUMBER_KEYS
+
+        self.assertIn(node.key, NUMBER_KEYS)
+
+    def test_charging_robot_is_not_filed_as_the_station(self):
+        """Станция и робот не подменяют друг друга в записи."""
+        rows = self.rows_for(
+            {
+                "object": "Charging station",
+                "device_number": "137",
+                "error_robot": "3780",
+                "description": "does not charge",
+            }
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["device_number"], "137")
+        self.assertEqual(rows[0]["robot_number"], 3780)
 
     def test_station_kind_is_still_known_to_the_code(self):
-        """Вид `station` не потерян: карта веток и проверка формата на месте.
-
-        Это то, что вернётся вместе с веткой. Проверяем напрямую, потому что
-        через дерево до номера станции теперь не дойти.
-        """
+        """Вид `station` не потерян: карта веток и проверка формата на месте."""
         from equipment_intake.tree_config import number_kind_for
 
-        # Вид задаёт **ветка**, а не конкретная подмарка станции: в карте стоит
-        # `charger`, и он же перекрывает `cs_k50h`/`cs_a42t_c2` ниже по пути.
+        # Вид задаёт **ветка**: в карте стоит `charger`.
         step = mock.Mock(option_id="charger")
 
         self.assertEqual(number_kind_for([step], None), v.KIND_STATION)
@@ -1149,6 +1217,146 @@ class ReviewMarkingChecks(unittest.TestCase):
         self.assertEqual(session.current_id, "robot_type")
         self.assertFalse(session.is_completed)
         intake_flow.reset_state()
+
+
+class DeviceBranchesAreBuildable(unittest.TestCase):
+    """🔴 **Ветки станций и зарядок — рабочие и наполняемые** (14.10.2026).
+
+    **Что было.** Обе ветки были **тупиками**: вариант корня вёл на узел типа
+    `UNAVAILABLE` («not available yet»). У такого узла нет кнопок, текст не
+    принимается, и — главное — **`add_option` для него отказывает**, а сменить
+    тип узла редактор не умеет. То есть просьбу владельца «подготовь, чтобы можно
+    было добавлять и расширять» нельзя было выполнить правкой данных: требовалась
+    починка структуры.
+
+    **Что сторожится здесь.** Три свойства, без которых ветка снова станет
+    бесполезной:
+
+    1. **достижимость** — от корня до итога, чтобы оператор мог записать отчёт;
+    2. **наполняемость** — кнопку можно добавить в каждый узел ветки;
+    3. **привязка заготовки** — причина принимает `template_id`, иначе отчёт
+       получит пустые тип ошибки и «что сделано».
+    """
+
+    def setUp(self):
+        """Изоляция от загрязнения `sys.modules` чужими тестами."""
+        restore_real_send_to_database()
+
+    def test_no_device_branch_is_a_dead_end(self):
+        """Ни одна ветка не упирается в «недоступно», и узлов-тупиков нет вовсе.
+
+        Проверяются **обе** стороны: у самого дерева не осталось узлов типа
+        `UNAVAILABLE` (мёртвые тупики валидатор запрещает), и от корня обе ветки
+        доходят до финала.
+        """
+        from equipment_intake.types import NodeType
+
+        leftovers = [
+            node_id
+            for node_id, node in DEFAULT_TREE.nodes.items()
+            if node.type == NodeType.UNAVAILABLE
+        ]
+
+        self.assertEqual(
+            leftovers, [], "в дереве остались узлы «ветка закрыта»"
+        )
+
+        for option in ("workstation", "charger"):
+            with self.subTest(option=option):
+                session = Session(tree=DEFAULT_TREE)
+                session.select(option)
+
+                # Дальше идём до конца: номер → (номер робота) → проблема →
+                # причина → итог. Если ветка оборвётся, `select` бросит.
+                session.submit_text("C2-H146" if option == "workstation" else "137")
+
+                if option == "charger":
+                    session.submit_text("3780")
+
+                self.assertTrue(session.current_node().options, "нет списка проблем")
+                session.select(session.current_node().options[0].id)
+
+                self.assertTrue(
+                    session.current_node().options, "нет списка причин"
+                )
+                session.select(session.current_node().options[0].id)
+
+                self.assertEqual(
+                    session.current_id,
+                    "summary",
+                    "ветка не доходит до итога — отчёт записать нечем",
+                )
+
+    def test_every_device_node_accepts_a_new_button(self):
+        """🔴 В каждый узел ветки можно **добавить кнопку**.
+
+        Это и есть «подготовить, чтобы можно было расширять». Проверяется через
+        `add_option` на заглушке: у узла типа `UNAVAILABLE` вызов возвращал
+        `None`, и добавить было нечего.
+        """
+        from equipment_intake import storage
+        # Помощник лежит в соседнем тест-файле; путь `tests/` уже в `sys.path`
+        # (см. начало файла), поэтому импорт плоский.
+        from test_intake_editor_storage import FakeDB, _install, _uninstall
+
+        db = FakeDB()
+        db.rows["telegram_intake_nodes"] = list(storage.load_node_rows() or [])
+        db.rows["telegram_intake_options"] = list(storage._read_options() or [])
+        _install(db)
+
+        try:
+            for node_id in (
+                "charging_problem",
+                "ask_cause_charging",
+                "workstation_problem",
+                "ask_cause_workstation",
+            ):
+                with self.subTest(node=node_id):
+                    created = storage.add_option(
+                        node_id, "Test button", next_node="summary", created_by="test"
+                    )
+
+                    self.assertIsNotNone(
+                        created,
+                        f"в узел {node_id} нельзя добавить кнопку",
+                    )
+        finally:
+            _uninstall()
+
+    def test_cause_of_a_device_accepts_a_template(self):
+        """Причина станции принимает заготовку — иначе отчёт будет пустым.
+
+        Связь нужна именно на **причине**: она определяет тип ошибки, «что
+        сделано» и время решения. Если бы узел причин не принимал связь, ветка
+        писала бы записи без этих полей.
+        """
+        from equipment_intake import storage
+        # Помощник лежит в соседнем тест-файле; путь `tests/` уже в `sys.path`
+        # (см. начало файла), поэтому импорт плоский.
+        from test_intake_editor_storage import FakeDB, _install, _uninstall
+
+        db = FakeDB()
+        db.rows["telegram_intake_nodes"] = list(storage.load_node_rows() or [])
+        db.rows["telegram_intake_options"] = list(storage._read_options() or [])
+        db.rows[storage.TEMPLATES_TABLE] = [
+            {"id": 200, "employee_title": "Charger test"}
+        ]
+        _install(db)
+
+        try:
+            # «Power or cable fault» — своя причина зарядки: у неё есть id, и
+            # связь ставится по паре (узел, вариант).
+            linked = storage.link_option_to_template(
+                "ask_cause_charging", "power_fault", 200, updated_by="test"
+            )
+
+            self.assertTrue(linked, "причина зарядки не принимает заготовку")
+
+            links = storage.option_template_links()
+
+            self.assertEqual(links.get("ask_cause_charging::power_fault"), 200)
+        finally:
+            _uninstall()
 
 
 if __name__ == "__main__":
