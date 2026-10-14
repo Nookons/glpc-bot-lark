@@ -396,6 +396,98 @@ def downtime_intervals(warehouse: str = None):
     return intervals
 
 
+def still_offline(warehouse: str = None):
+    """
+    Роботы, которые **прямо сейчас** в офлайне, с началом простоя.
+
+    🔴 **Почему отдельной функцией, а не внутри `downtime_intervals`.**
+    `downtime_intervals` возвращает только **закрытые** пары Offline→Online:
+    интервал без закрытия не становится записью списка, потому что у него нет
+    длительности. Менять её формат значило бы сломать три вызывающих места
+    (`analytics.py` — два, `shift_report.py` — один), которым длительность
+    нужна именно посчитанной.
+
+    Поэтому незакрытые читаются **своей** функцией. Это не дублирование: запрос
+    тот же, смысл другой — «стоит сейчас» против «стоял тогда».
+
+    **Зачем это в отчёте.** Аудит 14.10.2026: в офлайне висели **7 роботов**,
+    самый старый — **с 18.04.2026 (179 суток)**, ещё три — с 07–09.10. Сменный
+    рапорт об этом молчал полностью, а `MTTR` в тех же сменах печатал «no robot
+    came back online». Читатель видел «всё спокойно», хотя часть парка стоит
+    неделями.
+
+    `None` — сбой чтения; пустой список — «все на линии».
+    """
+    params = {
+        "select": "created_at,robot_number,new_status,type_problem",
+        "order": "created_at.asc",
+        "limit": str(HISTORY_SCAN_LIMIT),
+    }
+
+    if warehouse:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get(HISTORY_TABLE, params=params)
+
+    if rows is None:
+        logger.error("Не удалось прочитать журнал смен статуса для списка офлайна")
+        return None
+
+    opened = {}
+    now = _now()
+
+    for row in rows:
+        number = row.get("robot_number")
+        moment = parse_iso(row.get("created_at"))
+
+        if number is None or moment is None:
+            continue
+
+        status = row.get("new_status")
+
+        if status == robot_status.OFFLINE:
+            opened[number] = (moment, row.get("type_problem"))
+        elif status == robot_status.ONLINE:
+            # Вернулся на линию — интервал закрыт, «стоит сейчас» не он.
+            opened.pop(number, None)
+
+    still = [
+        {
+            "robot": number,
+            "start": started,
+            "hours": max((now - started).total_seconds() / 3600, 0.0),
+            "type_problem": problem,
+        }
+        for number, (started, problem) in opened.items()
+    ]
+    still.sort(key=lambda item: -item["hours"])
+
+    return still
+
+
+def _still_offline_line(warehouse: str = None) -> str:
+    """
+    Строка «🔌 Still offline: N · oldest #X (Nd)» для отчёта.
+
+    Пустая строка, когда все на линии или чтение не удалось: молчание здесь
+    лучше выдуманного нуля.
+    """
+    robots = still_offline(warehouse)
+
+    if not robots:
+        return ""
+
+    oldest = robots[0]
+    days = int(oldest["hours"] // 24)
+
+    age = f"{days}d" if days else f"{int(oldest['hours'])}h"
+
+    return (
+        f"🔌 Still offline: {len(robots)} · "
+        f"oldest #{oldest['robot']} ({age})"
+    )
+
+
 def downtime_metrics(shift_date: str, shift_name: str, warehouse: str = None) -> dict:
     """
     Простой роботов за смену: MTTR и самый долгий простой.
@@ -607,6 +699,8 @@ def build_shift_summary(
         f"({_pretty_date(previous['date']) if previous['date'] else 'n/a'} "
         f"{previous['shift'] or ''}) {format_delta(metrics['delta'])}",
         *([downtime_line(metrics)] if downtime_line(metrics) else []),
+        # Незакрытые простои: их не показывал ни один отчёт (см. `still_offline`).
+        *([_still_offline_line(metrics.get("warehouse"))] if _still_offline_line(metrics.get("warehouse")) else []),
         # Новые строки — только когда есть что сказать.
         *([_unassigned_line(metrics)] if _unassigned_line(metrics) else []),
         *([_zone_line(metrics)] if _zone_line(metrics) else []),
@@ -694,6 +788,20 @@ def build_shift_card(
         card["elements"].append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": repair_line},
+        })
+
+    # 🔴 **Роботы, которые стоят ПРЯМО СЕЙЧАС.**
+    #
+    # Аудит 14.10.2026: в офлайне 7 роботов, самый старый — с 18.04.2026
+    # (**179 суток**). Ни сменный отчёт, ни карточка об этом не сообщали: в тех
+    # же сменах MTTR печатал «no robot came back online», и читатель видел
+    # «всё спокойно», хотя часть парка стоит неделями.
+    still_line = _still_offline_line(metrics.get("warehouse"))
+
+    if still_line:
+        card["elements"].append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": still_line},
         })
 
     card["elements"].append({"tag": "hr"})

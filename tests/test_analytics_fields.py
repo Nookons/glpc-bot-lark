@@ -260,3 +260,67 @@ class ShiftReportChecks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StillOfflineChecks(unittest.TestCase):
+    """
+    🔴 **Отчёт обязан сказать, сколько роботов стоит ПРЯМО СЕЙЧАС.**
+
+    Аудит 14.10.2026: в офлайне было **7 роботов**, самый старый — с 18.04.2026
+    (**179 суток**), ещё три — с 07–09.10. Сменный рапорт об этом молчал
+    полностью, а MTTR в тех же сменах печатал «no robot came back online»:
+    читатель видел «всё спокойно», хотя часть парка стоит неделями.
+
+    Проверяется смысл: незакрытый интервал обязан попасть в отчёт, а закрытый —
+    нет (иначе список врал бы «стоит» про робота, который уже на линии).
+    """
+
+    def _offline(self, rows):
+        with mock.patch.object(shift_report, "rest_get", return_value=rows):
+            return shift_report.still_offline("GLP-C")
+
+    def test_open_interval_is_reported(self):
+        """Робот ушёл в офлайн и не вернулся — он «стоит сейчас»."""
+        robots = self._offline([
+            {"robot_number": "3742", "new_status": "离线 | Offline",
+             "created_at": "2026-10-07T10:00:00+00:00", "type_problem": "Abnormal walking"},
+        ])
+
+        self.assertEqual(len(robots), 1)
+        self.assertEqual(robots[0]["robot"], "3742")
+        self.assertGreater(robots[0]["hours"], 24 * 6)
+
+    def test_closed_interval_is_not_reported(self):
+        """Робот вернулся на линию — в списке «стоит сейчас» его быть не должно."""
+        robots = self._offline([
+            {"robot_number": "3422", "new_status": "离线 | Offline",
+             "created_at": "2026-10-08T08:00:00+00:00", "type_problem": None},
+            {"robot_number": "3422", "new_status": "在线 | Online",
+             "created_at": "2026-10-08T16:25:00+00:00", "type_problem": None},
+        ])
+
+        self.assertEqual(robots, [])
+
+    def test_oldest_is_first(self):
+        """Самый долгий простой — первым: это то, что надо чинить."""
+        # Статусы — **точные строки из справочника** (`robot_status`), а не
+        # сокращения: проверка идёт сравнением с константой, и «Offline» её не
+        # прошло бы (на этом мой первый вариант теста и упал).
+        import robot_status
+
+        robots = self._offline([
+            {"robot_number": "1", "new_status": robot_status.OFFLINE,
+             "created_at": "2026-10-13T10:00:00+00:00", "type_problem": None},
+            {"robot_number": "2", "new_status": robot_status.OFFLINE,
+             "created_at": "2026-04-18T10:00:00+00:00", "type_problem": None},
+        ])
+
+        self.assertEqual([item["robot"] for item in robots], ["2", "1"])
+
+    def test_read_failure_is_not_a_zero(self):
+        """Сбой чтения — `None`, а не пустой список.
+
+        Различие важное: пустой список печатает «все на линии», а сбой обязан
+        молчать, иначе отчёт соврёт о спокойствии.
+        """
+        self.assertIsNone(self._offline(None))
