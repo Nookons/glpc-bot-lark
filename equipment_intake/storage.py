@@ -121,6 +121,24 @@ _v2_state: Optional[bool] = None
 #: означает ничего про колонки другой.
 _node_state: Optional[bool] = None
 _node_checked_at: float = 0.0
+
+#: 🔴 **Короткий кэш строк узлов — чтобы не читать таблицу десятки раз за одну
+#: сборку дерева.**
+#:
+#: Замер 14.10.2026: `apply_overlay()` делал **12 запросов** к
+#: `telegram_intake_nodes` — по одному на каждый узел, потому что `_web_node`
+#: зовётся из `_known_node_ids` и из `effective_options` для каждого узла. В
+#: сумме это **6.5 секунды**, а `/intake/tree` в проде отвечал **12.7 с** при
+#: таймауте API в 10 с: карта дерева не открывалась вовсе — «Intake bot is
+#: unreachable» на живом боте.
+#:
+#: **Почему короткий TTL, а не кэш навсегда.** Правка узла из веба должна быть
+#: видна сразу: после сохранения карта перечитывает дерево, и устаревший кэш
+#: показал бы прежнее состояние. Полторы секунды покрывают одну сборку дерева
+#: (все 12 обращений идут подряд) и не переживают следующую правку.
+_NODE_ROWS_TTL_SECONDS = 1.5
+_node_rows_cache: Optional[List[dict]] = None
+_node_rows_cached_at: float = 0.0
 _v2_checked_at: float = 0.0
 
 #: Есть ли колонка связи `template_id` (миграция `0109`). **Отдельная память**:
@@ -160,6 +178,23 @@ def _node_table_known_missing() -> bool:
         _node_state is False
         and time.time() - _node_checked_at < _V2_TTL_SECONDS
     )
+
+
+def reset_node_rows_cache() -> None:
+    """Забыть прочитанные строки узлов.
+
+    🔴 **Вызывается при КАЖДОЙ записи узла.** Кэш нужен только чтобы одна
+    сборка дерева не читала таблицу двенадцать раз (см.
+    `_NODE_ROWS_TTL_SECONDS`), но правка из веба обязана быть видна **сразу**:
+    без сброса после сохранения карта показала бы прежнее состояние, и человек
+    решил бы, что правка не применилась.
+
+    TTL остаётся вторым рубежом — на случай записи мимо этих путей.
+    """
+    global _node_rows_cache, _node_rows_cached_at
+
+    _node_rows_cache = None
+    _node_rows_cached_at = 0.0
 
 
 def _remember_node_table(present: bool) -> None:
@@ -323,6 +358,16 @@ def load_node_rows() -> Optional[List[dict]]:
     if _node_table_known_missing():
         return []
 
+    global _node_rows_cache, _node_rows_cached_at
+
+    now = time.time()
+
+    if (
+        _node_rows_cache is not None
+        and now - _node_rows_cached_at < _NODE_ROWS_TTL_SECONDS
+    ):
+        return _node_rows_cache
+
     from sendToDataBase import rest_get
 
     # Сначала — набор с координатами холста (`0114`). Он может не приехать:
@@ -361,11 +406,17 @@ def load_node_rows() -> Optional[List[dict]]:
         #
         # Две разные таблицы не могут делить один признак.
         _remember_node_table(False)
+        _node_rows_cache = []
+        _node_rows_cached_at = time.time()
         return []
 
     _remember_node_table(True)
 
-    return [row for row in rows if isinstance(row, dict)]
+    parsed = [row for row in rows if isinstance(row, dict)]
+    _node_rows_cache = parsed
+    _node_rows_cached_at = time.time()
+
+    return parsed
 
 
 def overlay_supported() -> bool:
@@ -414,6 +465,8 @@ def reset_capability_cache() -> None:
     # её недоступной, оставил бы `False` для всех следующих.
     _node_state = None
     _node_checked_at = 0.0
+    _node_rows_cache = None
+    _node_rows_cached_at = 0.0
     reset_links_cache()
     # Координаты холста — своя миграция, поэтому и память своя: без сброса
     # тест, проверивший работу до `0114`, оставил бы `False` для всех следующих.
@@ -2218,6 +2271,9 @@ def update_node(
 
     saved = rest_upsert(NODE_TABLE, row, on_conflict="node_id") is not None
 
+    # Запись сделана — прочитанное раньше устарело.
+    reset_node_rows_cache()
+
     if saved:
         logger.info("intake storage: узел %s обновлён (hidden=%s)", node_id, row["hidden"])
 
@@ -2349,6 +2405,9 @@ def update_node_position(
     from sendToDataBase import rest_upsert
 
     saved = rest_upsert(NODE_TABLE, row, on_conflict="node_id") is not None
+
+    # Запись сделана — прочитанное раньше устарело.
+    reset_node_rows_cache()
 
     if saved:
         logger.info(
@@ -2621,7 +2680,12 @@ def add_node(
 
     from sendToDataBase import rest_upsert
 
-    if rest_upsert(NODE_TABLE, row, on_conflict="node_id") is None:
+    saved = rest_upsert(NODE_TABLE, row, on_conflict="node_id")
+
+    # Запись сделана — прочитанное раньше устарело.
+    reset_node_rows_cache()
+
+    if saved is None:
         return None
 
     if after_node_id and after_option_id:
@@ -2743,6 +2807,7 @@ def delete_node(
             )
 
         removed = rest_delete(NODE_TABLE, params={"node_id": f"eq.{node_id}"})
+        reset_node_rows_cache()
 
         if removed:
             logger.info("intake storage: узел %s удалён (создан из веба)", node_id)

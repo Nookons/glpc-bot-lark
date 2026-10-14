@@ -139,6 +139,14 @@ def _install(db: FakeDB) -> None:
     sys.modules["sendToDataBase"] = module
     # storage проверяет готовность базы чтением колонки is_builtin
     storage.reset_capability_cache()
+    # 🔴 **Кэш прочитанных строк узлов сбрасывается вместе с остальными.**
+    #
+    # Он живёт 1.5 секунды, чтобы одна сборка дерева не читала таблицу
+    # двенадцать раз (замер 14.10.2026: 12 запросов, 6.5 с, из-за чего
+    # `/intake/tree` в проде отвечал 12.7 с при таймауте API в 10 с). В тестах
+    # между прогонами проходит меньше этого времени, поэтому без сброса
+    # заглушка возвращал�� бы данные **прошлого** теста.
+    storage.reset_node_rows_cache()
     storage._v2_state = True
     storage._v2_checked_at = float("inf")
     # Колонка связи `0109` в тестовой базе **есть**: без неё `link_option_to_template`
@@ -1261,6 +1269,119 @@ class NewModuleGetsItsOwnErrorAndCauseNodes(EditorStorageTestCase):
         self.assertNotEqual(
             node_id, "robot_errors_tray",
             "второй узел ошибок для того же модуля",
+        )
+
+
+class NodeRowsAreCachedButNeverStale(EditorStorageTestCase):
+    """
+    🔴 **Строки узлов читаются один раз на сборку дерева — и не устаревают.**
+
+    Дефект, найденный замером 14.10.2026. `apply_overlay()` делал **12 запросов**
+    к `telegram_intake_nodes` — по одному на каждый узел: `_web_node` зовётся из
+    `_known_node_ids` и из `effective_options`. В сумме это **6.5 секунды**, а
+    `/intake/tree` в проде отвечал **12.7 с** при таймауте API в 10 с — карта
+    дерева не открывалась вовсе, с текстом «Intake bot is unreachable» на живом
+    боте.
+
+    Лечится коротким кэшем, но у него есть **вторая сторона**: правка из веба
+    обязана быть видна сразу. Поэтому кэш сбрасывается при **каждой** записи
+    узла, а TTL (1.5 с) остаётся лишь вторым рубежом. Оба свойства проверяются
+    здесь: без первого карта снова станет медленной, без второго — покажет
+    прежнее состояние после сохранения.
+    """
+
+    def _count_reads(self) -> dict:
+        """Ставит счётчик поверх рабочей заглушки этого класса.
+
+        Обёртка, а не своя заглушка: своя вернула бы пустой список, и тест
+        проверял бы не кэш, а отсутствие данных. Здесь `_install` уже подменил
+        `sendToDataBase`, и мы считаем **реальные** обращения к таблице узлов.
+        """
+        import sendToDataBase as db
+
+        counter = {"nodes": 0}
+        real_get = db.rest_get
+
+        def counting_get(table, params=None, optional=False):
+            if table == storage.NODE_TABLE:
+                counter["nodes"] += 1
+            return real_get(table, params, optional)
+
+        db.rest_get = counting_get
+        self.addCleanup(lambda: setattr(db, "rest_get", real_get))
+
+        return counter
+
+    def test_repeated_reads_do_not_hit_the_table(self):
+        """Повторные чтения не добавляют запросов — иначе смысл кэша теряется."""
+        counter = self._count_reads()
+
+        storage.reset_node_rows_cache()
+        storage.load_node_rows()
+        first = counter["nodes"]
+
+        for _ in range(5):
+            storage.load_node_rows()
+
+        self.assertEqual(
+            counter["nodes"],
+            first,
+            "повторное чтение снова спросило таблицу — кэш не работает",
+        )
+        self.assertGreater(first, 0, "холодное чтение о��язано спросить таблицу")
+
+    def test_writing_a_node_makes_the_next_read_fresh(self):
+        """
+        🔴 **Запись узла сбрасывает кэш — правка видна сразу.**
+
+        Без сброса карта после сохранения показала бы прежнее состояние, и
+        человек решил бы, что правка не применилась: это ровно тот класс
+        дефекта, который уже ловили на «ветка не в работе».
+        """
+        counter = self._count_reads()
+
+        # Прогреваем кэш.
+        storage.reset_node_rows_cache()
+        storage.load_node_rows()
+        before = counter["nodes"]
+
+        node_id = storage.add_node(
+            title="Camera: what is wrong?",
+            node_type="choice",
+            after_node_id="root",
+            after_option_id="robot",
+            created_by="test",
+        )
+        self.assertIsNotNone(node_id, "узел не создался")
+        self.addCleanup(storage.delete_node, node_id, updated_by="cleanup")
+
+        # Следующее чтение обязано увидеть новый узел, а не закэшированный ответ.
+        rows = storage.load_node_rows() or []
+        ids = {str(row.get("node_id")) for row in rows}
+
+        self.assertIn(node_id, ids, "новый узел не виден сразу после создания")
+        self.assertGreater(
+            counter["nodes"],
+            before,
+            "после записи чтение не спросило таблицу — кэш не сброшен",
+        )
+
+    def test_position_write_also_refreshes(self):
+        """Правка позиции — тоже запись: кэш сбрасывается и после неё."""
+        counter = self._count_reads()
+
+        storage.reset_node_rows_cache()
+        storage.load_node_rows()
+        before = counter["nodes"]
+
+        self.assertTrue(
+            storage.update_node_position("root", 111.5, 222.5, updated_by="test"),
+            "позиция не записалась",
+        )
+        storage.load_node_rows()
+
+        self.assertGreater(
+            counter["nodes"], before, "кэш не сброшен после записи позиции"
         )
 
 
