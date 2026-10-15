@@ -743,9 +743,43 @@ def shift_report_data(
         if zone:
             by_zone[zone] = by_zone.get(zone, 0) + 1
 
+    # 🔴 **«Обслуживание» считается по НЕЗАКРЫТЫМ ошибкам, а не по числу записей.**
+    #
+    # Дефект найден аудитом 14.10.2026. Раньше брались все записи робота за смену,
+    # но большинство из них **уже решено**: проверено на смене 14.10 ночь —
+    # у робота #3808 было 16 записей, из них **14 (87 %)** закрыты за ≤5 минут.
+    # Такой робот не «требует обслуживания» — он работает, а ошибки у него мелкие.
+    #
+    # **Что было не так с последствиями.** Порог срабатывал почти на каждой смене,
+    # из-за него карточка **всегда была красной** (проверено 4 смены подряд: все
+    # `red`), и сигнал «нужен ремонт» перестал что-либо значить.
+    #
+    # **Новое правило:** в обслуживание попадает робот, у которого есть ошибка
+    # **без времени решения** (`solving_time` пуст или ноль) — то есть работа ещё
+    # не закрыта. Это и есть «требует внимания», а не «часто пишут».
+    #
+    # Порог остался: одна незакрытая ошибка — ещё не повод для ремонта, а
+    # `maintenance_threshold` (по умолчанию 3) означает «три и больше незакрытых».
+    unresolved_by_robot: dict = {}
+
+    for exc in rows or []:
+        robot = exc.get("error_robot")
+
+        if robot in (None, "", "None"):
+            continue
+
+        solving = exc.get("solving_time")
+        closed = isinstance(solving, (int, float)) and solving > 0
+
+        if closed:
+            continue
+
+        key = str(robot)
+        unresolved_by_robot[key] = unresolved_by_robot.get(key, 0) + 1
+
     maintenance = [
         (robot, count)
-        for robot, count in by_robot.items()
+        for robot, count in unresolved_by_robot.items()
         if count >= maintenance_threshold
     ]
     maintenance.sort(key=lambda item: (-item[1], _robot_sort_key(item[0])))
@@ -761,6 +795,8 @@ def shift_report_data(
         "no_recovery": no_recovery,
         "no_solving_time": no_solving_time,
         "zones": by_zone,
+        # Незакрытые ошибки по роботам — из них собирается «обслуживание».
+        "unresolved": unresolved_by_robot,
         "maintenance": maintenance,
     }
 

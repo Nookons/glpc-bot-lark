@@ -418,48 +418,80 @@ def still_offline(warehouse: str = None):
 
     `None` — сбой чтения; пустой список — «все на линии».
     """
+    # 🔴 **Источник — живая таблица `equipment`, а НЕ журнал переходов.**
+    #
+    # Дефект найден при сверке 15.10.2026: журнал `change_status_robots` и живая
+    # таблица давали **разные наборы роботов, без единого общего**:
+    #
+    # | Источник | Роботы в офлайне |
+    # |---|---|
+    # | журнал (последняя запись 09.10) | 115, 3742, 3694, 3587, 3773, 3628 |
+    # | `equipment` (живой статус) | **2627, 5138, 7449, 3511** |
+    #
+    # Разгадка — в привязке к складу: `#115` журнал показывал как GLP-C, а на
+    # самом деле он **SMALL-P3** (`warehouse='SMALL-P3'`, зона `D`). То есть
+    # журнал не только устарел, но и **путал склады**: он писался, когда склад
+    # ещё не проставлялся.
+    #
+    # **Почему живая таблица верна.** Её наполняет приложение склада и синк с
+    # ESS (`ess_synced_at`), статус там **канонический** (`online`/`offline`),
+    # а `status_raw` хранит исходную строку. Проверено: те же 4 робота, что и в
+    # `robots_maintenance_list`, — независимое подтверждение.
+    #
+    # **Время простоя — по `updated_at`.** Момента перехода в этом источнике нет
+    # (он не журнал), поэтому возраст считается от последнего изменения строки.
+    # Это **оценка снизу**: статус обновлялся не позже, чем робот встал, значит
+    # «стоит не меньше N дней». В строке отчёта так и написано — «oldest», без
+    # утверждения точной даты.
+    key = _warehouse_key(warehouse) if warehouse else None
     params = {
-        "select": "created_at,robot_number,new_status,type_problem",
-        "order": "created_at.asc",
-        "limit": str(HISTORY_SCAN_LIMIT),
+        "select": "equipment_code,status,status_raw,problem_note,updated_at,warehouse",
+        "category": "eq.robot",
+        "status": "eq.offline",
+        "limit": "500",
     }
 
-    if warehouse:
-        params["warehouse"] = f"eq.{warehouse}"
+    title = None
 
-    rows = rest_get(HISTORY_TABLE, params=params)
+    if warehouse:
+        # `equipment.warehouse` хранит **название** склада, а не id: сравнение с
+        # числом вернуло бы пусто и «все на линии» — ложное спокойствие.
+        title = str(warehouse).strip()
+        params["warehouse"] = f"eq.{title}"
+
+    rows = rest_get("equipment", params=params)
 
     if rows is None:
-        logger.error("Не удалось прочитать журнал смен статуса для списка офлайна")
+        logger.error("Не удалось прочитать офлайн-роботов из equipment")
         return None
 
-    opened = {}
     now = _now()
+    still = []
 
     for row in rows:
-        number = row.get("robot_number")
-        moment = parse_iso(row.get("created_at"))
+        number = row.get("equipment_code")
+        moment = parse_iso(row.get("updated_at"))
 
-        if number is None or moment is None:
+        if number in (None, ""):
             continue
 
-        status = row.get("new_status")
+        problem = str(row.get("problem_note") or "").strip() or str(
+            row.get("status_raw") or ""
+        ).strip()
 
-        if status == robot_status.OFFLINE:
-            opened[number] = (moment, row.get("type_problem"))
-        elif status == robot_status.ONLINE:
-            # Вернулся на линию — интервал закрыт, «стоит сейчас» не он.
-            opened.pop(number, None)
+        hours = (
+            max((now - moment).total_seconds() / 3600, 0.0) if moment else 0.0
+        )
 
-    still = [
-        {
-            "robot": number,
-            "start": started,
-            "hours": max((now - started).total_seconds() / 3600, 0.0),
-            "type_problem": problem,
-        }
-        for number, (started, problem) in opened.items()
-    ]
+        still.append(
+            {
+                "robot": number,
+                "start": moment,
+                "hours": hours,
+                "type_problem": problem,
+            }
+        )
+
     still.sort(key=lambda item: -item["hours"])
 
     return still
@@ -549,6 +581,38 @@ def downtime_metrics(shift_date: str, shift_name: str, warehouse: str = None) ->
     }
 
 
+def _journal_last_entry() -> str:
+    """
+    Дата последней записи в журнале смен статуса — `ДД.ММ.ГГГГ` или пустая строка.
+
+    🔴 **Зачем это в отчёте.** Строка про MTTR должна называть **причину**, по
+    которой цифры нет. Без даты читатель не может отличить «журнал сломан» от
+    «смена была спокойной», а это разные вещи и лечатся по-разному.
+
+    `None`/`""` при сбое чтения — тогда отчёт скажет просто «журнал пуст», не
+    выдумывая дату.
+    """
+    rows = rest_get(
+        HISTORY_TABLE,
+        params={"select": "created_at", "order": "created_at.desc", "limit": "1"},
+    )
+
+    if not rows:
+        return ""
+
+    moment = parse_iso(rows[0].get("created_at"))
+
+    return _pretty_date_from(moment) if moment else ""
+
+
+def _pretty_date_from(moment) -> str:
+    """`ДД.ММ.ГГГГ` из даты — тем же видом, что и в заголовке отчёта."""
+    try:
+        return moment.astimezone(WARSAW_TZ).strftime("%d.%m.%Y")
+    except Exception:
+        return ""
+
+
 def downtime_line(metrics: dict) -> str:
     """Строка простоя для отчёта (или None, если данных нет)."""
     downtime = (metrics or {}).get("downtime") or {}
@@ -563,7 +627,32 @@ def downtime_line(metrics: dict) -> str:
                 "(started earlier)"
             )
 
-        return "🛠 MTTR: no robot came back online this shift"
+        # 🔴 **«Никто не вернулся» заменено на честную причину.**
+        #
+        # Аудит 15.10.2026: строка «MTTR: no robot came back online this shift»
+        # **вводила в заблуждение**. Она читается как «роботы не ломались», а на
+        # самом деле означает «измерить нечем»: журнал смен статуса
+        # (`change_status_robots`) не наполняется — последняя запись 09.10.2026.
+        #
+        # Проверено, что другого **измеренного** источника нет:
+        #
+        # * `equipment` хранит только текущий статус и время его изменения —
+        #   момента перехода в офлайн там нет, поэтому начало ремонта неизвестно;
+        # * `exceptions.end_time` — это `start_time + справочное время заготовки`
+        #   (сходится в 99.99 % строк), то есть **оценка**, а не факт.
+        #
+        # Поэтому вместо ложного спокойствия печатается факт с датой последней
+        # записи и подсказка, чем это лечится (команды `/offline` и `/online`
+        # работают и пишут в журнал — ими просто не пользуются).
+        since = _journal_last_entry()
+
+        if since:
+            return (
+                f"🛠 Repair time not measurable: the status journal has no "
+                f"entries since {since} (use /offline and /online)"
+            )
+
+        return "🛠 Repair time not measurable: the status journal is empty"
 
     line = (
         f"🛠 MTTR {format_duration(downtime['mttr_seconds'] // 60)} "
@@ -627,14 +716,47 @@ def shift_metrics(shift_date: str, shift_name: str, warehouse: str = None) -> di
 
 
 def report_color(metrics: dict) -> str:
-    """Цвет заголовка карточки: зелёный / оранжевый / красный."""
-    if metrics["total"] == 0:
+    """
+    Цвет заголовка карточки: зелёный / оранжевый / красный.
+
+    🔴 **Почему переписано.** Дефект найден аудитом 14.10.2026: карточка была
+    **всегда красной** — проверено 4 смены подряд, все `red`. Причины было две:
+
+    1. `maintenance` (порог «3+ записей на робота») срабатывал почти всегда —
+       на смене 14.10 ночь это **15 роботов**, у которых 87 % ошибок решались за
+       минуты. Теперь порог считает **незакрытые** ошибки (см. `shift_report_data`),
+       и «обслуживание» означает именно «нужен ремонт»;
+    2. порог `REPORT_WARN_TOTAL` был равен **5** — при 100–200 ошибках за смену
+       он не различал ничего: всё, что выше пяти, одинаково «оранжевое».
+
+    **Новая шкала — по доле незакрытых, а не по числу записей.** Смена с 200
+    мелкими ошибками, закрытыми за минуты, — это нормальная работа, а смена с 20
+    ошибками, из которых 15 висят, — тревога. Абсолютное число об этом не
+    говорит: оно зависит от размера парка и загрузки склада.
+
+    | Цвет | Когда |
+    |---|---|
+    | 🔴 red | есть робот с незакрытыми ошибками (порог обслуживания) |
+    | 🟠 orange | незакрыто больше четверти смены либо ≥ `REPORT_WARN_TOTAL` |
+    | 🟢 green | остал��ное |
+
+    Порог `REPORT_WARN_TOTAL` остался и теперь работает как «абсолютный пол»:
+    маленькая смена с несколькими незакрытыми тоже заслуживает внимания.
+    """
+    total = metrics.get("total") or 0
+
+    if total == 0:
         return "green"
 
-    if metrics["maintenance"]:
+    # Есть робот, у которого копится незакрытое, — это уже ремонт, а не шум.
+    if metrics.get("maintenance"):
         return "red"
 
-    if metrics["total"] >= REPORT_WARN_TOTAL:
+    # Доля незакрытых: сколько записей без «что сделано».
+    no_recovery = metrics.get("no_recovery") or 0
+    share = no_recovery / total if total else 0.0
+
+    if no_recovery >= REPORT_WARN_TOTAL or share >= 0.25:
         return "orange"
 
     return "green"
@@ -854,91 +976,214 @@ def build_shift_card(
 # SENDING
 # ============================================================
 
-def report_marker_name(shift_date: str, shift_name: str) -> str:
+def report_marker_name(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = None,
+) -> str:
+    """
+    Имя маркера «отчёт отправлен».
+
+    🔴 **Склад входит в имя** — иначе второй склад молча считался бы отправленным.
+
+    Дефект, найденный аудитом 14.10.2026: у каждого склада свой Lark-хук для
+    ошибок (`LARK_HOOK_ERROR_SP3`), а **сменный рапорт всегда уходил по GLP-C**.
+    Причина была в вызове (`shift_metrics(date, shift, warehouse=None)` →
+    `WAREHOUSE`), но при добавлении второго склада маркер стал бы **второй**
+    ловушкой: имя `2026-10-14-night.json` одно на оба склада, и отчёт по SMALL-P3
+    был бы отброшен как «уже отправленный» после GLP-C.
+
+    Склад в имени делает маркеры независимыми: у каждой смены каждого склада он
+    свой. Имя без склада сохранено (`warehouse=None`) — так читаются маркеры,
+    записанные до этой правки, и первый запуск не пришлёт дубль за прошедшие смены.
+    """
+    if warehouse:
+        # `cfold` и пробелы → дефис: имя файла в Storage не должно зависеть от
+        # регистра и не должно содержать пробелов.
+        key = str(warehouse).strip().casefold().replace(" ", "-")
+
+        return f"{shift_date}-{shift_name}-{key}.json"
+
     return f"{shift_date}-{shift_name}.json"
 
 
-def report_already_sent(shift_date: str, shift_name: str) -> bool:
-    """True — отчёт за эту смену уже уходил (маркер в Supabase Storage)."""
+def report_already_sent(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = None,
+) -> bool:
+    """True — отчёт за эту смену **этого склада** уже уходил."""
     marker = download_json(
         REPORT_BUCKET,
-        report_marker_name(shift_date, shift_name),
+        report_marker_name(shift_date, shift_name, warehouse),
     )
 
-    return bool(marker)
+    if marker:
+        return True
+
+    # 🔴 **Старый маркер без склада тоже учитывается — но только для склада по
+    # умолчанию.**
+    #
+    # До этой правки маркер был один на смену и относился к GLP-C. Если его не
+    # проверять, первый запуск после деплоя пришлёт дубль за уже отправленную
+    # смену. Для второго склада старый маркер, наоборот, **не** признак: его
+    # отчёта там не было вовсе, и промолчать значило бы потерять смену.
+    if warehouse and _warehouse_key(warehouse) == _warehouse_key(WAREHOUSE):
+        return bool(
+            download_json(
+                REPORT_BUCKET,
+                report_marker_name(shift_date, shift_name),
+            )
+        )
+
+    return False
 
 
-def mark_report_sent(shift_date: str, shift_name: str) -> bool:
-    """Ставит маркер, что отчёт за смену отправлен."""
+def mark_report_sent(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = None,
+) -> bool:
+    """Ставит маркер, что отчёт за смену этого склада отправлен."""
     return upload_json(
         REPORT_BUCKET,
-        report_marker_name(shift_date, shift_name),
+        report_marker_name(shift_date, shift_name, warehouse),
         {
             "shift_date": shift_date,
             "shift_name": shift_name,
+            "warehouse": warehouse or WAREHOUSE,
             "sent_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
 
-def send_shift_report(shift_date: str, shift_name: str, force: bool = False):
+def _warehouse_key(title) -> str:
+    """Склад в сравнимом виде: без регистра и лишних пробелов."""
+    return str(title or "").strip().casefold()
+
+
+def send_shift_report(
+    shift_date: str,
+    shift_name: str,
+    force: bool = False,
+    warehouse: str = None,
+):
     """
-    Отправляет отчёт за смену в целевую группу.
+    Отправляет отчёт за смену **одного склада** в его группу.
 
     Сначала карточкой, при отказе — текстом. Повторная отправка за ту же
     смену блокируется маркером: перезапуск бота внутри окна отчёта не должен
     прислать дубль.
+
+    🔴 **Склад теперь обязателен по смыслу** (аудит 14.10.2026). Раньше отчёт
+    всегда считался по `WAREHOUSE` (GLP-C): вызов `shift_metrics(date, shift)` без
+    склада подставлял его по умолчанию. Второй склад — **SMALL-P3** — не
+    отчитывался в Lark вовсе, хотя ошибки туда уходят своим хуком
+    (`LARK_HOOK_ERROR_SP3`). За смену 14.10 ночь это **7 записей**, которых
+    группа не видела.
+
+    `warehouse=None` оставлен для совместимости: он означает склад по умолчанию
+    и общий вебхук — то есть прежнее поведение.
     """
-    if not force and report_already_sent(shift_date, shift_name):
+    title = warehouse or WAREHOUSE
+
+    if not force and report_already_sent(shift_date, shift_name, title):
         logger.warning(
-            "Отчёт за %s/%s уже отправлялся — пропускаю, чтобы не дублировать",
+            "Отчёт за %s/%s (%s) уже отправлялся — пропускаю, чтобы не дублировать",
             shift_date,
             shift_name,
+            title,
         )
         return {"skipped": True, "reason": "already-sent"}
 
-    metrics = shift_metrics(shift_date, shift_name)
+    metrics = shift_metrics(shift_date, shift_name, title)
 
     if metrics is None:
         logger.error(
-            "Отчёт за %s/%s не отправляю: не удалось прочитать данные смены",
+            "Отчёт за %s/%s (%s) не отправляю: не удалось прочитать данные смены",
             shift_date,
             shift_name,
+            title,
         )
         return {"skipped": True, "reason": "db-error"}
 
     logger.info(
-        "Sending shift report: date=%s shift=%s total=%s downtime=%sm",
+        "Sending shift report: date=%s shift=%s warehouse=%s total=%s downtime=%sm",
         shift_date,
         shift_name,
+        title,
         metrics["total"],
         metrics["downtime_minutes"],
     )
 
-    card = build_shift_card(shift_date, shift_name, metrics)
-    result = send_card_via_hook(TARGET_HOOK_URL, card)
+    # 🔴 **Хук берётся по складу, как у карточек ошибок.**
+    #
+    # Общий `TARGET_HOOK_URL` остаётся запасным: если для склада свой вебхук не
+    # задан, отчёт уйдёт в общий — молчание было бы хуже.
+    import lark_hooks
+
+    target = lark_hooks.hook("status", title)
+
+    card = build_shift_card(shift_date, shift_name, metrics, title)
+    result = send_card_via_hook(target, card)
 
     if hook_ok(result):
-        logger.info("Shift report sent as card: %s/%s", shift_date, shift_name)
-        mark_report_sent(shift_date, shift_name)
+        logger.info(
+            "Shift report sent as card: %s/%s (%s)", shift_date, shift_name, title
+        )
+        mark_report_sent(shift_date, shift_name, title)
         return result
 
     logger.warning("Card rejected (%s) — отправляю текстовый отчёт", result)
 
     text = build_shift_summary(shift_date, shift_name, metrics)
-    result = send_text_via_hook(TARGET_HOOK_URL, text)
+    result = send_text_via_hook(target, text)
 
     logger.info(
-        "Shift report sent as text: %s/%s result=%s",
+        "Shift report sent as text: %s/%s (%s) result=%s",
         shift_date,
         shift_name,
+        title,
         result,
     )
 
     if hook_ok(result):
-        mark_report_sent(shift_date, shift_name)
+        mark_report_sent(shift_date, shift_name, title)
 
     return result
+
+
+def send_shift_reports(shift_date: str, shift_name: str, force: bool = False):
+    """
+    Отчёт за смену **по каждому складу** — своему хуку и своей группе.
+
+    🔴 **Зачем отдельная функция, а не цикл в планировщике.** Сбор и отправка —
+    разные решения: планировщик должен знать только «пора», а **какие склады
+    есть** и как не задвоить отправку — дело отчёта. Плюс сбой одного склада не
+    должен мешать второму: здесь они независимы так же, как записи в базе и
+    карточки в Lark.
+
+    Возвращается карта `{склад: результат}` — по ней планировщик решает,
+    отметить ли смену отправленной (см. `_report_sent_ok`).
+    """
+    from warehouses import WAREHOUSES
+
+    titles = list(WAREHOUSES.values()) or [WAREHOUSE]
+    results = {}
+
+    for title in titles:
+        try:
+            results[title] = send_shift_report(
+                shift_date, shift_name, force=force, warehouse=title
+            )
+        except Exception:
+            # Сбой одного склада не отменяет отчёт по другому.
+            logger.exception(
+                "Отчёт за %s/%s (%s) не отправлен", shift_date, shift_name, title
+            )
+            results[title] = {"skipped": True, "reason": "error"}
+
+    return results
 
 
 # ============================================================
@@ -946,17 +1191,43 @@ def send_shift_report(shift_date: str, shift_name: str, force: bool = False):
 # ============================================================
 
 def _report_sent_ok(result) -> bool:
-    """Считать ли отчёт доставленным (для отметки «уже отправлен»)."""
-    if isinstance(result, dict) and result.get("skipped"):
+    """
+    Считать ли отчёт доставленным (для отметки «уже отправлен»).
+
+    🔴 **Понимает и карту складов.** `send_shift_reports` возвращает
+    `{склад: результат}`, и смена считается отправленной, только если **по
+    каждому** складу отчёт либо доставлен, либо уже был отправлен раньше.
+    Иначе сбой одного склада навсегда закрыл бы смену для второго.
+    """
+    if not isinstance(result, dict):
+        return False
+
+    if result.get("skipped"):
         # Маркер «уже отправляли» — повторять не нужно;
         # ошибка чтения данных — нужно (попробуем в следующем цикле).
         return result.get("reason") == "already-sent"
+
+    # 🔴 **Карта складов отличается от ответа вебхука по ФОРМЕ, а не по
+    # отсутствию `skipped`.**
+    #
+    # Здесь я ошибся с первого раза: признаком карты было `"skipped" not in
+    # result`, и **успешный ответ вебхука** (`{"code": 0}`) попадал в ветку карты.
+    # Дальше он перебирал свои же ключи (`code`, `msg`), `hook_ok` на них падал, и
+    # функция возвращала `False` — то есть **успешная отправка считалась
+    # неуспешной**. Планировщик не отметил бы смену отправленной и присылал бы
+    # отчёт заново каждый цикл.
+    #
+    # Признак карты — значения-словари: у вебхука их не бывает.
+    values = list(result.values())
+
+    if values and all(isinstance(item, dict) for item in values):
+        return all(_report_sent_ok(item) for item in values)
 
     return hook_ok(result)
 
 
 def _scheduler_loop():
-    """Фоновый цикл: проверяет время и шлёт отчёт раз за смену."""
+    """Фоновый цикл: проверяет время и шлёт отчёт раз за смену по всем складам."""
     sent = set()
 
     while True:
@@ -965,7 +1236,10 @@ def _scheduler_loop():
             reportable = _get_reportable_shift(now)
 
             if reportable and reportable not in sent:
-                result = send_shift_report(*reportable)
+                # 🔴 **Отчёт по каждому складу** (аудит 14.10.2026): раньше
+                # планировщик звал `send_shift_report` без склада, и SMALL-P3 не
+                # отчитывался вовсе.
+                result = send_shift_reports(*reportable)
 
                 # Отмечаем смену отправленной только при успехе: иначе
                 # неудачная отправка больше никогда не повторится.
@@ -1026,7 +1300,10 @@ def main():
         print(build_shift_summary(shift_date, shift_name, metrics))
 
     if args.send:
-        result = send_shift_report(shift_date, shift_name, force=True)
+        # Отправляем **по всем складам** — как это делает планировщик. Так
+        # превью проверяет ровно тот путь, что работает в проде; иначе легко
+        # проверить GLP-C и не заметить, что второй склад молчит.
+        result = send_shift_reports(shift_date, shift_name, force=True)
         print("\n--- sent to Lark ---")
         print(json.dumps(result, ensure_ascii=False))
 

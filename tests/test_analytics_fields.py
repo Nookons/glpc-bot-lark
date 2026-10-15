@@ -289,53 +289,67 @@ class StillOfflineChecks(unittest.TestCase):
     """
     🔴 **Отчёт обязан сказать, сколько роботов стоит ПРЯМО СЕЙЧАС.**
 
-    Аудит 14.10.2026: в офлайне было **7 роботов**, самый старый — с 18.04.2026
-    (**179 суток**), ещё три — с 07–09.10. Сменный рапорт об этом молчал
-    полностью, а MTTR в тех же сменах печатал «no robot came back online»:
-    читатель видел «всё спокойно», хотя часть парка стоит неделями.
+    Аудит 15.10.2026 нашёл здесь **второй дефект, глубже первого**: источником
+    был журнал `change_status_robots`, и он давал роботов, которых в офлайне
+    **уже нет**, пропуская тех, кто стоит. Сверка показала **ни одного общего**
+    робота между журналом и живой таблицей:
 
-    Проверяется смысл: незакрытый интервал обязан попасть в отчёт, а закрытый —
-    нет (иначе список врал бы «стоит» про робота, который уже на линии).
+    | Источник | Офлайн |
+    |---|---|
+    | журнал (последняя запись 09.10) | 115, 3742, 3694, 3587, 3773, 3628 |
+    | `equipment` (живой статус) | 2627, 5138, 7449, 3511 |
+
+    И журнал **путал склады**: `#115` (простой 179 дней) числился за GLP-C, а он
+    `SMALL-P3` — зона `D`. Проверяется поэтому не только «есть ли робот в
+    списке», но и правильный источник с правильным складом.
     """
 
     def _offline(self, rows):
         with mock.patch.object(shift_report, "rest_get", return_value=rows):
             return shift_report.still_offline("GLP-C")
 
-    def test_open_interval_is_reported(self):
-        """Робот ушёл в офлайн и не вернулся — он «стоит сейчас»."""
+    def test_offline_robot_is_reported(self):
+        """Робот со статусом `offline` попадает в список."""
         robots = self._offline([
-            {"robot_number": "3742", "new_status": "离线 | Offline",
-             "created_at": "2026-10-07T10:00:00+00:00", "type_problem": "Abnormal walking"},
+            {"equipment_code": "3742", "status": "offline",
+             "updated_at": "2026-10-07T10:00:00+00:00",
+             "problem_note": "Abnormal walking"},
         ])
 
         self.assertEqual(len(robots), 1)
         self.assertEqual(robots[0]["robot"], "3742")
         self.assertGreater(robots[0]["hours"], 24 * 6)
 
-    def test_closed_interval_is_not_reported(self):
-        """Робот вернулся на линию — в списке «стоит сейчас» его быть не должно."""
-        robots = self._offline([
-            {"robot_number": "3422", "new_status": "离线 | Offline",
-             "created_at": "2026-10-08T08:00:00+00:00", "type_problem": None},
-            {"robot_number": "3422", "new_status": "在线 | Online",
-             "created_at": "2026-10-08T16:25:00+00:00", "type_problem": None},
-        ])
+    def test_query_asks_for_offline_and_the_right_warehouse(self):
+        """
+        🔴 **Запрос идёт в `equipment` по НАЗВАНИЮ склада.**
 
-        self.assertEqual(robots, [])
+        Две ловушки сразу: `equipment.warehouse` хранит **название** (сравнение с
+        числовым id вернуло бы пусто — «все на линии» вместо правды), а статус
+        нужен канонический `offline` (не локализованный `离线 | Offline`).
+        """
+        captured = {}
+
+        def fake_get(table, params=None, optional=False):
+            captured["table"] = table
+            captured["params"] = params or {}
+            return []
+
+        with mock.patch.object(shift_report, "rest_get", side_effect=fake_get):
+            shift_report.still_offline("SMALL-P3")
+
+        self.assertEqual(captured["table"], "equipment")
+        self.assertEqual(captured["params"].get("status"), "eq.offline")
+        self.assertEqual(captured["params"].get("warehouse"), "eq.SMALL-P3")
+        self.assertEqual(captured["params"].get("category"), "eq.robot")
 
     def test_oldest_is_first(self):
         """Самый долгий простой — первым: это то, что надо чинить."""
-        # Статусы — **точные строки из справочника** (`robot_status`), а не
-        # сокращения: проверка идёт сравнением с константой, и «Offline» её не
-        # прошло бы (на этом мой первый вариант теста и упал).
-        import robot_status
-
         robots = self._offline([
-            {"robot_number": "1", "new_status": robot_status.OFFLINE,
-             "created_at": "2026-10-13T10:00:00+00:00", "type_problem": None},
-            {"robot_number": "2", "new_status": robot_status.OFFLINE,
-             "created_at": "2026-04-18T10:00:00+00:00", "type_problem": None},
+            {"equipment_code": "1", "status": "offline",
+             "updated_at": "2026-10-13T10:00:00+00:00"},
+            {"equipment_code": "2", "status": "offline",
+             "updated_at": "2026-04-18T10:00:00+00:00"},
         ])
 
         self.assertEqual([item["robot"] for item in robots], ["2", "1"])
@@ -346,4 +360,240 @@ class StillOfflineChecks(unittest.TestCase):
         Различие важное: пустой список печатает «все на линии», а сбой обязан
         молчать, иначе отчёт соврёт о спокойствии.
         """
-        self.assertIsNone(self._offline(None))
+        with mock.patch.object(shift_report, "rest_get", return_value=None):
+            self.assertIsNone(shift_report.still_offline("GLP-C"))
+
+
+class WarehouseReportChecks(unittest.TestCase):
+    """
+    🔴 **Каждый склад отчитывается своим отчётом и своим хуком.**
+
+    Аудит 14.10.2026: ошибки уходили в Lark по складам (`LARK_HOOK_ERROR_SP3`),
+    а **сменный рапорт всегда считался по GLP-C** — `send_shift_report` звал
+    `shift_metrics(date, shift)` без склада. За смену 14.10 ночь это **7 записей
+    SMALL-P3**, которых группа не видела.
+
+    Отдельная опасность — маркер «уже отправлено»: одно имя файла на смену
+    означало бы, что после отчёта GLP-C отчёт SMALL-P3 отброшен как дубль.
+    """
+
+    def test_marker_is_different_per_warehouse(self):
+        """У каждой смены каждого склада — свой маркер."""
+        glp = shift_report.report_marker_name("2026-10-14", "night", "GLP-C")
+        sp3 = shift_report.report_marker_name("2026-10-14", "night", "SMALL-P3")
+
+        self.assertNotEqual(glp, sp3, "маркер общий на два склада — второй отчёт потеряется")
+        self.assertIn("glp-c", glp)
+        self.assertIn("small-p3", sp3)
+
+    def test_marker_without_warehouse_stays_the_old_name(self):
+        """Имя без склада не изменилось — старые маркеры читаются."""
+        self.assertEqual(
+            shift_report.report_marker_name("2026-10-14", "night"),
+            "2026-10-14-night.json",
+        )
+
+    def test_report_goes_over_every_warehouse(self):
+        """`send_shift_reports` обходит все склады, и сбой одного не мешает другому."""
+        calls = []
+
+        def fake_send(date, shift, force=False, warehouse=None):
+            calls.append(warehouse)
+
+            if warehouse == "GLP-C":
+                raise RuntimeError("склад недоступен")
+
+            return {"ok": True}
+
+        with mock.patch.object(
+            shift_report, "send_shift_report", side_effect=fake_send
+        ):
+            results = shift_report.send_shift_reports("2026-10-14", "night")
+
+        # Оба склада вызваны, несмотря на сбой первого.
+        self.assertIn("GLP-C", calls)
+        self.assertIn("SMALL-P3", calls)
+        # Сбой одного виден в результате, а не проглочен.
+        self.assertEqual(results["GLP-C"].get("reason"), "error")
+        self.assertTrue(results["SMALL-P3"].get("ok"))
+
+    def test_sent_ok_requires_every_warehouse(self):
+        """Смена закрыта, только если по КАЖДОМУ складу отчёт ушёл."""
+        good = {"GLP-C": {"code": 0}, "SMALL-P3": {"code": 0}}
+        mixed = {"GLP-C": {"code": 0}, "SMALL-P3": {"skipped": True, "reason": "db-error"}}
+
+        self.assertTrue(shift_report._report_sent_ok(good))
+        self.assertFalse(shift_report._report_sent_ok(mixed))
+
+
+class MaintenanceMeaningChecks(unittest.TestCase):
+    """
+    🔴 **«Обслуживание» — это НЕЗАКРЫТЫЕ ошибки, а не частые.**
+
+    Дефект 14.10.2026: порог считал все записи робота за смену. У робота #3808
+    их было 16, из них **14 (87 %)** закрыты за ≤5 минут — он работал, а не
+    требовал ремонта. Порог срабатывал почти всегда (**15 роботов** за смену), и
+    из-за этого карточка **всегда была красной**: сигнал «нужен ремонт» перестал
+    что-либо значить.
+    """
+
+    def _data(self, rows):
+        with mock.patch(
+            "sendToDataBase.get_shift_exceptions", return_value=rows
+        ):
+            import sendToDataBase
+
+            return sendToDataBase.shift_report_data(
+                "2026-10-14", "night", warehouse="GLP-C"
+            )
+
+    def test_closed_errors_do_not_ask_for_maintenance(self):
+        """Пять закрытых ошибок — робот работает, а не «требует обслуживания»."""
+        data = self._data([
+            {"error_robot": "3808", "raw_fault": "X", "solving_time": 4,
+             "recovery_title": "Restart"}
+            for _ in range(5)
+        ])
+
+        self.assertEqual(data["maintenance"], [])
+
+    def test_unresolved_errors_ask_for_maintenance(self):
+        """Три незакрытые — вот это повод для ремонта."""
+        data = self._data([
+            {"error_robot": "3808", "raw_fault": "X", "solving_time": None,
+             "recovery_title": None}
+            for _ in range(3)
+        ])
+
+        self.assertEqual(data["maintenance"], [("3808", 3)])
+
+    def test_zero_means_unknown_not_solved(self):
+        """`solving_time = 0` — «неизвестно», а не «решено мгновенно».
+
+        Поэтому такая ошибка считается незакрытой (см. `_solving_time`).
+        """
+        data = self._data([
+            {"error_robot": "1", "raw_fault": "X", "solving_time": 0,
+             "recovery_title": None}
+            for _ in range(3)
+        ])
+
+        self.assertEqual(data["maintenance"], [("1", 3)])
+
+
+class ReportColorChecks(unittest.TestCase):
+    """
+    🔴 **Цвет карточки различает смены, а не горит красным всегда.**
+
+    Проверено на живых данных 14.10.2026: **4 смены подряд были `red`**. Причин
+    было две: порог обслуживания ловил «частые» ошибки (см. выше), а
+    `REPORT_WARN_TOTAL = 5` не различал ничего при 100–200 записях за смену.
+
+    Новая шкала — по **доле незакрытых**: 200 мелких ошибок, закрытых за минуты,
+    это нормальная работа, а 20 ошибок, из которых 15 висят, — тревога.
+    """
+
+    def _metrics(self, **over):
+        base = {
+            "total": 100, "robots": {}, "employees": {}, "downtime_minutes": 0,
+            "downtime": {"available": False}, "maintenance": [], "types": {},
+            "previous": {"date": None, "shift": None, "total": None}, "delta": None,
+            "warehouse": "GLP-C", "zones": {}, "unassigned": 0,
+            "no_recovery": 0, "no_solving_time": 0,
+        }
+        base.update(over)
+
+        return base
+
+    def test_empty_shift_is_green(self):
+        self.assertEqual(shift_report.report_color(self._metrics(total=0)), "green")
+
+    def test_busy_but_closed_shift_is_green(self):
+        """200 ошибок, из которых 2 не закрыты — работа идёт нормально."""
+        color = shift_report.report_color(
+            self._metrics(total=200, no_recovery=2)
+        )
+
+        self.assertEqual(color, "green")
+
+    def test_many_unresolved_is_orange(self):
+        """Больше четверти смены без «что сделано» — предупреждение."""
+        color = shift_report.report_color(
+            self._metrics(total=100, no_recovery=40)
+        )
+
+        self.assertEqual(color, "orange")
+
+    def test_maintenance_is_red(self):
+        """Робот копит незакрытое — это ремонт."""
+        color = shift_report.report_color(
+            self._metrics(total=100, no_recovery=2, maintenance=[("3808", 3)])
+        )
+
+        self.assertEqual(color, "red")
+
+
+class RepairTimeLineChecks(unittest.TestCase):
+    """
+    🔴 **Нет цифры — назови причину, а не выдумывай спокойствие.**
+
+    Аудит 15.10.2026: строка «MTTR: no robot came back online this shift»
+    **вводила в заблуждение** — читается как «роботов не было в ремонте», а
+    означает «измерить нечем»: журнал `change_status_robots` не наполняется с
+    **09.10.2026** (проверено: последняя запись 09.10 21:25, всего 175).
+
+    Проверено, что **измеренного** источника нет:
+
+    * `equipment` хранит только текущий статус и время его изменения — момента
+      перехода в офлайн нет, начало ремонта неизвестно;
+    * `exceptions.end_time` = `start_time` + справочное время заготовки
+      (сходится в 99.99 % строк) — это **оценка**, а не факт.
+
+    Поэтому проверяется, что отчёт называет причину **с датой**, а не молчит и
+    не обещает ложного «всё спокойно».
+    """
+
+    def _metrics(self, downtime):
+        return {
+            "total": 10, "robots": {}, "employees": {}, "downtime_minutes": 0,
+            "downtime": downtime, "maintenance": [], "types": {},
+            "previous": {"date": None, "shift": None, "total": None}, "delta": None,
+            "warehouse": "GLP-C", "zones": {}, "unassigned": 0,
+            "no_recovery": 0, "no_solving_time": 0,
+        }
+
+    def test_no_measured_data_names_the_reason(self):
+        """Пустой журнал — говорим «не измеримо» и называем дату последней записи."""
+        with mock.patch.object(
+            shift_report, "_journal_last_entry", return_value="09.10.2026"
+        ):
+            line = shift_report.downtime_line(
+                self._metrics({"available": True, "count": 0})
+            )
+
+        self.assertIn("not measurable", line)
+        self.assertIn("09.10.2026", line)
+        # 🔴 Прежняя формулировка запрещена: она читается как «всё спокойно».
+        self.assertNotIn("no robot came back online", line)
+
+    def test_unreadable_journal_does_not_invent_a_date(self):
+        """Сбой чтения журнала — без выдуманной даты."""
+        with mock.patch.object(shift_report, "_journal_last_entry", return_value=""):
+            line = shift_report.downtime_line(
+                self._metrics({"available": True, "count": 0})
+            )
+
+        self.assertIn("not measurable", line)
+        self.assertIn("empty", line)
+
+    def test_measured_repairs_still_show_mttr(self):
+        """Когда данные ЕСТЬ, считается как раньше — MTTR и самый долгий."""
+        line = shift_report.downtime_line(
+            self._metrics({
+                "available": True, "count": 2, "mttr_seconds": 3600,
+                "longest": {"robot": "3422", "seconds": 7200},
+            })
+        )
+
+        self.assertIn("MTTR 1h 00m", line)
+        self.assertIn("#3422", line)
