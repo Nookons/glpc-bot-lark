@@ -250,7 +250,7 @@ Which one?
 | **Ex SP3** | `TELEGRAM_TOPIC_ERROR_SP3` | то же самое для склада SMALL-P3 |
 | **Robot status** | `TELEGRAM_TOPIC_STATUS` | `/offline`, `/online`, кнопки причин, «Describe the reason», сообщение о смене статуса, `/robot`, `/cancel`. Склад берётся из топика (или из аргумента: `/offline sp3 5016`) |
 | **Stats** | `TELEGRAM_TOPIC_STATS` | `/stats`, `/top`, `/downtime`, `/week`, `/digest`; склад — аргументом (`/stats sp3 day`) или склад топика |
-| **Service** | `TELEGRAM_TOPIC_SERVICE` | `/help`, `/id`, `/topics`, `/reg`, `/whoami`, `/unreg`, «Unknown command», предупреждения бота |
+| **Service** | `TELEGRAM_TOPIC_SERVICE` | `/help`, `/id`, `/topics`, `/reg`, `/whoami`, `/unreg`, «Unknown command», предупреждения бота, `/inspection` (в проде — топик `Inspection`, id 25189) |
 
 Топик ошибок для любого склада задаётся как `TELEGRAM_TOPIC_ERROR_<КЛЮЧ>`
 (например `TELEGRAM_TOPIC_ERROR_SP3`); для склада по умолчанию работает

@@ -18,10 +18,16 @@
 
     /inspection
       │
+      ├─ 0. Склад — **только если он не определён топиком** (см. ниже):
+      │        · топик ошибок конкретного склада → склад известен, шага нет;
+      │        · служебный топик Inspection (25189) → склад спрашиваем;
+      │        · предлагаются только те склады, куда есть доступ по API.
+      │
       ├─ 1. Тип оборудования: [Robot] [Charging station] [Workstation] [✖ Cancel]
       │        └─ тип обязателен: он задаёт категорию поиска (см. ниже)
       │
-      ├─ 2. Номер устройства (текстом) → проверка строго в этой категории
+      ├─ 2. Номер устройства (текстом) → поиск строго в этой категории
+      │     И на выбранном складе
       │        └─ не найден / найден в другой категории — осмотр НЕ начинается
       │
       ├─ 3. Шаблон осмотра: кнопки, отфильтрованные по категории устройства
@@ -50,10 +56,30 @@
 при этом живёт **в базе** (`equipment_inspections`) с первой секунды: в памяти
 только «на каком пункте мы стоим», и перезапуск бота не теряет сам осмотр —
 оператор увидит его на веб-версии незакрытым.
+
+─── Где живёт команда и почему спрашивается склад (17.10.2026) ─────────────
+
+Владелец перенёс `/inspection` в служебный топик `Inspection` (thread 25189,
+`TELEGRAM_TOPIC_SERVICE=25189`). Из этого следует две вещи:
+
+1. **Топик должен быть разрешён на отправку.** `is_shared_topic` знал `service`
+   и раньше, поэтому команда принималась, но барьер `_output_topic_allowed`
+   отклонял **ответ** — человек видел молчание. Список на отправку
+   (`allowed_output_topics`) дополнен видом `service` в `telegram_bot.py`.
+2. **Склад из топика больше не выводится.** В топике ошибок
+   (`Ex GLPC` / `Ex SP3`) склад известен из самого топика, и там вопрос не
+   задаётся — он только замедлял бы работу. В служебном топике
+   `error_warehouse_for_thread()` возвращает `None`, и раньше осмотр молча
+   привязывался к `DEFAULT_WAREHOUSE` (GLP-C) — то есть станция SMALL-P3
+   искалась бы в GLP-C. Теперь склад спрашивают (шаг 0), а поиск номера
+   (`validation.find_equipment`) всегда идёт **в выбранном** складе: номера
+   повторяются между складами (`121`, `122`, `123` есть в обоих), и склад в
+   поиске обязателен.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -76,6 +102,10 @@ from inspection_api import (
     upload_item_photo,
 )
 
+#: Лог диалога осмотра. Нужен там, где молчаливое решение скрыло бы проблему
+#: (например, склад карточки, которого нет в `TELEGRAM_WAREHOUSES`).
+logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # СОСТОЯНИЕ: ПАМЯТЬ + TTL
@@ -89,6 +119,7 @@ from inspection_api import (
 SESSION_TTL_SECONDS = int(os.environ.get("TELEGRAM_INSPECTION_TTL", "1800") or "1800")
 
 #: Шаги диалога.
+STEP_WAREHOUSE = "warehouse"  # выбор склада (лишь если топик его не задал)
 STEP_TYPE = "type"          # выбор типа оборудования
 STEP_NUMBER = "number"      # номер устройства
 STEP_TEMPLATE = "template"  # выбор шаблона осмотра
@@ -123,12 +154,33 @@ STATUS_LABELS = {
 #: Префикс callback-данных диалога. `ins` не занят никем: занятые префиксы —
 #: `dt` (дерево), `ed` (редактор), `rf` (номер робота), `em` (меню ошибки),
 #: `w` (склад), `st` (статус).
+#:
+#: 🔴 **`CB_WAREHOUSE = "w"` — это НЕ конфликт с префиксом `w`.** Имена разведены
+#: по позиции в `callback_data`, а не по букве: выбор склада отправляет
+#: `ins:w:<title>`, и `handle_callback` сначала проверяет **первое** поле
+#: (`ins`). До чужого обработчика `w` (`_handle_warehouse_choice`, он ловит
+#: данные, начинающиеся с `w:`) такое нажатие не доходит. Совпадение буквы
+#: безопасно именно потому, что Telegram кодирует **всю** строку целиком, а
+#: диспетчер смотрит её первый сегмент.
 CB_PREFIX = "ins"
 
+CB_WAREHOUSE = "w"   # ins:w:<warehouse_title>
 CB_TYPE = "t"        # ins:t:<category>
 CB_TEMPLATE = "k"    # ins:k:<template_id>
 CB_PROBLEM = "p"     # ins:p:<item_index>
 CB_CANCEL = "x"      # ins:x
+
+#: Склады, куда у API есть доступ у любого (не админа): **только свой склад**
+#: карточки, как в `can_access_warehouse`.
+#:
+#: 🔴 **Список ролей повторяет `ADMIN_ROLES` из API — это вынужденное
+#: дублирование, а не второй источник правды.** Бот **не импортирует код API**
+#: (это другое приложение, другой процесс, другая база кода), поэтому сравнить
+#: со словарём напрямую нельзя. Значение обязано совпадать с
+#: `tk-assist-api/app/core/permissions.py::ADMIN_ROLES = {"admin", "manager"}`.
+#: Если оно там изменится, здесь надо поменять тоже; на расхождение указывает
+#: тест `test_inspection.py::TestWarehouseAccess`.
+ADMIN_ROLES = ("admin", "manager")
 
 
 @dataclass
@@ -144,6 +196,9 @@ class Session:
     auth_id: Optional[str] = None
     employee_name: str = ""
     warehouse: str = ""
+    #: Склады, доступные этому человеку. Пусто — «не вычисляли»: в этом случае
+    #: работает прежнее правило «склад из топика».
+    warehouses: List[str] = field(default_factory=list)
     thread_id: Optional[int] = None
     #: Тип оборудования и его вид для проверки номера.
     category: Optional[str] = None
@@ -277,6 +332,43 @@ def cancel_button() -> Dict[str, str]:
     return {"text": "✖️ Cancel", "callback_data": f"{CB_PREFIX}:{CB_CANCEL}"}
 
 
+def warehouse_keyboard(session: Session) -> Dict[str, list]:
+    """
+    Кнопки выбора склада: **только доступные этому человеку склады**.
+
+    🔴 **Почему список не берётся из `warehouses.WAREHOUSES` напрямую.** API
+    проверяет склад при создании осмотра
+    (`InspectionService.create_inspection` → `can_access_warehouse`): работник и
+    лидер видят **только свой** склад, любой — только администратор или
+    менеджер. Показать обычному работнику SMALL-P3 значило бы провести его
+    через все пункты с фото и получить `403` в самом конце — работа пропала бы
+    впустую. Поэтому предлагаем ровно то, что API разрешит
+    (см. `_warehouse_choices`).
+
+    Подписи **не хардкодятся**: их источник — `warehouses.WAREHOUSES`, словарь
+    из `TELEGRAM_WAREHOUSES` (тот же список, что и у остальных команд).
+    """
+    import keyboard_layout
+
+    labels = [str(title) for title in session.warehouses]
+    columns = keyboard_layout.columns_for_labels(labels)
+
+    buttons = [
+        {
+            "text": str(title),
+            "callback_data": f"{CB_PREFIX}:{CB_WAREHOUSE}:{title}",
+        }
+        for title in session.warehouses
+    ]
+
+    rows = keyboard_layout.grid_rows(
+        buttons, columns=columns, max_rows=len(buttons) or 1
+    )
+    rows.append([cancel_button()])
+
+    return {"inline_keyboard": rows}
+
+
 def type_keyboard() -> Dict[str, list]:
     import keyboard_layout
 
@@ -349,6 +441,26 @@ def problem_keyboard() -> Dict[str, list]:
 # ============================================================
 # ТЕКСТЫ
 # ============================================================
+
+def warehouse_prompt(session: Session) -> str:
+    """
+    Первый шаг в служебном топике: **какой склад осматриваем**.
+
+    Зачем вопрос вообще нужен: `/inspection` теперь живёт в служебном топике
+    `Inspection`, а не в топике ошибок, и склад из топика там не выводится.
+    Раньше в этой роли работал `bot.current_warehouse()`, который для всего
+    неизвестного отдаёт `DEFAULT_WAREHOUSE` (GLP-C) — то есть осмотр станции
+    SMALL-P3 молча привязался бы к GLP-C и номер там не нашёлся бы (номера
+    повторяются между складами: `121`, `122`, `123` есть и в GLP-C, и в
+    SMALL-P3).
+    """
+    return (
+        "🔍 Equipment inspection\n"
+        "\n"
+        "Which warehouse do you inspect?\n"
+        "The device number is then checked on that warehouse only."
+    )
+
 
 def type_prompt() -> str:
     return (
@@ -592,10 +704,74 @@ def start(chat_id, sender, reply_to=None) -> bool:
         warehouse=bot.current_warehouse(),
         thread_id=bot._reply_thread(chat_id),
     )
+
+    # 🔴 **Склад: спрашиваем только тогда, когда его не задал топик.**
+    #
+    # В топике ошибок склада (`Ex GLPC` / `Ex SP3`) склад уже известен — вопрос
+    # был бы лишним шагом и замедлял бы работу: человек уже стоит в топике этого
+    # склада. В служебном топике (`Inspection`) топик склад не задаёт, поэтому
+    # спрашиваем: без этого работа привязалась бы к `DEFAULT_WAREHOUSE` (GLP-C).
+    #
+    # Тот же признак, по которому определяется склад для приёма ошибок:
+    # `error_warehouse_for_thread` отдаёт `None` для всего, что не топик ошибок
+    # (в частности, `None` для служебного топика — и это ровно то, что нужно).
+    from_topic = bot.error_warehouse_for_thread(chat_id, session.thread_id)
+    choices = _warehouse_choices(employee, from_topic)
+
+    if from_topic:
+        # Склад задан топиком — вопроса нет, диалог идёт как раньше.
+        session.warehouse = from_topic
+        session.step = STEP_TYPE
+        put_session(session)
+        _ask_type(session, reply_to)
+
+        return True
+
+    if not choices:
+        # Ни одного доступного склада: у карточки не заполнен склад и человек не
+        # администратор. Спрашивать нечего, а поиск без склада запрещён (номера
+        # повторяются между складами) — честно объясняем, что делать.
+        bot._send(
+            chat_id,
+            "⚠️ Can't tell which warehouse you inspect: your employee card has "
+            "no warehouse, and inspections are done on your own warehouse only.\n"
+            "Ask a leader to fill in the warehouse on your card.",
+            reply_to_message_id=reply_to,
+        )
+        return True
+
+    if len(choices) == 1:
+        # Доступен ровно один склад — выбор из одного варианта только замедлял
+        # бы работу. Берём его из карточки/доступа.
+        session.warehouse = choices[0]
+        session.step = STEP_TYPE
+        put_session(session)
+        _ask_type(session, reply_to)
+
+        return True
+
+    session.warehouses = choices
+    session.step = STEP_WAREHOUSE
     put_session(session)
 
     sent = bot._send(
         chat_id,
+        warehouse_prompt(session),
+        reply_to_message_id=reply_to,
+        reply_markup=warehouse_keyboard(session),
+    )
+
+    if sent:
+        session.data["prompt_message_id"] = sent.get("message_id")
+        put_session(session)
+
+    return True
+
+
+def _ask_type(session: Session, reply_to=None) -> None:
+    """Показывает шаг выбора типа — общий путь для всех «склад уже известен»."""
+    sent = _bot()._send(
+        session.chat_id,
         type_prompt(),
         reply_to_message_id=reply_to,
         reply_markup=type_keyboard(),
@@ -605,7 +781,53 @@ def start(chat_id, sender, reply_to=None) -> bool:
         session.data["prompt_message_id"] = sent.get("message_id")
         put_session(session)
 
-    return True
+
+def _warehouse_choices(employee: Dict[str, Any], topic_warehouse: Optional[str]) -> List[str]:
+    """
+    Склады, которые человеку **разрешено** осматривать по правилам API.
+
+    🔴 **Зачем эта проверка в боте.** `InspectionService.create_inspection`
+    сверяет склад найденного оборудования с правами токена:
+    `can_access_warehouse` (см. `tk-assist-api/app/core/permissions.py`). Правило
+    там такое: работник и лидер видят **только свой** склад, любой склад —
+    только `admin`/`manager`. Значит, показав работнику GLP-C чужой SMALL-P3, мы
+    провели бы его через весь осмотр с фото и получили бы `403` на создании —
+    то есть потеряли бы работу в самом конце. Поэтому показываем ровно то, что
+    API разрешит, — интерфейс не обещает того, чего API не даст.
+
+    Список складов — из `warehouses.WAREHOUSES` (переменная `TELEGRAM_WAREHOUSES`),
+    а не из строк в коде: второй источник правды разошёлся бы с остальными
+    командами бота.
+    """
+    from warehouses import WAREHOUSES
+
+    known = [str(title) for title in WAREHOUSES.values()]
+
+    role = str(employee.get("role") or "").strip().lower()
+
+    if role in ADMIN_ROLES:
+        # Администратор/менеджер: любой склад (та же семантика, что
+        # `level_of(principal) == "admin"` в API).
+        return known
+
+    own = str(employee.get("warehouse") or "").strip()
+
+    if not own:
+        # Склада нет в карточке. Если топик склад задал — он и есть ответ;
+        # иначе предлагать нечего (API откажет: склад `None` не «всем доступен»).
+        return [topic_warehouse] if topic_warehouse in known else []
+
+    if own not in known:
+        # Склад карточки есть в базе, но не обслуживается этим ботом
+        # (`WAREHOUSES`): осмотр там невозможен, и предлагать его нельзя.
+        logger.warning(
+            "Осмотр: склад карточки %r отсутствует в TELEGRAM_WAREHOUSES %s",
+            own,
+            known,
+        )
+        return []
+
+    return [own]
 
 
 # ============================================================
@@ -646,7 +868,9 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         return True
 
     try:
-        if action == CB_TYPE:
+        if action == CB_WAREHOUSE:
+            _choose_warehouse(session, arg, chat_id, message_id, answer)
+        elif action == CB_TYPE:
             _choose_type(session, arg, chat_id, message_id, answer)
         elif action == CB_TEMPLATE:
             _choose_template(session, arg, chat_id, message_id, answer)
@@ -666,6 +890,34 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         return True
 
     return True
+
+
+def _choose_warehouse(session: Session, title: str, chat_id, message_id, answer) -> None:
+    """
+    Первый шаг: склад выбран → показываем выбор типа.
+
+    Проверяем выбор по списку из сессии, а не «на слово»: сессия живёт в памяти
+    и обновляется только этим кодом, но кнопка устаревшего сообщения могла
+    прийти с чужим складом (например, после правки переменных окружения). Тогда
+    лучше отказать, чем искать устройство на складе, которого нет.
+    """
+    if title not in session.warehouses:
+        answer("Unknown warehouse")
+        return
+
+    session.warehouse = title
+    session.step = STEP_TYPE
+    put_session(session)
+
+    answer(title)
+
+    bot = _bot()
+    bot._send(
+        chat_id,
+        type_prompt(),
+        reply_markup=type_keyboard(),
+    )
+    _delete_quiet(chat_id, message_id)
 
 
 def _choose_type(session: Session, category: str, chat_id, message_id, answer) -> None:
@@ -777,7 +1029,9 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
         return True
 
     # Прочие шаги текст не принимают: номер и пункты — единственные текстовые
-    # шаги, а на шаге выбора кнопка надёжнее свободного текста.
+    # шаги, а на шаге выбора кнопка надёжнее свободного текста. Шаг склада тоже
+    # кнопочный: названия складов приходят из `TELEGRAM_WAREHOUSES`, и сверять
+    # свободный текст с ними значило бы завести второе правило разбора.
     return False
 
 

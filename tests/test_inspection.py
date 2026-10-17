@@ -55,6 +55,14 @@ import telegram_api as tg  # noqa: E402
 import telegram_bot as bot  # noqa: E402
 from equipment_intake import validation  # noqa: E402
 
+#: **Настоящая функция поиска**, снятая ДО подмены фикстурой `rec`.
+#:
+#: Нужна тесту «выбранный склад уходит в поиск»: он обязан перехватить
+#: **реальный** запрос к справочнику, а не строку в исходнике и не заглушку,
+#: которая вернёт что угодно независимо от склада. На этом в проекте уже
+#: обжигались (см. `TestTypeRuleWiring`).
+_REAL_FIND_EQUIPMENT = validation.find_equipment
+
 
 #: 🔴 **Сторож сети: ни один тест этого файла не имеет права выйти наружу.**
 #
@@ -272,8 +280,83 @@ def _start(rec, monkeypatch, category="robot"):
     insp.handle_text(CHAT_ID, {"id": USER_ID}, "3780", 2)
 
 
+def _start_in_service_topic(rec, monkeypatch, warehouse="SMALL-P3", category="robot",
+                            number="3780"):
+    """
+    Вход из **служебного** топика: склад спрашивают и выбирают.
+
+    Маршрутизация топиков ошибок настроена (`_error_routing`), а сам вход — не
+    из топика ошибок, поэтому `error_warehouse_for_thread` вернёт `None` — ровно
+    как в боевом служебном топике `Inspection` (25189). Это сценарий владельца.
+    """
+    _error_routing(monkeypatch)
+    insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+    if _session().step == insp.STEP_WAREHOUSE:
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_WAREHOUSE, warehouse], 1, "cbw"
+        )
+
+    insp.handle_callback(
+        CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_TYPE, category], 2, "cb1"
+    )
+    insp.handle_text(CHAT_ID, {"id": USER_ID}, number, 3)
+
+
 def _session():
     return insp.get_session(CHAT_ID, USER_ID)
+
+
+#: Боевой служебный топик `Inspection` (владелец, 17.10.2026). Именно в нём
+#: теперь живёт `/inspection`, и именно он не определяет склад сам по себе.
+SERVICE_THREAD_ID = 25189
+
+
+def _error_routing(monkeypatch, mapping=None):
+    """
+    Приводит окружение топиков к **боевому** и ставит источник в служебный топик.
+
+    🔴 **Зачем тестам это нужно.** `error_warehouse_for_thread` в режиме «ни один
+    топик ошибок не настроен» намеренно отдаёт `DEFAULT_WAREHOUSE` — это
+    историческая совместимость (`error_routing_configured`), иначе бот не принял
+    бы ничего вообще. Но **в проде маршрутизация настроена**
+    (`TELEGRAM_TOPIC_ID=2`, `TELEGRAM_TOPIC_ERROR_SP3=318`, служебный 25189),
+    поэтому запрос для служебного топика `Inspection` даёт `None` — и именно это
+    включает вопрос о складе. Тест, оставивший окружение пустым, проверял бы
+    другой режим и «падал бы на конфигурации оператора».
+
+    **Почему вместе с топиками настраивается источник.** Барьер
+    `_output_topic_allowed` — последняя линия защиты бота, и обходить его в
+    тестах нельзя. Боевой ответ уходит в 25189; он разрешён на отправку лишь
+    потому, что `service` теперь в `allowed_output_topics()`. Здесь это и
+    проверяется попутно: если `service` из списка убрать, ответы «уйдут в
+    никуда» и тесты это заметят (отправок просто не будет).
+
+    **Подмена — только через `monkeypatch`.** Мутировать `bot.TOPIC_RAW` вручную
+    нельзя: это общий словарь модуля, и `clear()` в одном тесте утёк бы в
+    следующие (проверено: ломало диспетчерские тесты ниже по файлу).
+    """
+    monkeypatch.setattr(bot, "TOPIC_RAW", dict(mapping or {
+        "error": "2",
+        "error:SMALL-P3": "318",
+        "service": str(SERVICE_THREAD_ID),
+    }))
+    monkeypatch.setattr(bot, "TELEGRAM_TOPIC_ID", 2)
+    monkeypatch.setattr(bot, "TELEGRAM_TOPIC_NAME", "")
+    # Кэш разрешённых топиков пересчитывается от подменённого `TOPIC_RAW`.
+    monkeypatch.setattr(bot, "_ALLOWED_OUTPUT_TOPICS", set())
+    # Источник ответа — служебный топик: как `/inspection` в `Inspection`.
+    #
+    # Подменяем именно `_reply_thread`, а не thread-local `_origin_thread`:
+    # ответы в тестах уходят через `_send`, который при пустом `thread_id`
+    # спрашивает этот помощник. Подмена чистая — `monkeypatch` вернёт функцию
+    # обратно сам, и состояние не утечёт в следующие тесты.
+    monkeypatch.setattr(
+        bot, "_reply_thread",
+        lambda chat_id, thread_id=None: (
+            thread_id if thread_id is not None else SERVICE_THREAD_ID
+        ),
+    )
 
 
 def _created_inspection(items=None):
@@ -983,6 +1066,327 @@ class TestDispatcher:
         used = {"dt", "ed", "rf", "em", "w", "st"}
         assert insp.CB_PREFIX not in used
 
+    def test_warehouse_action_is_nested_under_ins(self) -> None:
+        """🔴 `CB_WAREHOUSE = "w"` — действие **внутри** `ins`, а не префикс.
+
+        Совпадение буквы с чужим префиксом `w` (`_handle_warehouse_choice`)
+        безопасно ровно потому, что диспетчер смотрит **первый** сегмент
+        `callback_data`: наш данные начинаются с `ins:`, и чужой обработчик их
+        не увидит. Проверяем и то, и другое: буква «w» занята как префикс, но
+        наши кнопки так не начинаются.
+        """
+        assert insp.CB_WAREHOUSE == "w"
+        keyboard = insp.warehouse_keyboard(
+            insp.Session(chat_id=1, user_id=2, warehouses=["GLP-C", "SMALL-P3"])
+        )
+        flat = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+        assert "ins:w:GLP-C" in flat
+        assert "ins:w:SMALL-P3" in flat
+        for data in flat:
+            assert data.split(":")[0] == "ins", data
+
+
+# ============================================================
+# ШАГ 0: СКЛАД (17.10.2026)
+# ============================================================
+
+class TestWarehouseStep:
+    """Склад спрашивается **только там, где топик его не задал**.
+
+    Владелец перенёс `/inspection` в служебный топик `Inspection` (25189). Там
+    склад не выводится из топика, и молчаливая привязка к `DEFAULT_WAREHOUSE`
+    (GLP-C) искала бы станцию SMALL-P3 не на том складе — номера повторяются
+    между складами.
+    """
+
+    def _employee(self, monkeypatch, **fields):
+        import telegram_store
+
+        card = {
+            "user_name": "Felipe Dominguez",
+            "card_id": 60143682,
+            "auth_id": AUTH_ID,
+            "warehouse": "GLP-C",
+            "role": "worker",
+            "is_leader": False,
+        }
+        card.update(fields)
+        monkeypatch.setattr(
+            telegram_store, "get_employee_context",
+            lambda *a, **k: ("Felipe Dominguez", dict(card)),
+        )
+
+    def test_service_topic_asks_for_warehouse_first(self, rec, monkeypatch) -> None:
+        """🔴 В служебном топике первый вопрос — склад, а не тип.
+
+        Ключ к правке владельца: «добавь вопрос что за склад ещё».
+        Проверяется на **настоящем** `error_warehouse_for_thread`: маршрутизация
+        топиков ошибок настроена, а вход — не из топика ошибок (как боевой 25189).
+        """
+        _error_routing(monkeypatch)
+        # Администратор: доступны оба склада, значит вопрос задаётся.
+        self._employee(monkeypatch, role="admin", warehouse="GLP-C")
+
+        assert bot.error_warehouse_for_thread(CHAT_ID, 25189) is None, (
+            "предусловие: служебный топик не должен определять склад"
+        )
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        session = _session()
+        assert session is not None
+        assert session.step == insp.STEP_WAREHOUSE, (
+            f"первый шаг должен быть склад, а не {session.step}"
+        )
+
+        prompt = rec.sent[0]
+        assert "Which warehouse" in prompt["text"]
+        assert "What do you want to inspect" not in prompt["text"]
+
+        flat = [
+            b["callback_data"]
+            for row in prompt["reply_markup"]["inline_keyboard"]
+            for b in row
+        ]
+        assert "ins:w:GLP-C" in flat
+        assert "ins:w:SMALL-P3" in flat
+        assert "ins:x" in flat, "нет кнопки отмены"
+
+    def test_error_topic_does_not_ask_for_warehouse(self, rec, monkeypatch) -> None:
+        """В топике ошибок склад известен — вопрос не задаётся.
+
+        Лишний шаг замедлял бы работу: человек уже стоит в топике склада, и его
+        ответ очевиден. Проверяется на настоящем резолвере, а не на заглушке.
+        """
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="worker", warehouse="SMALL-P3")
+
+        assert bot.error_warehouse_for_thread(CHAT_ID, 318) == "SMALL-P3"
+
+        # Топик ошибок SMALL-P3: команда пришла оттуда же.
+        monkeypatch.setattr(bot, "_reply_thread", lambda chat_id, thread_id=None: 318)
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        session = _session()
+        assert session is not None
+        assert session.step == insp.STEP_TYPE, "в топике ошибок шага склада быть не должно"
+        assert session.warehouse == "SMALL-P3", "склад не взят из топика ошибок"
+        assert "What do you want to inspect" in rec.sent[0]["text"]
+
+    def test_choosing_warehouse_shows_type_next(self, rec, monkeypatch) -> None:
+        """После выбора склада идёт выбор типа — порядок шагов сохранён."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="admin")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_WAREHOUSE, "SMALL-P3"], 1, "cbw"
+        )
+
+        session = _session()
+        assert session.step == insp.STEP_TYPE
+        assert session.warehouse == "SMALL-P3"
+
+        prompt = rec.sent[-1]
+        assert "What do you want to inspect" in prompt["text"]
+        flat = [
+            b["callback_data"]
+            for row in prompt["reply_markup"]["inline_keyboard"]
+            for b in row
+        ]
+        assert "ins:t:robot" in flat
+
+    def test_chosen_warehouse_reaches_the_lookup(self, rec, monkeypatch) -> None:
+        """🔴 Выбранный склад уходит **в реальный поиск** номера.
+
+        Проверяется не строка в исходнике и не заглушка, а запрос, который
+        уехал бы в справочник: перехватывается `sendToDataBase.rest_get` под
+        **настоящей** функцией `validation.find_equipment`. На проверке «по
+        исходнику» в проекте уже обжигались: из запроса убрали категорию, и все
+        тесты остались зелёными.
+        """
+        import sendToDataBase
+
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="admin")
+
+        captured = []
+
+        def fake_rest_get(table, params=None, optional=False):
+            captured.append({"table": table, "params": dict(params or {})})
+            return []
+
+        monkeypatch.setattr(sendToDataBase, "rest_get", fake_rest_get)
+
+        # Возвращаем **настоящую** функцию поиска поверх заглушки фикстуры:
+        # иначе склад в запрос не попадёт вообще, и тест проверял бы заглушку.
+        monkeypatch.setattr(validation, "find_equipment", _REAL_FIND_EQUIPMENT)
+
+        _start_in_service_topic(rec, monkeypatch, warehouse="SMALL-P3", number="13")
+
+        equipment_calls = [
+            call for call in captured if call["table"] == "equipment"
+        ]
+        assert equipment_calls, "реального запроса к справочнику не было"
+        assert equipment_calls[0]["params"].get("warehouse") == "eq.SMALL-P3", (
+            "поиск ушёл не на выбранный склад: "
+            f"{equipment_calls[0]['params']}"
+        )
+
+    def test_buttons_offer_only_known_warehouses(self, rec, monkeypatch) -> None:
+        """В кнопках ровно GLP-C и SMALL-P3 — из `warehouses.WAREHOUSES`."""
+        from warehouses import WAREHOUSES
+
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="manager", warehouse=None)
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        prompt = rec.sent[-1]
+        labels = [
+            b["text"]
+            for row in prompt["reply_markup"]["inline_keyboard"]
+            for b in row
+            if b["callback_data"] != "ins:x"
+        ]
+        assert labels == list(WAREHOUSES.values()), labels
+        assert labels == ["GLP-C", "SMALL-P3"], labels
+
+
+class TestWarehouseAccess:
+    """🔴 Бот предлагает **только доступные** склады — как решает API.
+
+    `InspectionService.create_inspection` сверяет склад оборудования с правами
+    токена (`can_access_warehouse`): работник и лидер видят только свой склад,
+    любой — только админ/менеджер. Если предложить чужой склад, человек пройдёт
+    весь осмотр с фото и получит `403` на создании — работа пропадёт в конце.
+    """
+
+    def _employee(self, monkeypatch, **fields):
+        import telegram_store
+
+        card = {"user_name": "Felipe", "auth_id": AUTH_ID, "warehouse": "GLP-C"}
+        card.update(fields)
+        monkeypatch.setattr(
+            telegram_store, "get_employee_context",
+            lambda *a, **k: ("Felipe", dict(card)),
+        )
+
+    def _choices(self, monkeypatch, **fields):
+        employee = {"warehouse": "GLP-C", "role": "worker"}
+        employee.update(fields)
+        return insp._warehouse_choices(employee, None)
+
+    def test_worker_gets_only_own_warehouse(self, monkeypatch) -> None:
+        assert self._choices(monkeypatch, role="worker", warehouse="GLP-C") == ["GLP-C"]
+        assert self._choices(monkeypatch, role="worker", warehouse="SMALL-P3") == ["SMALL-P3"]
+
+    def test_shift_leader_gets_only_own_warehouse(self, monkeypatch) -> None:
+        """🔴 Лидер — **только свой** склад (требование владельца в API)."""
+        assert self._choices(monkeypatch, role="shift leader", warehouse="GLP-C") == ["GLP-C"]
+
+    def test_admin_and_manager_get_both(self, monkeypatch) -> None:
+        assert self._choices(monkeypatch, role="admin", warehouse="GLP-C") == [
+            "GLP-C", "SMALL-P3",
+        ]
+        assert self._choices(monkeypatch, role="manager", warehouse=None) == [
+            "GLP-C", "SMALL-P3",
+        ]
+
+    def test_role_list_matches_api(self) -> None:
+        """Список ролей совпадает с `ADMIN_ROLES` API.
+
+        Бот не импортирует код API (другое приложение), поэтому список
+        продублирован — тест сторожит расхождение, если оно появится.
+        """
+        from pathlib import Path
+
+        api = Path(
+            "/Users/nookon/Desktop/tk-assist-api/app/core/permissions.py"
+        )
+        if not api.exists():  # pragma: no cover — API рядом не всегда
+            pytest.skip("tk-assist-api is not next to LarkBot")
+
+        text = api.read_text(encoding="utf-8")
+        for role in insp.ADMIN_ROLES:
+            assert f'"{role}"' in text, f"{role} больше не упомянут в permissions.py"
+
+    def test_single_available_warehouse_is_not_asked(self, rec, monkeypatch) -> None:
+        """Один доступный склад — вопроса нет: выбор из одного лишь замедляет."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="worker", warehouse="SMALL-P3")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        session = _session()
+        assert session.step == insp.STEP_TYPE, "шаг склада задан без необходимости"
+        assert session.warehouse == "SMALL-P3"
+        assert "What do you want to inspect" in rec.sent[0]["text"]
+
+    def test_worker_never_sees_the_other_warehouse(self, rec, monkeypatch) -> None:
+        """Работник GLP-C не видит SMALL-P3 — иначе получил бы 403 в конце."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="worker", warehouse="GLP-C")
+
+        # Топик склад не задал, доступен один склад — вопроса нет вовсе.
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        texts = "\n".join(m["text"] for m in rec.sent)
+        assert "Which warehouse" not in texts
+        assert _session().warehouse == "GLP-C"
+
+    def test_worker_with_unknown_own_warehouse_is_refused(self, rec, monkeypatch) -> None:
+        """Склад карточки не обслуживается ботом — честный отказ, не поиск."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="worker", warehouse="PNT-A")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert _session() is None
+        assert "no warehouse" in rec.sent[0]["text"].lower() or (
+            "warehouse" in rec.sent[0]["text"].lower()
+        )
+
+    def test_warehouse_cancel_works_on_the_new_step(self, rec, monkeypatch) -> None:
+        """`/cancel` работает на шаге склада, как и на любом другом."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="admin")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+        assert _session().step == insp.STEP_WAREHOUSE
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_CANCEL], 2, "cbx"
+        )
+
+        assert _session() is None
+        assert rec.answered[-1]["text"] == "Cancelled"
+
+    def test_unknown_warehouse_callback_is_refused(self, rec, monkeypatch) -> None:
+        """Кнопка устаревшего сообщения с чужим складом не подменяет выбор."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="admin")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_WAREHOUSE, "PNT-A"], 1, "cbw"
+        )
+
+        assert _session().step == insp.STEP_WAREHOUSE, "чужой склад принят"
+        assert rec.answered[-1]["text"] == "Unknown warehouse"
+
+    def test_text_step_does_not_hijack_the_warehouse_step(self, rec, monkeypatch) -> None:
+        """Свободный текст на шаге склада не принимается — выбор только кнопкой."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="admin")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert insp.handle_text(CHAT_ID, {"id": USER_ID}, "GLP-C", 1) is False
+        assert _session().step == insp.STEP_WAREHOUSE
+
+
 
 class TestEndToEndDispatch:
     """Сквозной путь через `handle_update` — как это видит Telegram.
@@ -1260,6 +1664,188 @@ class TestTypeRuleWiring:
         assert "def find_equipment" not in text, (
             "в inspection_api появилась вторая реализация поиска устройства — "
             "она разойдётся с equipment_intake.validation"
+        )
+
+
+# ============================================================
+# СЛУЖЕБНЫЙ ТОПИК: ОСМОТР РАБОТАЕТ, ОШИБКА — НЕТ
+# ============================================================
+
+class TestServiceTopicDispatch:
+    """`/inspection` в служебном топике `Inspection` (thread 25189).
+
+    🔴 **Две вещи, которые легко сломать одной правкой.**
+
+    1. **Осмотр из служебного топика должен работать полностью** — команда,
+       кнопки, номер, фото пункта. Топик принимается `is_shared_topic`, а
+       **ответ** уходит только потому, что `service` добавлен в
+       `allowed_output_topics()`. Раньше ответ отклонил бы барьер отправки, и
+       человек видел бы молчание при «сработавшей» кнопке.
+    2. **Фото ОШИБКИ из служебного топика по-прежнему отвергается.**
+       `error_warehouse_for_thread` для не-топика ошибок возвращает `None`, и
+       ошибка из службы не должна записаться на `DEFAULT_WAREHOUSE` (GLP-C).
+
+    Это **разные ветки** диспетчера: сначала `_inspection_pending()` (осмотр),
+    и только потом проверка топика ошибок. Тесты сторожат именно этот порядок.
+    """
+
+    SERVICE_THREAD = SERVICE_THREAD_ID
+
+    def _gates(self, monkeypatch):
+        """Боевое окружение топиков + служебный топик разрешён на отправку."""
+        monkeypatch.setattr(bot, "ALLOWED_CHAT_IDS", set())
+        monkeypatch.setattr(bot, "LISTEN_TOPIC_IDS", set())
+        monkeypatch.setattr(bot, "LISTEN_TOPIC_NAMES", set())
+        monkeypatch.setattr(bot, "_delete_user_message", lambda *a, **k: True)
+        monkeypatch.setattr(bot, "_send_action", lambda *a, **k: None)
+        _error_routing(monkeypatch)
+
+        # Администратор: доступны оба склада, значит в службе спросят склад.
+        import telegram_store
+
+        monkeypatch.setattr(
+            telegram_store, "get_employee_context",
+            lambda *a, **k: ("Dmytro", {
+                "user_name": "Dmytro", "auth_id": AUTH_ID,
+                "warehouse": "GLP-C", "role": "admin", "is_leader": True,
+            }),
+        )
+
+    def _message(self, text=None, photo=False, message_id=900, thread_id=None):
+        thread_id = self.SERVICE_THREAD if thread_id is None else thread_id
+        message = {
+            "message_id": message_id,
+            "from": {"id": USER_ID, "is_bot": False, "username": "t",
+                     "first_name": "T"},
+            "chat": {"id": CHAT_ID, "type": "supergroup"},
+            "date": int(__import__("time").time()),
+            "message_thread_id": thread_id,
+            "is_topic_message": True,
+        }
+
+        if text is not None:
+            message["text"] = text
+
+        if photo:
+            message["photo"] = [
+                {"file_id": "small", "file_unique_id": "s"},
+                {"file_id": "big", "file_unique_id": "b"},
+            ]
+
+        return {"update_id": message_id, "message": message}
+
+    def _callback(self, data, message_id=901):
+        return {
+            "update_id": message_id,
+            "callback_query": {
+                "id": f"cb{message_id}",
+                "from": {"id": USER_ID, "is_bot": False, "username": "t",
+                         "first_name": "T"},
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": CHAT_ID, "type": "supergroup"},
+                    "from": {"id": 1, "is_bot": True},
+                    "message_thread_id": self.SERVICE_THREAD,
+                },
+                "data": data,
+            },
+        }
+
+    def test_service_topic_is_shared_and_allowed_to_answer(self, monkeypatch) -> None:
+        """🔴 Топик 25189 принимается **и** разрешён на отправку.
+
+        Первое давал `is_shared_topic` и раньше, второго не было — именно это и
+        чинилось (`allowed_output_topics`).
+        """
+        _error_routing(monkeypatch)
+
+        assert bot.is_shared_topic(CHAT_ID, self.SERVICE_THREAD) is True
+        # `topic_allowed` отвечает на другой вопрос («брать ли входящее») и может
+        # быть False — в диспетчере участвует пара `allowed or shared`.
+        assert bot._output_topic_allowed(CHAT_ID, self.SERVICE_THREAD) is True, (
+            "ответ в служебный топик отклонён: осмотр ответил бы молчанием"
+        )
+
+    def test_foreign_topic_is_still_silent(self, monkeypatch) -> None:
+        """Чужой топик по-прежнему закрыт на отправку — защита не ослаблена."""
+        _error_routing(monkeypatch)
+
+        assert bot._output_topic_allowed(CHAT_ID, 777) is False
+        assert bot._output_topic_allowed(CHAT_ID, None) is False
+        assert not bot.is_shared_topic(CHAT_ID, 777)
+
+    def test_error_photo_is_rejected_in_the_service_topic(self, monkeypatch) -> None:
+        """🔴 Фото **ошибки** из служебного топика не принимается.
+
+        Топик ошибок не определён → `error_warehouse_for_thread` отдаёт `None`,
+        и приём ошибок обязан отказаться: иначе запись ушла бы на
+        `DEFAULT_WAREHOUSE` (GLP-C) не с того склада.
+        """
+        _error_routing(monkeypatch)
+
+        assert bot.error_warehouse_for_thread(CHAT_ID, self.SERVICE_THREAD) is None
+
+        # Диалога осмотра нет — фото идёт в приём ошибок и получает отказ.
+        assert insp.peek_session(CHAT_ID, USER_ID) is None
+
+        import unittest.mock as mock
+
+        monkeypatch.setattr(bot, "ALLOWED_CHAT_IDS", set())
+        with mock.patch.object(bot, "handle_photo") as photo, \
+             mock.patch.object(bot, "_handle_wrong_topic") as wrong:
+            bot._handle_update_inner(
+                self._message(photo=True, message_id=3101), "TestBot"
+            )
+
+        photo.assert_not_called()
+        assert wrong.called, "оператору не сказали, что топик не тот"
+
+    def test_inspection_photo_works_in_the_service_topic(self, rec, monkeypatch) -> None:
+        """🔴 Фото **пункта осмотра** из служебного топика доходит до диалога.
+
+        Порядок веток решает: осмотр проверяется **раньше** топика ошибок,
+        иначе снимок пункта ушёл бы в Lark как новая ошибка.
+        """
+        self._gates(monkeypatch)
+
+        monkeypatch.setattr(bot.tg, "get_file", lambda file_id: "photos/f.jpg")
+        monkeypatch.setattr(
+            bot.tg, "download_file", lambda path, dest: _touch(dest)
+        )
+        monkeypatch.setattr(
+            validation, "find_equipment",
+            lambda kind, warehouse, code: dict(ROBOT),
+        )
+
+        bot.handle_update(self._message(text="/inspection", message_id=2001), "TestBot")
+        assert _session() is not None, "команда не дошла из служебного топика"
+        assert _session().step == insp.STEP_WAREHOUSE
+
+        bot.handle_update(self._callback("ins:w:GLP-C", message_id=2002), "TestBot")
+        bot.handle_update(self._callback("ins:t:robot", message_id=2003), "TestBot")
+        bot.handle_update(self._message(text="3780", message_id=2004), "TestBot")
+
+        assert _session().step == insp.STEP_TEMPLATE
+
+        _choose_template(rec, monkeypatch)
+        bot.handle_update(self._callback("ins:k:1", message_id=2005), "TestBot")
+
+        saved = []
+        monkeypatch.setattr(
+            insp, "upload_item_photo", lambda *a, **k: saved.append(1) or {}
+        )
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+
+        bot.handle_update(self._message(photo=True, message_id=2006), "TestBot")
+
+        assert saved, "фото пункта не дошло — его перехватил приём ошибок"
+        assert _session().item_index == 1
+
+        # Ответы ушли именно в служебный топик, а не в чужой.
+        assert rec.sent, "бот не отправил ни одного сообщения"
+        assert all(m["thread_id"] == self.SERVICE_THREAD for m in rec.sent), (
+            "ответ ушёл не в служебный топик: "
+            f"{[m['thread_id'] for m in rec.sent]}"
         )
 
 

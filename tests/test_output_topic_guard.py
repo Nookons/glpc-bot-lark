@@ -68,14 +68,25 @@ dotenv.load_dotenv = lambda *a, **k: False  # запрет подмешиван�
 import telegram_bot as bot
 allowed = sorted(bot.allowed_output_topics())
 print("allowed", allowed)
-for tid in (2, 318, 320, 319, 321, 777, None):
+for tid in (2, 318, 320, 319, 321, 25189, 777, None):
     print("check", tid, bot._output_topic_allowed(-100, tid))
 """
 
 
 class TestBotWritesOnlyWhereItBelongs:
     def test_foreign_topics_are_refused(self) -> None:
-        """Чужие топики (в том числе Service 321) — молчание."""
+        """Чужие топики — молчание; обслуживаемые, включая Service, — можно.
+
+        🔴 **Ожидание по Service (321) изменено 17.10.2026 владельцем.**
+        Раньше служебный топик был закрыт на отправку. Затем владелец перенёс
+        туда `/inspection` (в проде это топик `Inspection`, id 25189, переменная
+        `TELEGRAM_TOPIC_SERVICE`), и закрытый Service означал бы, что команда
+        обрабатывается, а ответ уходит «в никуда» — человек видит молчание.
+        Служебный топик такой же обслуживаемый, как статусы и статистика.
+
+        **Защита при этом не ослаблена:** произвольный топик (777) и General
+        (`None`) по-прежнему запрещены — это и есть суть барьера.
+        """
         env = {
             "TELEGRAM_TOPIC_ID": "2",
             "TELEGRAM_TOPIC_ERROR_SP3": "318",
@@ -91,15 +102,41 @@ class TestBotWritesOnlyWhereItBelongs:
         )
         allowed = lines["allowed"]
 
-        # Обслуживаемые топики разрешены
-        for ok_topic in ("2", "318", "320", "319"):
+        # Обслуживаемые топики разрешены — включая служебный.
+        for ok_topic in ("2", "318", "319", "320", "321"):
             assert f"check {ok_topic} True" in res["out"], f"{ok_topic} должен быть разрешён"
 
-        # Service (321) и произвольный (777) — запрещены
-        assert "321" not in allowed, f"Service-топик не должен быть разрешён: {allowed}"
-        assert "check 321 False" in res["out"], "321 (Service) обязан быть запрещён"
+        assert "321" in allowed, f"Service-топик обязан быть разрешён: {allowed}"
+
+        # Произвольный и General — запрещены.
+        assert "777" not in allowed, f"чужой топик не должен быть разрешён: {allowed}"
         assert "check 777 False" in res["out"], "произвольный топик обязан быть запрещён"
         assert "check None False" in res["out"], "General — молчание"
+
+    def test_service_topic_from_production_is_allowed(self) -> None:
+        """🔴 Боевой служебный топик `Inspection` (25189) обязан быть разрешён.
+
+        **Это и есть дефект, который правился.** Владелец выставил
+        `TELEGRAM_TOPIC_SERVICE=25189`, топик принимал команду
+        (`is_shared_topic`), но `allowed_output_topics()` его не содержал
+        (было `[2, 318, 319, 320]`) — то есть ответ отправить было нельзя, и
+        `/inspection` в этом топике молчал бы.
+        """
+        env = {
+            "TELEGRAM_TOPIC_ID": "2",
+            "TELEGRAM_TOPIC_ERROR_SP3": "318",
+            "TELEGRAM_TOPIC_STATUS": "319",
+            "TELEGRAM_TOPIC_STATS": "320",
+            "TELEGRAM_TOPIC_SERVICE": "25189",
+        }
+        res = _run_with_env(SNIPPET, env)
+
+        assert res["code"] == 0, res["err"]
+        assert "check 25189 True" in res["out"], (
+            "служебный топик 25189 не разрешён на отправку — осмотр ответил бы "
+            f"молчанием. Вывод: {res['out']}"
+        )
+
 
     def test_unconfigured_bot_is_not_muted(self) -> None:
         """Если топики вовсе не настроены — бот **не** немеет.
