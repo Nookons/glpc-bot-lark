@@ -1152,11 +1152,13 @@ class TestWarehouseStep:
         assert "ins:w:SMALL-P3" in flat
         assert "ins:x" in flat, "нет кнопки отмены"
 
-    def test_error_topic_does_not_ask_for_warehouse(self, rec, monkeypatch) -> None:
-        """В топике ошибок склад известен — вопрос не задаётся.
+    def test_error_topic_is_refused(self, rec, monkeypatch) -> None:
+        """🔴 В топике ошибок команда **отказывает** — она живёт только в `Inspection`.
 
-        Лишний шаг замедлял бы работу: человек уже стоит в топике склада, и его
-        ответ очевиден. Проверяется на настоящем резолвере, а не на заглушке.
+        Требование владельца 17.10.2026: «нужно только в топике что я тебе дал».
+        Отказ **проговаривается вслух**, а не молчанием: молчание выглядело бы
+        как поломка — ровно так `/inspection` уже «не работала», когда топик не
+        был разрешён на отправку.
         """
         _error_routing(monkeypatch)
         self._employee(monkeypatch, role="worker", warehouse="SMALL-P3")
@@ -1164,6 +1166,30 @@ class TestWarehouseStep:
         assert bot.error_warehouse_for_thread(CHAT_ID, 318) == "SMALL-P3"
 
         # Топик ошибок SMALL-P3: команда пришла оттуда же.
+        monkeypatch.setattr(bot, "_reply_thread", lambda chat_id, thread_id=None: 318)
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert _session() is None, "в топике ошибок диалог начинаться не должен"
+        assert "Inspection topic" in rec.sent[0]["text"], rec.sent[0]["text"]
+
+    def test_error_topic_still_skips_the_question_when_service_is_unset(
+        self, rec, monkeypatch
+    ) -> None:
+        """Без `TELEGRAM_TOPIC_SERVICE` ограничение снято — и склад берётся из топика.
+
+        🔴 **Почему эта ветка осталась.** Если служебный топик не настроен,
+        ограничивать команду нечем: иначе на свежей установке она стала бы
+        мёртвой везде и это выглядело бы как «бот не отвечает». В этом режиме
+        работает прежняя логика: в топике ошибок склад известен из топика, и
+        вопрос не задаётся — лишний шаг замедлял бы работу.
+        """
+        _error_routing(monkeypatch)
+        # Снимаем настройку служебного топика — только для этого теста.
+        monkeypatch.setattr(bot, "topic_thread", lambda kind, chat_id=None: None)
+        self._employee(monkeypatch, role="worker", warehouse="SMALL-P3")
+
+        assert bot.error_warehouse_for_thread(CHAT_ID, 318) == "SMALL-P3"
         monkeypatch.setattr(bot, "_reply_thread", lambda chat_id, thread_id=None: 318)
 
         insp.start(CHAT_ID, {"id": USER_ID}, None)
@@ -1254,13 +1280,17 @@ class TestWarehouseStep:
         assert labels == ["GLP-C", "SMALL-P3"], labels
 
 
-class TestWarehouseAccess:
-    """🔴 Бот предлагает **только доступные** склады — как решает API.
+class TestWarehouseButtons:
+    """🔴 Кнопки склада — **всегда две, без роли и без чтения карточки**.
 
-    `InspectionService.create_inspection` сверяет склад оборудования с правами
-    токена (`can_access_warehouse`): работник и лидер видят только свой склад,
-    любой — только админ/менеджер. Если предложить чужой склад, человек пройдёт
-    весь осмотр с фото и получит `403` на создании — работа пропадёт в конце.
+    Решение владельца 17.10.2026, дословно: «пускай просто будет две кнопки и
+    всё, не с сервера». До этого список вычислялся по роли работника и повторял
+    правило API `can_access_warehouse`.
+
+    Проверяется именно то, что просили: **две кнопки у всех**, независимо от
+    роли и склада в карточке. Отказ по чужому складу теперь приходит от API —
+    и приходит **сразу после выбора шаблона** (осмотр создаётся там же), а не
+    после пройденных пунктов с фото. Это и делает размен допустимым.
     """
 
     def _employee(self, monkeypatch, **fields):
@@ -1273,80 +1303,89 @@ class TestWarehouseAccess:
             lambda *a, **k: ("Felipe", dict(card)),
         )
 
-    def _choices(self, monkeypatch, **fields):
-        employee = {"warehouse": "GLP-C", "role": "worker"}
-        employee.update(fields)
-        return insp._warehouse_choices(employee, None)
+    def test_choices_are_always_the_bot_warehouses(self) -> None:
+        """Список кнопок не зависит ни от чего, кроме `TELEGRAM_WAREHOUSES`."""
+        from warehouses import WAREHOUSES
 
-    def test_worker_gets_only_own_warehouse(self, monkeypatch) -> None:
-        assert self._choices(monkeypatch, role="worker", warehouse="GLP-C") == ["GLP-C"]
-        assert self._choices(monkeypatch, role="worker", warehouse="SMALL-P3") == ["SMALL-P3"]
+        assert insp._warehouse_choices() == list(WAREHOUSES.values())
+        assert insp._warehouse_choices() == ["GLP-C", "SMALL-P3"]
 
-    def test_shift_leader_gets_only_own_warehouse(self, monkeypatch) -> None:
-        """🔴 Лидер — **только свой** склад (требование владельца в API)."""
-        assert self._choices(monkeypatch, role="shift leader", warehouse="GLP-C") == ["GLP-C"]
+    def test_choices_need_no_arguments(self) -> None:
+        """У функции нет аргументов — роль и карточка в неё не попадают.
 
-    def test_admin_and_manager_get_both(self, monkeypatch) -> None:
-        assert self._choices(monkeypatch, role="admin", warehouse="GLP-C") == [
-            "GLP-C", "SMALL-P3",
-        ]
-        assert self._choices(monkeypatch, role="manager", warehouse=None) == [
-            "GLP-C", "SMALL-P3",
-        ]
-
-    def test_role_list_matches_api(self) -> None:
-        """Список ролей совпадает с `ADMIN_ROLES` API.
-
-        Бот не импортирует код API (другое приложение), поэтому список
-        продублирован — тест сторожит расхождение, если оно появится.
+        Это сторож решения владельца: если кто-то снова начнёт передавать сюда
+        сотрудника, тест упадёт и заставит обсудить это явно.
         """
-        from pathlib import Path
+        import inspect as _inspect
 
-        api = Path(
-            "/Users/nookon/Desktop/tk-assist-api/app/core/permissions.py"
-        )
-        if not api.exists():  # pragma: no cover — API рядом не всегда
-            pytest.skip("tk-assist-api is not next to LarkBot")
+        params = _inspect.signature(insp._warehouse_choices).parameters
+        assert list(params) == [], f"у выбора складов появились аргументы: {list(params)}"
 
-        text = api.read_text(encoding="utf-8")
-        for role in insp.ADMIN_ROLES:
-            assert f'"{role}"' in text, f"{role} больше не упомянут в permissions.py"
+    def test_worker_sees_both_warehouses(self, rec, monkeypatch) -> None:
+        """🔴 Работник GLP-C видит и SMALL-P3 — владелец просил две кнопки.
 
-    def test_single_available_warehouse_is_not_asked(self, rec, monkeypatch) -> None:
-        """Один доступный склад — вопроса нет: выбор из одного лишь замедляет."""
-        _error_routing(monkeypatch)
-        self._employee(monkeypatch, role="worker", warehouse="SMALL-P3")
-
-        insp.start(CHAT_ID, {"id": USER_ID}, None)
-
-        session = _session()
-        assert session.step == insp.STEP_TYPE, "шаг склада задан без необходимости"
-        assert session.warehouse == "SMALL-P3"
-        assert "What do you want to inspect" in rec.sent[0]["text"]
-
-    def test_worker_never_sees_the_other_warehouse(self, rec, monkeypatch) -> None:
-        """Работник GLP-C не видит SMALL-P3 — иначе получил бы 403 в конце."""
+        Раньше здесь проверялось обратное. Изменение осознанное: чужой склад
+        упрётся в 403, но уже **на создании осмотра**, а не после фото.
+        """
         _error_routing(monkeypatch)
         self._employee(monkeypatch, role="worker", warehouse="GLP-C")
 
-        # Топик склад не задал, доступен один склад — вопроса нет вовсе.
         insp.start(CHAT_ID, {"id": USER_ID}, None)
 
-        texts = "\n".join(m["text"] for m in rec.sent)
-        assert "Which warehouse" not in texts
-        assert _session().warehouse == "GLP-C"
+        assert _session().step == insp.STEP_WAREHOUSE
+        flat = [
+            b["callback_data"]
+            for row in rec.sent[0]["reply_markup"]["inline_keyboard"]
+            for b in row
+        ]
+        assert "ins:w:GLP-C" in flat
+        assert "ins:w:SMALL-P3" in flat, "работник должен видеть обе кнопки"
 
-    def test_worker_with_unknown_own_warehouse_is_refused(self, rec, monkeypatch) -> None:
-        """Склад карточки не обслуживается ботом — честный отказ, не поиск."""
+    def test_shift_leader_sees_both_warehouses(self, rec, monkeypatch) -> None:
+        """Лидер тоже видит обе — роль на кнопки не влияет."""
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="shift leader", warehouse="GLP-C")
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert _session().step == insp.STEP_WAREHOUSE
+
+    def test_employee_without_warehouse_sees_both(self, rec, monkeypatch) -> None:
+        """Карточка без склада больше не мешает: кнопки есть у всех.
+
+        Раньше такой работник получал отказ («ask a leader to fill in the
+        warehouse»), потому что список строился из карточки. Теперь список
+        складов от карточки не зависит, и осмотр возможен — а отказ по доступу
+        придёт от API, если человек выбрал не свой склад.
+        """
+        _error_routing(monkeypatch)
+        self._employee(monkeypatch, role="worker", warehouse=None)
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert _session().step == insp.STEP_WAREHOUSE
+        flat = [
+            b["callback_data"]
+            for row in rec.sent[0]["reply_markup"]["inline_keyboard"]
+            for b in row
+        ]
+        assert "ins:w:GLP-C" in flat
+        assert "ins:w:SMALL-P3" in flat
+
+    def test_unknown_warehouse_but_not_in_bot_is_still_offered(self, rec, monkeypatch) -> None:
+        """Склад карточки вне бота (`PNT-A`) больше не ломает диалог.
+
+        Раньше это был отказ. Теперь список — склады бота, а `PNT-A` в нём нет:
+        человек видит GLP-C и SMALL-P3 и выбирает, где действительно осматривает.
+        """
         _error_routing(monkeypatch)
         self._employee(monkeypatch, role="worker", warehouse="PNT-A")
 
         insp.start(CHAT_ID, {"id": USER_ID}, None)
 
-        assert _session() is None
-        assert "no warehouse" in rec.sent[0]["text"].lower() or (
-            "warehouse" in rec.sent[0]["text"].lower()
-        )
+        session = _session()
+        assert session is not None, "диалог не должен обрываться из-за склада карточки"
+        assert session.warehouses == ["GLP-C", "SMALL-P3"]
 
     def test_warehouse_cancel_works_on_the_new_step(self, rec, monkeypatch) -> None:
         """`/cancel` работает на шаге склада, как и на любом другом."""
