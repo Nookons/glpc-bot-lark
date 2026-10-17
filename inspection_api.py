@@ -150,6 +150,48 @@ def issue_token(auth_id: str) -> str | None:
         return None
 
 
+def token_failure_reason(auth_id: str) -> str | None:
+    """
+    Почему токен не выпускается — **человеческим текстом**. None — выпускается.
+
+    🔴 **Зачем отдельная функция.** Раньше единственное сообщение обвиняло
+    `auth_id`:
+
+    > Your Telegram account is not linked to a system user (no auth_id)
+
+    А `issue_token` возвращает `None` по **четырём** разным причинам: нет
+    `auth_id`, нет секрета `SUPABASE_JWT_SECRET`, нет библиотеки PyJWT или
+    секрет не подходит для HS256.
+
+    Владелец 17.10.2026 получил это сообщение, хотя **и привязка, и `auth_id`
+    были на месте** — не хватало библиотеки PyJWT в контейнере (её не было в
+    `requirements.txt`, а локально она стояла). По такому тексту человек пошёл бы
+    чинить карточку сотрудника, то есть **не туда**.
+
+    Диагноз обязан указывать на настоящую причину — иначе он вреднее молчания.
+    """
+    if not auth_id:
+        return (
+            "Your employee card has no `auth_id`, so an inspection can't be "
+            "attributed to you. Ask a leader to link your card to a system user."
+        )
+
+    if not JWT_SECRET:
+        return (
+            "The bot can't sign an inspection token: `SUPABASE_JWT_SECRET` is "
+            "not set on the bot. Ask an administrator to add it."
+        )
+
+    if _import_jwt() is None:
+        return (
+            "The bot can't sign an inspection token: the PyJWT library is not "
+            "installed in the bot's environment. Ask an administrator to "
+            "install it (it is listed in requirements.txt)."
+        )
+
+    return None
+
+
 def _error_text(response) -> str:
     """
     Текст ошибки API, пригодный для человека.
@@ -193,9 +235,14 @@ def _request(
     token = issue_token(auth_id)
 
     if not token:
+        # 🔴 **Причину называем ту, что есть на самом деле.**
+        #
+        # Раньше здесь стоял текст только про `auth_id` — и он вводил в
+        # заблуждение, когда `auth_id` был, а не хватало библиотеки (реальный
+        # случай владельца 17.10.2026). `token_failure_reason` различает причины.
         raise InspectionApiUnavailable(
-            "Your Telegram account is not linked to a system user "
-            "(no auth_id) — inspections are unavailable"
+            token_failure_reason(auth_id)
+            or "Inspections are unavailable: the bot could not sign a token"
         )
 
     url = f"{API_BASE}{path}"

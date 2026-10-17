@@ -1915,3 +1915,91 @@ def _write_photo(monkeypatch) -> str:
         handle.write(b"\xff\xd8\xff\xe0" + b"0" * 32)
 
     return path
+
+
+# ============================================================
+# ТОКЕН И ЕГО ЗАВИСИМОСТИ (17.10.2026)
+# ============================================================
+
+class TestTokenDependencies:
+    """🔴 Осмотр не должен обвинять карточку работника, когда виноват не он.
+
+    Реальный случай владельца 17.10.2026: в Telegram пришло
+
+        ⚠️ Your Telegram account is not linked to a system user (no auth_id)
+
+    хотя **и привязка, и `auth_id` были на месте**. Не хватало библиотеки
+    **PyJWT** в контейнере бота: локально она стояла (её поставили руками при
+    разработке), а в `requirements.txt` её не было — и `Dockerfile` ставит
+    только этот файл. `issue_token` возвращал `None`, а сообщение обвиняло
+    `auth_id`.
+
+    Цена ошибки: человек пошёл бы чинить **карточку сотрудника**, то есть не туда.
+    """
+
+    def test_pyjwt_is_declared_in_requirements(self) -> None:
+        """PyJWT объявлен в `requirements.txt` — иначе прод не подпишет токен.
+
+        Это **сторож упаковки**, а не кода: локально библиотека может стоять, и
+        все тесты будут зелёными, а контейнер соберётся без неё. Именно так
+        дефект и дожил до прода.
+        """
+        from pathlib import Path
+
+        requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
+        text = requirements.read_text(encoding="utf-8").lower()
+
+        assert "pyjwt" in text, (
+            "PyJWT не объявлен в requirements.txt — контейнер бота соберётся "
+            "без него, и /inspection не сможет выпустить токен"
+        )
+
+    def test_pyjwt_is_importable_here(self) -> None:
+        """И он действительно импортируется — объявление соответствует установке."""
+        assert inspection_api._import_jwt() is not None
+
+    def test_missing_library_names_the_library_not_the_card(self, monkeypatch) -> None:
+        """🔴 Нет библиотеки — сообщение говорит про библиотеку, не про `auth_id`."""
+        monkeypatch.setattr(inspection_api, "_import_jwt", lambda: None)
+
+        reason = inspection_api.token_failure_reason("79fdec66-66a5-4935-9d22-efbc15a2e3e8")
+
+        assert reason is not None
+        assert "PyJWT" in reason
+        assert "auth_id" not in reason, (
+            "нельзя обвинять карточку работника, когда причина в библиотеке"
+        )
+
+    def test_missing_secret_names_the_secret(self, monkeypatch) -> None:
+        """Нет секрета — сообщение говорит про секрет, не про карточку."""
+        monkeypatch.setattr(inspection_api, "JWT_SECRET", "")
+
+        reason = inspection_api.token_failure_reason("79fdec66-66a5-4935-9d22-efbc15a2e3e8")
+
+        assert reason is not None
+        assert "SUPABASE_JWT_SECRET" in reason
+        assert "auth_id" not in reason
+
+    def test_missing_auth_id_names_the_card(self) -> None:
+        """А вот когда `auth_id` действительно нет — говорим именно про него."""
+        reason = inspection_api.token_failure_reason("")
+
+        assert reason is not None
+        assert "auth_id" in reason
+
+    def test_working_setup_has_no_reason(self) -> None:
+        """Когда всё на месте, причины нет — и токен выпускается."""
+        auth_id = "79fdec66-66a5-4935-9d22-efbc15a2e3e8"
+
+        assert inspection_api.token_failure_reason(auth_id) is None
+        assert inspection_api.issue_token(auth_id)
+
+    def test_request_raises_with_the_real_reason(self, monkeypatch) -> None:
+        """`_request` не подменяет причину своим текстом про `auth_id`."""
+        monkeypatch.setattr(inspection_api, "_import_jwt", lambda: None)
+        monkeypatch.setattr(inspection_api, "API_BASE", "http://api.test")
+
+        with pytest.raises(inspection_api.InspectionApiUnavailable) as exc:
+            inspection_api._request("GET", "/v1/inspections", "some-auth-id")
+
+        assert "PyJWT" in str(exc.value)
