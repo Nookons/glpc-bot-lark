@@ -1832,7 +1832,7 @@ def clear_pending_status(chat_id, user_id):
         return _pending_status.pop(_pending_key(chat_id, user_id), None)
 
 
-def reasons_keyboard(direction: str, robot_id) -> dict:
+def reasons_keyboard(direction: str, robot_id, last_issue: str = None) -> dict:
     """
     Кнопки с причинами: callback_data несёт всё нужное, состояние не нужно.
 
@@ -1860,10 +1860,35 @@ def reasons_keyboard(direction: str, robot_id) -> dict:
     # «Skip — no description» длиннее прочих и зря сузило бы ряд причин.
     columns = keyboard_layout.columns_for_labels(labels)
 
-    buttons = [
+    buttons = []
+
+    # 🔴 **Последняя ошибка робота — первой кнопкой** (владелец 17.10.2026:
+    # «когда робот офлайн находим его и берём его последнюю ошибку с сервера что
+    # была и предлагаем как причину для офлайна и если окей то пишем её как
+    # причину офлайна если нет то пользователь нажимает other и пишет сам»).
+    #
+    # **Почему первой.** Это ответ, который чаще всего верен: робота выводят из
+    # работы обычно из-за той же неисправности, что зафиксирована последней.
+    # Первая кнопка — та, куда попадает палец, и лишний поиск по списку здесь
+    # стоит времени простоя.
+    #
+    # **Почему отдельным кодом (`last_issue`), а не подстановкой в причину.**
+    # Выбранная кнопка должна попасть в журнал **как есть** — текстом ошибки из
+    # сервера. `last_issue` передаёт её дословно, и в `type_problem` уйдёт
+    # «Went off the road», а не «Abnormal walking» из справочника причин.
+    #
+    # **Кнопка только у офлайна.** Возврат в работу причиной не описывается:
+    # там спрашивают, что сделали, а не почему сломалось.
+    if direction == "offline" and last_issue:
+        buttons.append({
+            "text": f"🛠 {last_issue}"[:60],
+            "callback_data": f"st:{direction}:{robot_id}:last_issue",
+        })
+
+    buttons.extend(
         {"text": label, "callback_data": f"st:{direction}:{robot_id}:{code}"}
         for code, label in reasons
-    ]
+    )
 
     # 🔴 **`max_rows` не ограничиваем — иначе причина молча пропадает.**
     #
@@ -2262,6 +2287,18 @@ def start_status_flow(chat_id, direction: str, robot: dict, warehouse: str = Non
     """Показывает робота и кнопки причин (команду сотрудника бот удалит)."""
     spec = robot_status.DIRECTIONS[direction]
 
+    # 🔴 **Последняя ошибка робота — кандидат в причины** (владелец 17.10.2026).
+    #
+    # Ищем её только для вывода из работы: возврат в работу причиной не
+    # описывается. Сбой чтения не ломает диалог — `last_issue_for_robot`
+    # возвращает `None`, и список причин остаётся прежним.
+    last_issue = None
+
+    if direction == "offline":
+        import journal
+
+        last_issue = journal.last_issue_for_robot(robot.get("id"))
+
     _send(
         chat_id,
         f"{spec['emoji']} Robot {robot.get('robot_number')} · "
@@ -2270,7 +2307,7 @@ def start_status_flow(chat_id, direction: str, robot: dict, warehouse: str = Non
         f"Status: {robot.get('status')} → {spec['new_status']}\n"
         "\n"
         "Choose the reason:",
-        reply_markup=reasons_keyboard(direction, robot.get("id")),
+        reply_markup=reasons_keyboard(direction, robot.get("id"), last_issue),
     )
 
 
@@ -2378,11 +2415,40 @@ def handle_status_callback(callback: dict):
         tg.answer_callback_query(callback_id, "Register first: /reg <Your Name>")
         return
 
-    label = robot_status.reason_label(direction, code)
+    # 🔴 **«Последняя ошибка» — не причина из справочника, а текст с сервера.**
+    #
+    # Владелец 17.10.2026: «берём его последнюю ошибку с сервера что была и
+    # предлагаем как причину… если окей то пишем её как причину офлайна».
+    #
+    # Текст берём **заново с сервера**, а не из callback-данных: между показом
+    # кнопки и нажатием могло пройти время, и в callback нельзя класть длинную
+    # строку (Telegram ограничивает `callback_data` 64 байтами — русский текст
+    # ошибки в него не влез бы). Заодно причина остаётся актуальной: если за это
+    # время пришла новая ошибка, в журнал попадёт она, а не устаревшая.
+    if code == "last_issue":
+        import journal
 
-    if not label:
-        tg.answer_callback_query(callback_id, "Unknown reason")
-        return
+        try:
+            fresh = robot_status.find_robot_by_id(robot_id, strict=True)
+        except robot_status.StatusUnavailable:
+            tg.answer_callback_query(
+                callback_id, "Database unavailable — try again in a minute"
+            )
+            return
+
+        label = journal.last_issue_for_robot((fresh or {}).get("id")) if fresh else None
+
+        if not label:
+            # Ошибку убрали или её не было: кнопка устарела. Честно говорим и не
+            # подставляем ничего от себя — причина офлайна должна быть настоящей.
+            tg.answer_callback_query(callback_id, "No recent error to use")
+            return
+    else:
+        label = robot_status.reason_label(direction, code)
+
+        if not label:
+            tg.answer_callback_query(callback_id, "Unknown reason")
+            return
 
     try:
         robot = robot_status.find_robot_by_id(robot_id, strict=True)

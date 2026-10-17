@@ -8333,3 +8333,121 @@ def test_failed_repair_photo_does_not_become_an_error():
         "снимок поломки ушёл в приём ошибок: робот уже выведен из работы, "
         "второй записи об ошибке быть не должно"
     )
+
+
+# ============================================================
+# ПОСЛЕДНЯЯ ОШИБКА КАК ПРИЧИНА ОФЛАЙНА (17.10.2026)
+# ============================================================
+
+def test_last_issue_is_the_first_reason_button():
+    """🔴 Последняя ошибка робота предлагается **первой** кнопкой.
+
+    Владелец 17.10.2026: «когда робот офлайн находим его и берём его последнюю
+    ошибку с сервера что была и предлагаем как причину для офлайна и если окей
+    то пишем её как причину офлайна если нет то пользователь нажимает other и
+    пишет сам».
+
+    Первой — потому что это чаще всего верный ответ: робота выводят из работы
+    обычно из-за той же неисправности, что зафиксирована последней. Оператор
+    нажимает её, не ища в списке.
+    """
+    keyboard = bot.reasons_keyboard("offline", 3259, "Went off the road")
+    rows = keyboard["inline_keyboard"]
+
+    first = rows[0][0]
+    assert first["text"] == "🛠 Went off the road", first
+    assert first["callback_data"] == "st:offline:3259:last_issue"
+
+    # Справочник причин на месте: «Other» нужен, если ошибка не подходит.
+    all_codes = [b["callback_data"] for row in rows for b in row]
+    assert "st:offline:3259:other" in all_codes, "нет кнопки Other"
+
+
+def test_no_last_issue_keeps_the_keyboard_as_before():
+    """Нет последней ошибки — кнопки как раньше, диалог не ломается.
+
+    Проверено на данных: у **4 из 11** офлайновых роботов ошибок в журнале нет
+    вовсе. Выдумывать им причину нельзя.
+    """
+    keyboard = bot.reasons_keyboard("offline", 3259, None)
+    codes = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+
+    assert not any(c.endswith(":last_issue") for c in codes), (
+        "кнопка последней ошибки появилась без самой ошибки"
+    )
+    assert "st:offline:3259:abnormal_walking" in codes
+
+
+def test_online_has_no_last_issue_button():
+    """У `/online` кнопки последней ошибки нет.
+
+    Возврат в работу причиной не описывается: там спрашивают, **что сделали**,
+    а не почему сломалось. Показать ошибку значило бы предложить неверный ответ.
+    """
+    keyboard = bot.reasons_keyboard("online", 3259, "Went off the road")
+    codes = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+
+    assert not any(c.endswith(":last_issue") for c in codes)
+    assert "st:online:3259:replaced_parts" in codes
+
+
+def test_last_issue_uses_the_server_text_verbatim():
+    """Выбранная ошибка уходит причиной **дословно**, а не подменяется справочником.
+
+    Проверяется через разбор источника: `last_issue` не проходит через
+    `robot_status.reason_label`, иначе «Went off the road» превратилось бы в
+    «Abnormal walking» из справочника причин — и в журнал попала бы не та
+    неисправность.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert 'if code == "last_issue":' in source, "нет отдельной ветки last_issue"
+    assert "journal.last_issue_for_robot" in source, (
+        "ошибка не берётся с сервера тем же правилом, что и везде"
+    )
+
+
+def test_last_issue_reads_the_journal_with_one_rule():
+    """Правило разбора ошибки — из `journal`, а не своя копия.
+
+    Копии расходились: `/top` и рапорт смены показывали **категорию**
+    оборудования вместо неисправности, потому что правило жило в двух местах.
+    """
+    import journal
+
+    assert hasattr(journal, "last_issue_for_robot")
+
+    rows = [
+        {"raw_fault": "Went off the road", "raw_template_title": "Unknown reason"},
+        {"raw_template_title": "Foreign objects on the ground"},
+    ]
+
+    assert journal.meaningful_issue(rows[0]) == "Went off the road", (
+        "raw_fault обязан быть первым: raw_template_title хранит название заготовки"
+    )
+
+
+def test_last_issue_returns_none_instead_of_unknown():
+    """`unknown` не предлагается причиной — это «в журнале нечего взять».
+
+    Показать оператору кнопку «🛠 unknown» значило бы предложить бессмыслицу и
+    записать её в журнал как причину офлайна.
+    """
+    import journal
+
+    original = journal.meaningful_issue
+
+    try:
+        journal.meaningful_issue = lambda row: "unknown"
+        # Читаем через подменённый rest_get: строка «есть», но разобрать нечего.
+        import sendToDataBase
+
+        original_get = sendToDataBase.rest_get
+        sendToDataBase.rest_get = lambda *a, **k: [{"raw_fault": "x"}]
+
+        try:
+            assert journal.last_issue_for_robot(3259) is None
+        finally:
+            sendToDataBase.rest_get = original_get
+    finally:
+        journal.meaningful_issue = original

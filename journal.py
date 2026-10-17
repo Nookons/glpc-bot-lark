@@ -250,3 +250,88 @@ def _first(*values: Any) -> Any:
             return value
 
     return None
+
+
+def last_issue_for_robot(
+    robot_id: Any,
+    warehouse: Any = None,
+    *,
+    limit: int = 1,
+) -> Optional[str]:
+    """
+    Последняя **осмысленная** ошибка робота — или `None`.
+
+    🔴 **Зачем (владелец 17.10.2026):** «когда робот офлайн находим его и берём
+    его последнюю ошибку с сервера что была и предлагаем как причину для офлайна
+    и если окей то пишем её как причину офлайна если нет то пользователь нажимает
+    other и пишет сам».
+
+    **Тип ошибки берётся тем же правилом, что и везде** — `meaningful_issue`.
+    Своя копия логики здесь была бы третьей в проекте, а расхождение копий уже
+    приводило к тому, что `/top` и рапорт смены показывали **категорию**
+    оборудования вместо неисправности. Поэтому правило одно.
+
+    **Склад обязателен.** Номера роботов повторяются между складами (`121`,
+    `122`, `123` есть и в GLP-C, и в SMALL-P3), поэтому поиск только по номеру
+    вернул бы ошибку **чужой машины** — и она попала бы в причину офлайна.
+    Но здесь фильтруем по `robot_id`: это внешний ключ на
+    `robots_maintenance_list`, он однозначен и склада не требует. Параметр
+    `warehouse` оставлен для случая, когда id нет (старые записи).
+
+    **`None` — честный ответ.** У четырёх роботов из одиннадцати офлайновых
+    ошибок в журнале нет вовсе: предлагать им «последнюю ошибку» нечего, и
+    выдумывать причину нельзя. Диалог в этом случае работает как раньше.
+
+    Сбой чтения — тоже `None`: причина офлайна не то место, где стоит падать.
+    """
+    if robot_id in (None, "", 0):
+        if not warehouse:
+            return None
+    else:
+        try:
+            robot_id = int(robot_id)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        from sendToDataBase import rest_get
+    except ImportError:  # pragma: no cover — журнал без базы (тесты)
+        return None
+
+    # 🔴 **`issue_type` в списке колонок быть не должно.**
+    #
+    # Я добавил его по аналогии с `meaningful_issue` — и запрос **падал целиком**
+    # (`PostgREST` отвечает `400` на неизвестную колонку, а `rest_get(...,
+    # optional=True)` возвращает `None`). Снаружи это выглядело как «у робота нет
+    # ошибок»: функция честно возвращала `None`, и **причина офлайна не
+    # предлагалась ни разу**. Найдено проверкой на живых данных, а не тестом.
+    #
+    # В `exceptions` таких колонок нет: `issue_type` переименован в
+    # `equipment_category` (см. `legacy_row`), а `raw_*` — снимок. Правило
+    # `meaningful_issue` читает словарь **уже полученной строки**, и отсутствие
+    # ключа там безопасно; в `select` его просить нельзя.
+    params = {
+        "select": "raw_fault,raw_template_title,reported_error,start_time",
+        "order": "start_time.desc",
+        "limit": str(max(1, int(limit))),
+    }
+
+    if robot_id not in (None, "", 0):
+        params["robot_id"] = f"eq.{robot_id}"
+    else:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get("exceptions", params, optional=True)
+
+    if not rows:
+        return None
+
+    for row in rows:
+        issue = meaningful_issue(row)
+
+        # `unknown` — это «в журнале нечего взять», а не название ошибки.
+        # Предложить его причиной значило бы показать оператору бессмыслицу.
+        if issue and issue != "unknown":
+            return issue
+
+    return None
