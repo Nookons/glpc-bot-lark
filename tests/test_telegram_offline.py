@@ -16,6 +16,8 @@ import signal
 import threading
 import sys
 import tempfile
+import pathlib
+from unittest import mock
 import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -8209,3 +8211,125 @@ def test_queue_queries_name_the_new_columns():
             f"запрос очереди всё ещё просит `robot_number` — такой колонки в "
             f"новой таблице нет: {select!r}"
         )
+
+
+# ============================================================
+# ФОТО РЕМОНТА: ОБЯЗАТЕЛЬНЫЙ robot_id (17.10.2026)
+# ============================================================
+
+def test_repair_photo_insert_carries_robot_id():
+    """🔴 Запись ремонта уходит с `robot_id` — без него вставка падала.
+
+    Дефект из прода 17.10.2026, найденный по логам:
+
+        POST robot_repair_assignments failed: 400 Client Error
+        null value in column "robot_id" of relation "robot_repair_assignments"
+
+    Колонка `robot_id` объявлена `NOT NULL`, а бот передавал только
+    `robot_number` (то, что оператор назвал руками). Поэтому **каждое фото
+    ремонта терялось**: робот выводился из работы, снимок поломки уходил в
+    Storage, а запись ремонта не создавалась. Владелец описал это как
+    «/offline и /online не работает корректно».
+    """
+    posted = []
+
+    def fake_post(table, payload=None, **kwargs):
+        posted.append((table, dict(payload or {})))
+        return {"id": 999}
+
+    # `rest_post`/`rest_get` импортируются **внутри** функции
+    # (`from sendToDataBase import ...`), поэтому подменяем их в самом модуле
+    # `sendToDataBase`, а не в `telegram_bot`: атрибута `bot.rest_post` нет.
+    import sendToDataBase
+
+    original_post = sendToDataBase.rest_post
+    original_get = sendToDataBase.rest_get
+    sendToDataBase.rest_post = fake_post
+    sendToDataBase.rest_get = lambda *a, **k: []
+
+    try:
+        with mock.patch(
+            "supabase_storage.upload_photo_and_get_url",
+            lambda *a, **k: "https://example.test/photo.jpg",
+        ), mock.patch.object(bot, "_send", lambda *a, **k: {"message_id": 1}):
+            ok = bot._attach_photo_to_repair(
+                -100, {"id": 1}, "/tmp/photo.jpg",
+                {
+                    "direction": "offline",
+                    "robot_number": 3437,
+                    "robot_id": 3259,
+                    "warehouse": "GLP-C",
+                    "type_problem": "Abnormal walking",
+                    "awaiting_photo": True,
+                },
+            )
+    finally:
+        sendToDataBase.rest_post = original_post
+        sendToDataBase.rest_get = original_get
+
+    assert ok is True, "фото не прикрепилось"
+
+    inserts = [p for t, p in posted if t == "robot_repair_assignments"]
+    assert inserts, "записи ремонта не было вовсе"
+    assert inserts[0].get("robot_id") == 3259, (
+        f"в записи нет обязательного robot_id: {inserts[0]}"
+    )
+    assert inserts[0].get("robot_number") == 3437
+
+
+def test_pending_state_keeps_robot_id():
+    """`robot_id` попадает в состояние флоу — из него его берёт запись.
+
+    Проверяются **оба** пути: выбор причины кнопкой и «Skip» без описания.
+    Оба заводят ремонт, и оба теряли фото.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert source.count('"robot_id": robot.get("id")') >= 2, (
+        "robot_id запоминается не во всех путях начала флоу склада"
+    )
+
+
+def test_failed_repair_photo_does_not_become_an_error():
+    """🔴 Сбой прикрепления фото НЕ уводит снимок в приём ошибок.
+
+    Раньше `return` стоял **внутри** `if _attach_photo_to_repair(...)`, поэтому
+    при сбое управление шло дальше — в приём ошибок, и **снимок поломки
+    превращался в новую ошибку**. Робот к этому моменту уже выведен из работы:
+    в журнале появлялась ошибка, которой не было.
+    """
+    intake_calls = []
+
+    original_get_file = bot.tg.get_file
+    original_download = bot.tg.download_file
+    bot.tg.get_file = lambda *a, **k: "/tmp/photo.jpg"
+    bot.tg.download_file = lambda *a, **k: True
+
+    try:
+        with mock.patch.object(
+            bot, "_attach_photo_to_repair", lambda *a, **k: False
+        ), mock.patch.object(
+            bot, "peek_pending_status",
+            lambda *a, **k: {"awaiting_photo": True, "robot_number": 3437,
+                             "robot_id": 3259},
+        ), mock.patch.object(
+            bot, "get_employee_name", lambda *a, **k: "Huseyn"
+        ), mock.patch.object(
+            bot, "_send", lambda *a, **k: {"message_id": 1}
+        ), mock.patch.object(
+            intake_flow, "start",
+            lambda *a, **k: intake_calls.append("intake") or True,
+        ):
+            bot.handle_photo(
+                -100, {"id": 1},
+                {"photo": [{"file_id": "f", "file_unique_id": "u"}]},
+                5,
+            )
+    finally:
+        bot.tg.get_file = original_get_file
+        bot.tg.download_file = original_download
+
+    assert not intake_calls, (
+        "снимок поломки ушёл в приём ошибок: робот уже выведен из работы, "
+        "второй записи об ошибке быть не должно"
+    )

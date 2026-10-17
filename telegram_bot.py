@@ -2439,6 +2439,12 @@ def handle_status_callback(callback: dict):
     set_pending_status(chat_id, sender.get("id"), {
         "direction": direction,
         "robot_number": robot.get("robot_number"),
+        # 🔴 **`robot_id` обязателен для записи ремонта** (см. `_attach_photo_to_repair`).
+        # В `robot_repair_assignments` колонка `robot_id` объявлена `NOT NULL`, а
+        # `robot_number` — то, что оператор назвал руками. Без id вставка падала
+        # с `400 ... null value in column "robot_id"`, и **фото ремонта
+        # терялось**. Здесь id уже есть: его вернул поиск робота.
+        "robot_id": robot.get("id"),
         "type_problem": label,
         "prompt_message_id": message_id,
         # Склад робота: описание причины может прийти уже в общем топике,
@@ -2555,6 +2561,15 @@ def _attach_photo_to_repair(chat_id, sender, photo_path, pending: dict) -> bool:
         created = rest_post(
             "robot_repair_assignments",
             {
+                # 🔴 **`robot_id` обязателен** — колонка `NOT NULL`.
+                #
+                # Дефект, найденный в проде 17.10.2026: бот передавал только
+                # `robot_number`, и **каждое фото ремонта** падало с
+                # `400 — null value in column "robot_id"`. Оператор выводил
+                # робота из работы, присылал снимок поломки, и фото **терялось**:
+                # запись ремонта не создавалась. Владелец описал это как
+                # «/offline и /online не работает корректно».
+                "robot_id": pending.get("robot_id"),
                 "robot_number": robot_number,
                 "warehouse": warehouse,
                 "card_id": (get_employee(sender.get("id")) or {}).get("card_id"),
@@ -2732,6 +2747,9 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
     pending.update({
         "direction": direction,
         "robot_number": robot.get("robot_number"),
+        # Тот же обязательный `robot_id`, что и в ветке выбора причины: путь
+        # «Skip — без описания» тоже заводит ремонт и тоже терял фото.
+        "robot_id": robot.get("id"),
         "type_problem": reason,
         "warehouse": robot.get("warehouse") or current_warehouse(),
         # Момент вывода из работы: простой считается от него, а не от времени,
@@ -4769,9 +4787,30 @@ def handle_photo(chat_id, sender, message, message_id):
     repair_pending = peek_pending_status(chat_id, sender.get("id"))
 
     if repair_pending and repair_pending.get("awaiting_photo"):
-        if _attach_photo_to_repair(chat_id, sender, destination, repair_pending):
+        # 🔴 **Возврат — безусловный, даже если фото не прикрепилось.**
+        #
+        # Дефект, найденный 17.10.2026. Раньше `return` стоял **внутри** `if`:
+        #
+        #     if _attach_photo_to_repair(...):
+        #         _delete_quiet(...)
+        #         return
+        #
+        # При сбое вставки (`400 null value in column "robot_id"` — тогда он
+        # случался **на каждом** фото) управление шло дальше, в приём ошибок, и
+        # **снимок поломки превращался в новую ошибку**. Робот к этому моменту
+        # уже выведен из работы, и второй записи об ошибке быть не должно:
+        # в журнале появлялась ошибка, которой не было.
+        #
+        # Ожидание снимка — это состояние диалога, а не «может, ошибка»: пока
+        # `awaiting_photo` стоит, любое фото принадлежит ремонту. О неудаче
+        # `_attach_photo_to_repair` сообщает сам и оставляет ожидание активным,
+        # поэтому оператор просто пришлёт снимок ещё раз.
+        attached = _attach_photo_to_repair(chat_id, sender, destination, repair_pending)
+
+        if attached:
             _delete_quiet(chat_id, message_id)
-            return
+
+        return
 
     # Start the guided production intake for every photo.
     import equipment_intake.flow as intake_flow
