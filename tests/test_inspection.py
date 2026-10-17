@@ -731,6 +731,59 @@ class TestItems:
         assert (CHAT_ID, 4242) in rec.deleted, "фото оператора осталось"
         assert (CHAT_ID, example_message_id) in rec.deleted, "фото-пример осталось"
 
+    def test_step_message_is_deleted_before_the_next_point(self, rec, monkeypatch) -> None:
+        """🔴 Сообщение пункта убирается из чата при переходе к следующему.
+
+        Владелец 17.10.2026: «шаги потом не удаляются». Убирались **только два
+        фото**, а текст «Step N of M» с кнопками `Problem` / `Cancel` оставался:
+        за осмотр из четырнадцати пунктов в топике накапливалось столько же
+        сообщений, и оператор не понимал, какой пункт активен — **старые кнопки
+        выглядят рабочими**.
+
+        Найдено воспроизведением: при переходе удалялись фото оператора и
+        примера, а `prompt_message_id` прошлого пункта оставался, хотя сессия уже
+        указывала на новое сообщение. Старый текст терял владельца, но не исчезал.
+        """
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        # Сообщение пункта, которое показывает бот (текст + кнопки).
+        step_message_id = _session().data["prompt_message_id"]
+        rec.deleted.clear()
+
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+
+        path = _write_photo(monkeypatch)
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 5150, path)
+
+        assert (CHAT_ID, step_message_id) in rec.deleted, (
+            f"сообщение пункта {step_message_id} осталось в чате — шаги копятся"
+        )
+
+    def test_each_transition_deletes_exactly_one_step(self, rec, monkeypatch) -> None:
+        """За каждый переход убирается **ровно одно** сообщение пункта.
+
+        Сторож от обратной ошибки: удалить лишнее (например, новое сообщение
+        сразу после отправки) значило бы показать пустоту вместо пункта.
+        """
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+
+        first = _session().data["prompt_message_id"]
+        rec.deleted.clear()
+
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 6001, _write_photo(monkeypatch))
+
+        # Прошлое сообщение удалено, новое — осталось в сессии и в чате.
+        assert (CHAT_ID, first) in rec.deleted
+        second = _session().data["prompt_message_id"]
+        assert second != first, "новый пункт переиспользовал id прошлого сообщения"
+        assert (CHAT_ID, second) not in rec.deleted, "удалено сообщение нового пункта"
+
     def test_last_point_finishes_inspection(self, rec, monkeypatch) -> None:
         """После последнего пункта осмотр закрывается и показывается итог."""
         _start(rec, monkeypatch)
