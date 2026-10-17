@@ -335,6 +335,26 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     # на самом деле заготовка просто не заполнена.
     journal = result.get("journal") or {}
 
+    # **Что сделано — только из заготовки.**
+    #
+    # 🔴 **Владелец 17.10.2026, дословно:** «почему no template linked если
+    # темплейт подключён и также замени Problem на What was done а problem удали
+    # вообще».
+    #
+    # Разбор показал, что текст был **неправдой**. Запись владельца (робот 3899,
+    # Chassis, 17.10.2026): заготовка **подобрана** (`template_id = 152`), но у
+    # неё само поле «что сделано» **не заполнено** — в базе `raw_recovery`
+    # пусто. Карточка же утверждала «no template linked» — то есть обвиняла
+    # подбор шаблона там, где шаблон был, а пусто было **содержимое заготовки**.
+    # Проверено на данных: таких заготовок **13**, и самая частая
+    # (`Went off the road`) использована **265 раз**.
+    #
+    # **Пустое поле больше не выводится вовсе.** Раньше на его месте стояла
+    # строка-заглушка, и она читалась как факт («шаблона нет»). Здесь пустота
+    # означает ровно то, что означает: заготовку ещё не заполнили. Молчание
+    # честнее выдуманного объяснения — тот же принцип, что у `Solving time`.
+    journal = result.get("journal") or {}
+
     # Обратная совместимость: если запись в журнал не удалась, остаётся текст
     # оператора — он в `description`, и это честный запасной вариант.
     action = str(journal.get("raw_recovery") or "").strip()
@@ -346,13 +366,6 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
 
     if solving:
         fields.append(("Solving time", f"{int(solving)} min"))
-
-    # **Причина не подобралась — говорим прямо.**
-    #
-    # Владелец должен видеть, что заготовки нет: тогда её заведут, и в отчётах
-    # появится «что сделано». Молчание читается как «сделано ничего».
-    if journal and not action:
-        fields.append(("What was done", "no template linked"))
 
     fields.append(("Reported by",_escape_md(result.get("employee") or result.get("username") or "Unknown")))
 
@@ -382,7 +395,21 @@ def _card(result, photo_url, db_saved, queued, glpc_saved=None):
     if glpc_saved is False:
         fields.append(("Shift journal","Save failed"))
     elements=[{"tag":"div","fields":[{"is_short":True,"text":{"tag":"lark_md","content":f"**{k}**\n{str(v)[:500]}"}} for k,v in fields]}]
-    elements.append({"tag":"div","text":{"tag":"plain_text","content":f"Problem: {str(a.get('description') or '')[:1500]}"}})
+
+    # 🔴 **Строка «Problem: …» удалена** (владелец 17.10.2026: «problem удали
+    # вообще»).
+    #
+    # Она дублировала поле «What happened» выше: там ответ на вопрос ошибки
+    # (`error` / `problem` из дерева), здесь — текст оператора из `description`.
+    # Дубль подтверждён на данных: у **982** записей из 7995 описание совпадает с
+    # ошибкой слово в слово, и в карточке они стояли дважды.
+    #
+    # **Что не потеряно.** Текст оператора остаётся в базе
+    # (`exceptions.raw_description`) и по-прежнему **читается в приоритете** над
+    # справочником в отчётах (`exception_rows.py`) — в карточках смен, Excel и
+    # веб-версии он никуда не исчез. Убрана только строка в Lark-карточке.
+    #
+    # Именно потому удаление безопасно: карточка — уведомление, а не хранилище.
     if photo_url: elements.append({"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"Open photo"},"type":"primary","url":photo_url}]})
     return {"header":{"template":"orange","title":{"tag":"plain_text","content":"Equipment error report"}},"elements":elements}
 

@@ -1870,6 +1870,78 @@ class LarkCardChecks(unittest.TestCase):
 
         self.assertNotIn("Shift journal", text)
 
+    def test_empty_template_is_not_reported_as_a_missing_template(self):
+        """🔴 Пустая заготовка не выдаётся за отсутствующую.
+
+        Владелец 17.10.2026: «почему no template linked если темплейт подключён».
+
+        Разбор живой записи (робот 3899, Chassis, шаблон `152`): заготовка
+        **подобрана**, но её собственное поле «что сделано» не заполнено — в базе
+        `raw_recovery` пусто. Карточка же утверждала «no template linked», то есть
+        обвиняла подбор шаблона там, где пусто было **содержимое заготовки**.
+        Таких заготовок 13, и самая частая использована 265 раз.
+        """
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {
+                "answers": {"object": "Robot", "device_number": "3899"},
+                "warehouse": "GLP-C",
+                "journal": {"raw_recovery": "", "template_id": 152},
+            },
+            None, True, False,
+        )
+        text = json.dumps(card, ensure_ascii=False)
+
+        self.assertNotIn("no template linked", text)
+        self.assertNotIn("What was done", text, "пустое поле не показывается вовсе")
+
+    def test_filled_template_still_shows_what_was_done(self):
+        """Заполненная заготовка по-прежнему видна — правка не сломала поле."""
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {
+                "answers": {"object": "Robot", "device_number": "1"},
+                "warehouse": "GLP-C",
+                "journal": {"raw_recovery": "Restore network connection",
+                            "raw_solving_time": 6},
+            },
+            None, True, False,
+        )
+        rows = {}
+        for field in card["elements"][0]["fields"]:
+            label, _, value = field["text"]["content"].partition("\n")
+            rows[label.strip("* ")] = value
+
+        self.assertEqual(rows["What was done"], "Restore network connection")
+        self.assertEqual(rows["Solving time"], "6 min")
+
+    def test_card_has_no_problem_line(self):
+        """🔴 Строки «Problem: …» в карточке нет (владелец: «problem удали вообще»).
+
+        Она дублировала поле «What happened»: там ответ на вопрос ошибки, здесь
+        текст оператора. Дубль подтверждён на данных — у 982 записей из 7995
+        описание совпадает с ошибкой слово в слово.
+
+        **Текст оператора при этом не потерян:** он остаётся в базе
+        (`raw_description`) и читается в приоритете в отчётах; убрана только
+        строка карточки. Здесь проверяется именно отсутствие строки.
+        """
+        from equipment_intake import integrations
+
+        card = integrations._card(
+            {
+                "answers": {"object": "Robot", "device_number": "1",
+                            "description": "Robot stopped at the aisle"},
+                "warehouse": "GLP-C",
+            },
+            None, True, False,
+        )
+        text = json.dumps(card, ensure_ascii=False)
+
+        self.assertNotIn("Problem:", text)
+
     def fields_glpc(self, db_saved, glpc_saved):
         from equipment_intake import integrations
 
