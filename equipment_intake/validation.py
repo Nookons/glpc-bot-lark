@@ -222,6 +222,151 @@ def parts_with_lookup(kind: str, warehouse: str, value) -> List[Tuple[str, Optio
     return [(part, _lookup_one(kind, warehouse, part)) for part in parts]
 
 
+#: Колонки единицы оборудования, нужные осмотру.
+#:
+#: `equipment_type_id` — чтобы понять, какая это модель; `status` — чтобы
+#: предупредить, что единица выведена из работы; `id` — **ключ**, по которому
+#: осмотр привязывается к устройству. Именно `id`, а не номер строкой:
+#: требование владельца 16.10.2026 «привязывай инспекцию к устройству через
+#: ключ». Номер между складами и категориями повторяется (проверено на живой
+#: базе), и осмотр «за номером» уехал бы не на ту единицу.
+EQUIPMENT_SELECT = "id, equipment_code, category, warehouse, sub_warehouse, status, equipment_type_id"
+
+
+def find_equipment(kind: str, warehouse: str, code: str) -> Optional[dict]:
+    """
+    Единица оборудования **точно по номеру**, в своей категории и на своём складе.
+
+    Возвращает строку справочника или `None` (нет такой / справочник недоступен).
+
+    ─── Почему своя ручка, а не `_lookup_one` ───────────────────────────────
+
+    `_lookup_one` отвечает на вопрос «есть ли такой номер» и отдаёт `bool`. Для
+    приёма ошибки этого хватало, для осмотра — нет: осмотр привязывается к
+    устройству **по ключу** (`equipment_id`), и без строки справочника ключа
+    взять неоткуда.
+
+    Логика поиска при этом **не дублируется**: категория по-прежнему берётся из
+    `EQUIPMENT_CATEGORY`, то есть «станция ищется только среди станций»
+    остаётся одним правилом на оба механизма. Своя копия фильтра разошлась бы
+    с приёмом ошибок при первой правке — в этом проекте такое уже случалось.
+
+    ─── Почему `limit=2`, а не `limit=1` ────────────────────────────────────
+
+    Если по одному номеру в одной категории на одном складе вдруг окажется две
+    строки, `limit=1` вернул бы первую молча — и осмотр ушёл бы на случайную из
+    двух. Здесь мы берём первую, но **факт дубликата видно в логе**.
+    """
+    text = _text(code)
+    category = EQUIPMENT_CATEGORY.get(kind)
+
+    if not text or not category:
+        return None
+
+    from sendToDataBase import rest_get
+
+    params = {
+        "select": EQUIPMENT_SELECT,
+        "category": f"eq.{category}",
+        "equipment_code": f"eq.{text}",
+        "order": "id",
+        "limit": "2",
+    }
+
+    if warehouse:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get("equipment", params, optional=True)
+
+    if rows is None:
+        logger.info(
+            "inspection lookup: справочник недоступен для %r — «неизвестно»",
+            text,
+        )
+        return None
+
+    if len(rows) > 1:
+        logger.warning(
+            "inspection lookup: номер %r в категории %s на складе %s найден %s раз — "
+            "беру первую строку (id=%s)",
+            text,
+            category,
+            warehouse,
+            len(rows),
+            rows[0].get("id"),
+        )
+
+    return rows[0] if rows else None
+
+
+def find_elsewhere(kind: str, warehouse: str, code: str) -> List[Tuple[str, str]]:
+    """
+    Где ещё есть такой же номер — `[(склад, категория), …]`.
+
+    Нужно для честного отказа: владелец требует **не подменять** устройство
+    молча. Если номер не найден в выбранной категории на своём складе, но
+    найден в другой категории (или на другом складе), человек должен увидеть,
+    где именно он есть, и выбрать заново.
+
+    🔴 **Почему это не «поиск без фильтра».** Смысл проверки обратный: не найти
+    устройство, чтобы осмотреть, а **объяснить отказ**. Категория текущего
+    запроса исключается — её отсутствие мы уже знаем.
+
+    Категории перебираются **поимённо** (`EQUIPMENT_CATEGORY`), а не запросом
+    «без фильтра категории»: так у каждой категории остаётся свой точный
+    фильтр, и номера разных категорий не смешиваются в один ответ.
+    """
+    text = _text(code)
+
+    if not text:
+        return []
+
+    found: List[Tuple[str, str]] = []
+    current = EQUIPMENT_CATEGORY.get(kind)
+
+    for other_kind, category in EQUIPMENT_CATEGORY.items():
+        if not category or category == current:
+            continue
+
+        # Свой склад проверяем в другой категории, чужой склад — в той же.
+        row = find_equipment(other_kind, warehouse, text)
+
+        if row:
+            found.append((str(row.get("warehouse") or warehouse), category))
+
+    # Тот же номер на **других складах**: номера повторяются между складами
+    # (проверено: 206 номеров встречаются более чем на одном).
+    for other_warehouse in _other_warehouses(warehouse):
+        row = find_equipment(kind, other_warehouse, text)
+
+        if row:
+            found.append((other_warehouse, current or ""))
+
+    return found
+
+
+def _other_warehouses(warehouse: str) -> List[str]:
+    """
+    Склады, кроме указанного.
+
+    Берутся из справочника `warehouses`, а не из константы: список складов
+    меняется (появляются новые площадки), и зашитый перечень молча перестал бы
+    находить их — «нет в другом складе» выглядело бы как «нет нигде».
+    """
+    from sendToDataBase import rest_get
+
+    rows = rest_get("warehouses", {"select": "title", "limit": "50"}, optional=True)
+
+    if not rows:
+        return []
+
+    return [
+        str(row.get("title"))
+        for row in rows
+        if row.get("title") and str(row.get("title")) != str(warehouse)
+    ]
+
+
 def _lookup_one(kind: str, warehouse: str, code: str) -> Optional[bool]:
     """
     Есть ли устройство в своём справочнике: `True` / `False` / `None`.

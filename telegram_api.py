@@ -450,6 +450,59 @@ def send_photo(
     return payload.get("result")
 
 
+def send_photo_url(
+    chat_id,
+    url: str,
+    caption: str = None,
+    message_thread_id: int = None,
+    reply_markup: dict = None,
+    timeout: int = 60,
+):
+    """
+    Отправляет фото **по ссылке** (Telegram сам его скачает).
+
+    🔴 **Зачем отдельная функция, а не `send_photo`.** `send_photo` открывает
+    файл (`open(image_path, "rb")`) и отдаёт его multipart-ом. Ссылка в этом
+    виде молча не работает: `open("https://…")` бросает `OSError`, исключение
+    ловится, и функция возвращает `None` — то есть фото просто не появляется,
+    а в логе остаётся «не удалось прочитать фото». Проверено чтением кода.
+
+    Нужна она ровно для одного: фото-пример пункта осмотра лежит в Supabase
+    Storage, а не на диске бота. Скачивать чужой объект к себе значило бы
+    копировать его и хранить мусор.
+
+    `photo` при этом — обычная строка URL в JSON-запросе (не multipart), как
+    и требует Bot API для ссылок.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set")
+        return None
+
+    if _dry_run() and not _dry_run_reply_allowed(
+        "sendPhoto", {"message_thread_id": message_thread_id}
+    ):
+        logger.info(
+            "[DRY-RUN] sendPhoto по ссылке не вызван: chat=%s thread=%s url=%s",
+            chat_id,
+            message_thread_id,
+            url,
+        )
+        return {"message_id": 0, "dry_run": True}
+
+    payload = {"chat_id": chat_id, "photo": url}
+
+    if caption:
+        payload["caption"] = truncate(caption, TELEGRAM_CAPTION_LIMIT)
+
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    return call("sendPhoto", payload, timeout=timeout)
+
+
 def answer_callback_query(callback_query_id: str, text: str = None):
     """Гасит «часики» на кнопке; text показывается всплывашкой."""
     payload = {"callback_query_id": callback_query_id}

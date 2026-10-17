@@ -461,6 +461,11 @@ KNOWN_COMMANDS = (
     # и о редакторе дерева знали только те, кому сказали отдельно.
     # Найдено аудитом 14.10.2026.
     "tree",
+    # Осмотр оборудования (16.10.2026). **В `OUTSIDE_TOPIC_COMMANDS` её нет
+    # намеренно**: осмотр делают в рабочем топике, а список снаружи — ровно
+    # разрешение отвечать там, где бота нет. Владелец: «ни в какой больше топик
+    # он не должен писать вообще его там нету».
+    "inspection",
 )
 
 # Русская раскладка: люди часто набирают /reg как /куп, а /req как /куй.
@@ -551,6 +556,7 @@ HELP_TEXT = (
     "/downtime [days] — longest total downtime and MTTR\n"
     "/week — weekly report preview\n"
     "/tree — edit the intake question tree (leaders)\n"
+    "/inspection — step-by-step equipment inspection with photos\n"
     "/topics — which topic is used for what\n"
     "/offline <robot> — take a robot out of service\n"
     "/online <robot> — return a robot to service\n"
@@ -1601,6 +1607,17 @@ def images_janitor_loop(interval_seconds: int = 3600):
 
             if swept:
                 logger.info("Убрано просроченных сессий приёма: %s", swept)
+
+            # Осмотр — тот же словарь в памяти: брошенный диалог иначе висел бы
+            # до перезапуска бота.
+            import inspection as inspection_module
+
+            swept_inspections = inspection_module.sweep_sessions()
+
+            if swept_inspections:
+                logger.info(
+                    "Убрано просроченных диалогов осмотра: %s", swept_inspections
+                )
         except Exception:
             logger.exception("Ошибка очистки старых фото")
 
@@ -2300,6 +2317,15 @@ def handle_status_callback(callback: dict):
         _handle_robot_fix_callback(chat_id, sender, parts, message_id, callback_id)
         return
 
+    # Осмотр оборудования: тип, шаблон, пункт, отмена.
+    if parts and parts[0] == "ins":
+        import inspection as inspection_module
+
+        if inspection_module.handle_callback(
+            chat_id, sender, parts, message_id, callback_id
+        ):
+            return
+
     if parts and parts[0] == "em":
         _handle_error_menu_callback(
             chat_id, sender, parts, message_id, callback_id
@@ -2715,6 +2741,20 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
 
 
 def _handle_cancel(chat_id, sender, reply_to):
+    # **Осмотр отменяется первым.**
+    #
+    # Если у человека открыт диалог осмотра, `/cancel` относится к нему, а не к
+    # смене статуса: обе ветки могут быть активны одновременно (осмотр идёт в
+    # том же рабочем топике). Отмена осмотра сама сообщает о результате, поэтому
+    # дальше отвечать «Nothing to cancel» не нужно.
+    try:
+        import inspection as inspection_module
+
+        if inspection_module.cancel(chat_id, sender):
+            return
+    except Exception:
+        logger.exception("Не удалось отменить осмотр")
+
     pending = clear_pending_status(chat_id, sender.get("id"))
 
     if pending:
@@ -3334,6 +3374,15 @@ def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -
 
         if intake_editor.handle_command(chat_id, sender, command, reply_to):
             return True
+
+    # Осмотр оборудования (16.10.2026). Команда живёт рядом с `/tree`: обе
+    # работают в рабочем топике и обе доступны любому работнику — осмотр делает
+    # техник, а не только лидер.
+    if command == "inspection":
+        import inspection as inspection_module
+
+        inspection_module.start(chat_id, sender, reply_to)
+        return True
 
     if command == "stats":
         _handle_stats(chat_id, args, reply_to)
@@ -5009,6 +5058,18 @@ def _handle_update_inner(update: dict, bot_username: str = None):
             # Общий топик: описание причины для смены статуса принимаем (флоу
             # живёт здесь), а ошибку — нет: её склад определяется топиком
             # ошибок, иначе запись уйдёт не на тот склад.
+            #
+            # **Осмотр — тоже сюда.** Он делается в рабочем топике, и требование
+            # «/inspection в OUTSIDE_TOPIC_COMMANDS не добавлять» означает лишь,
+            # что бот молчит в **чужих** топиках. Общий топик бот обслуживает
+            # (`is_shared_topic`), поэтому номер устройства и комментарий к
+            # пункту здесь принимаются — иначе диалог обрывался бы на первом же
+            # шаге: кнопка срабатывала, а текст нет.
+            if _inspection_pending(chat_id, sender.get("id")) and _handle_inspection_text(
+                chat_id, sender, text, message_id
+            ):
+                return
+
             if peek_pending_status(chat_id, sender.get("id")):
                 _handle_text_message(chat_id, sender, text, message_id, chat)
             elif parse_error_message(text):
@@ -5028,6 +5089,18 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         return
 
     if message.get("photo"):
+        # **Фото пункта осмотра — раньше проверки топика ошибок.**
+        #
+        # Осмотр идёт в рабочем топике (в нём же живут статусы), а склад топика
+        # ошибок у него `None`. Проверка «это топик ошибок?» ниже отказала бы и
+        # увела осмотр в ветку «здесь не отслеживается» — при том, что кнопки
+        # осмотра были показаны именно здесь. Поэтому сначала спрашиваем
+        # диалог, и только потом — приём ошибок.
+        if _inspection_pending(chat_id, sender.get("id")) and _handle_inspection_photo(
+            chat_id, sender, message, message_id
+        ):
+            return
+
         # Ошибка принимается только из топика ошибок: его склад обязан быть
         # известен. Общий топик (статусы/статистика/служебный) проходит мимо
         # раннего фильтра, и раньше фото оттуда уходило на склад по умолчанию
@@ -5145,6 +5218,92 @@ def _finish_error_choice(chat_id, sender, choice, number, message_id):
     _delete_quiet(chat_id, choice.get("prompt_message_id"))
 
 
+def _inspection_pending(chat_id, user_id) -> bool:
+    """
+    Идёт ли у этого человека диалог осмотра.
+
+    Спрашивается **до** передачи сообщения другим флоу: приём ошибок
+    перехватывает любое фото, и без этой проверки снимок пункта осмотра ушёл бы
+    в Lark как новая ошибка, а диалог встал бы намертво.
+    """
+    try:
+        import inspection as inspection_module
+
+        return inspection_module.peek_session(chat_id, user_id) is not None
+    except Exception:
+        # Модуль осмотра не должен ронять основной поток бота: если он почему-то
+        # не импортируется, ведём себя как «осмотра нет».
+        logger.exception("Не удалось проверить состояние осмотра")
+        return False
+
+
+def _handle_inspection_text(chat_id, sender, text, message_id) -> bool:
+    """Текст для диалога осмотра. False — это не шаг осмотра."""
+    import inspection as inspection_module
+
+    return inspection_module.handle_text(chat_id, sender, text, message_id)
+
+
+def _handle_inspection_photo(chat_id, sender, message, message_id) -> bool:
+    """
+    Фото для пункта осмотра. Скачивает файл и отдаёт диалогу.
+
+    Скачивание живёт здесь, а не в `inspection.py`, по одной причине: это тот
+    же шаг, что у приёма ошибок (`tg.get_file` + `tg.download_file`), и его
+    поведение при сбое (нет файла, нет места на диске) должно быть видно в
+    основном потоке, а не внутри логики шагов.
+    """
+    import inspection as inspection_module
+
+    session = inspection_module.peek_session(chat_id, sender.get("id"))
+
+    if session is None or session.step not in (
+        inspection_module.STEP_ITEM,
+        inspection_module.STEP_PROBLEM,
+    ):
+        return False
+
+    sizes = message.get("photo") or []
+
+    if not sizes:
+        return False
+
+    best = sizes[-1]
+    file_path = tg.get_file(best.get("file_id"))
+
+    if not file_path:
+        _send(
+            chat_id,
+            "⚠️ Can't download the photo from Telegram. Please try again.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return True
+
+    extension = os.path.splitext(file_path)[1] or ".jpg"
+    file_unique_id = best.get("file_unique_id") or best.get("file_id")
+
+    destination = os.path.join(
+        _IMAGES_DIR,
+        f"insp_{file_unique_id}{extension}",
+    )
+
+    if not tg.download_file(file_path, destination):
+        _send(
+            chat_id,
+            "⚠️ Can't save the photo on the server. Please try again.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return True
+
+    _send_action(chat_id, "upload_photo")
+
+    return inspection_module.handle_photo(
+        chat_id, sender, message, message_id, destination
+    )
+
+
 def _handle_text_message(chat_id, sender, text, message_id, chat):
     if text.startswith("/"):
         command, args = parse_command(text, BOT_USERNAME)
@@ -5206,6 +5365,19 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
         _send(chat_id, hint)
 
         _delete_user_message(chat_id, message_id)
+        return
+
+    # **Осмотр — раньше приёма ошибок и редактора.**
+    #
+    # Тот же порядок, что в ветке фото ниже: там диалог осмотра проверяется
+    # раньше приёма ошибок, иначе снимок пункта ушёл бы в Lark как новая
+    # ошибка. Здесь это важно по той же причине: и у приёма ошибок, и у осмотра
+    # есть текстовый шаг (номер устройства / комментарий к проблеме), и разный
+    # порядок в двух ветках дал бы «кнопка сработала, а текст ушёл не туда».
+    #
+    # `handle_text` осмотра возвращает False, когда шаг не текстовый, поэтому
+    # обычная работа бота не меняется.
+    if _handle_inspection_text(chat_id, sender, text, message_id):
         return
 
     # Handle text only when this employee has an active intake step.
@@ -6117,6 +6289,7 @@ def main():
         {"command": "robot", "description": "Robot card by number"},
         {"command": "offline", "description": "Take a robot out of service"},
         {"command": "online", "description": "Return a robot to service"},
+        {"command": "inspection", "description": "Equipment inspection with photos"},
         {"command": "id", "description": "Show chat/user IDs"},
         {"command": "help", "description": "Help"},
     ])
