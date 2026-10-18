@@ -8592,3 +8592,43 @@ def test_last_error_skips_the_description_step():
     )
     # Описание берётся из деталей ошибки, а не из текста оператора.
     assert 'details["note"]' in source or "note if code ==" in source
+
+
+def test_oversized_video_gets_an_honest_answer():
+    """🔴 Файл больше 20 МБ — понятный отказ, а не «не удалось скачать».
+
+    Telegram Bot API **не отдаёт боту файлы больше 20 МБ**: `getFile` вернёт
+    ошибку, и скачивание не начнётся. Видео с телефона часто тяжелее, поэтому
+    без проверки оператор получил бы «не удалось скачать» и решил бы, что
+    сломан бот, — а причина в размере.
+
+    Проверка стоит **до** попытки скачивания, иначе сообщение бесполезно.
+    """
+    limit = bot.TELEGRAM_DOWNLOAD_LIMIT_BYTES
+
+    assert bot._media_too_big({"file_size": limit + 1}) is True
+    assert bot._media_too_big({"file_size": limit}) is False
+    assert bot._media_too_big({"file_size": 5 * 1024 * 1024}) is False
+
+    # Размер не пришёл — не отказываем заранее: пусть попробует.
+    assert bot._media_too_big({}) is False
+    assert bot._media_too_big({"file_size": None}) is False
+
+    # Размер читается человеком, а не числом байт.
+    assert bot._human_size(25 * 1024 * 1024) == "25 MB"
+
+
+def test_oversized_photo_does_not_become_a_new_error():
+    """Слишком большой файл ремонта **не уходит** в приём ошибок.
+
+    Робот уже выведен из работы: второй записи об ошибке быть не должно.
+    Возврат `True` означает «сообщение обработано» — именно поэтому ветка
+    осмотра его и возвращает.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert "TELEGRAM_DOWNLOAD_LIMIT_BYTES" in source
+    # Проверка стоит перед скачиванием в обеих ветках.
+    assert source.count("if _media_too_big(best):") == 2, (
+        "проверка размера должна быть и в ветке осмотра, и в ветке ремонта"
+    )

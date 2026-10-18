@@ -4870,6 +4870,17 @@ def handle_photo(chat_id, sender, message, message_id):
     if best is None:
         return
 
+    if _media_too_big(best):
+        _send(
+            chat_id,
+            f"⚠️ This file is {_human_size(best.get('file_size'))} — Telegram "
+            "does not let bots download files over 20 MB.\n"
+            "Send a shorter video or a photo instead.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return
+
     file_path = tg.get_file(best.get("file_id"))
 
     if not file_path:
@@ -5431,6 +5442,36 @@ def _handle_inspection_text(chat_id, sender, text, message_id) -> bool:
     return inspection_module.handle_text(chat_id, sender, text, message_id)
 
 
+#: Предел Telegram Bot API на скачивание файла через `getFile`.
+#:
+#: 🔴 **Это ограничение API, а не наше.** Бот не может получить файл больше
+#: 20 МБ: `getFile` вернёт ошибку, и скачивание не начнётся. Видео с телефона
+#: часто весит больше, поэтому проверять надо **до** попытки: иначе оператор
+#: получит «не удалось скачать» и решит, что сломан бот, — а проблема в размере.
+TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+
+
+def _media_too_big(item: dict) -> bool:
+    """Файл заведомо больше лимита Telegram — качать бессмысленно."""
+    size = item.get("file_size") if isinstance(item, dict) else None
+
+    try:
+        return int(size) > TELEGRAM_DOWNLOAD_LIMIT_BYTES
+    except (TypeError, ValueError):
+        # Размер не пришёл — не отказываем заранее: пусть попробует скачать.
+        return False
+
+
+def _human_size(size) -> str:
+    """Размер по-человечески: «37 MB»."""
+    try:
+        mb = int(size) / (1024 * 1024)
+    except (TypeError, ValueError):
+        return "too large"
+
+    return f"{mb:.0f} MB"
+
+
 def _pick_media(message: dict):
     """
     Файл из сообщения: фото или видео.
@@ -5493,6 +5534,22 @@ def _handle_inspection_photo(chat_id, sender, message, message_id) -> bool:
 
     if best is None:
         return False
+
+    # 🔴 **Честный ответ вместо молчания.** Telegram не отдаёт боту файлы
+    # больше 20 МБ, а видео с телефона часто тяжелее. Без этой проверки
+    # оператор получил бы «не удалось скачать» и решил бы, что сломан бот.
+    if _media_too_big(best):
+        _send(
+            chat_id,
+            f"⚠️ This file is {_human_size(best.get('file_size'))} — Telegram "
+            "does not let bots download files over 20 MB.\n"
+            "Send a shorter video or a photo instead.",
+            reply_to_message_id=message_id,
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        # Возвращаем `True`: сообщение обработано, в приём ошибок его отдавать
+        # нельзя — робот уже выведен из работы, и второй записи быть не должно.
+        return True
 
     file_path = tg.get_file(best.get("file_id"))
 
