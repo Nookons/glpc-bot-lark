@@ -1937,13 +1937,21 @@ def reasons_keyboard(direction: str, robot_id, last_issue: str = None) -> dict:
     # значило задерживать вывод робота из работы ради формулировки: робот стоит
     # в проходе или мешает линии, и каждая минута ожидания — простой.
     #
-    # Кнопка есть **только у офлайна**: возврат в работу без описания не нужен —
-    # там нечего объяснять, а причина «почему вернули» уже не проблема.
-    if direction == "offline":
-        rows.append([{
-            "text": "⏭️ Skip — no description",
-            "callback_data": f"st:{direction}:{robot_id}:skip",
-        }])
+    # 🔴 **Кнопка Skip нужна ОБОИМ направлениям.**
+    #
+    # Дефект 18.10.2026, репорт владельца: «/online тоже не работает». После
+    # выбора причины бот писал «press «Skip»…», а **кнопки Skip у `/online` не
+    # было** — она добавлялась только для офлайна. Оператор попадал в тупик:
+    # выйти можно было лишь `/cancel`, то есть отменив всё, ради чего он пришёл.
+    #
+    # Раньше считалось, что «возврат в работу без описания не нужен: там нечего
+    # объяснять». На практике причина уже выбрана кнопкой («Solved without
+    # changing», «Replaced Spare Parts»), и текст — необязательное дополнение.
+    # Требовать его значит держать робота вне работы ради формулировки.
+    rows.append([{
+        "text": "⏭️ Skip — no description",
+        "callback_data": f"st:{direction}:{robot_id}:skip",
+    }])
 
     rows.append([{
         "text": "✖️ Cancel",
@@ -2481,6 +2489,23 @@ def handle_status_callback(callback: dict):
 
         label = details["issue"]
         note = details["note"]
+    elif code == "skip":
+        # 🔴 **`skip` — не причина из справочника, а решение «без описания».**
+        #
+        # Дефект 18.10.2026 («/online тоже не работает»): кнопка Skip не проходила
+        # проверку `reason_label`, потому что кода `skip` в справочнике причин
+        # **нет** — и бот отвечал «Unknown reason», ничего не делая. У офлайна
+        # это не всплывало только потому, что кнопки там не было.
+        #
+        # Причина при этом **уже выбрана** предыдущим нажатием и лежит в
+        # состоянии флоу (`pending["type_problem"]`) — её и записываем. Если
+        # состояния нет (кнопка устарела, чат чистили), честно говорим.
+        pending_now = peek_pending_status(chat_id, sender.get("id")) or {}
+        label = pending_now.get("type_problem")
+
+        if not label:
+            tg.answer_callback_query(callback_id, "Pick a reason first")
+            return
     else:
         label = robot_status.reason_label(direction, code)
 
@@ -2585,7 +2610,12 @@ def handle_status_callback(callback: dict):
         f"{robot.get('status')} → {spec['new_status']}\n"
         f"Reason: {label}\n"
         "\n"
-        "✍️ Describe the reason in one message, press «Skip» to go offline "
+        # 🔴 **Текст подсказки — по направлению.** Для офлайна это «уйдёт в
+        # офлайн», для возврата в работу — «вернётся в работу». Копия фразы про
+        # офлайн в ветке `/online` прямо противоречила кнопке, которую человек
+        # только что нажал.
+        f"✍️ Describe the reason in one message, press «Skip» to "
+        f"{'take it offline' if direction == 'offline' else 'return it to service'} "
         "without a description, or /cancel.",
         message_thread_id=_reply_thread(chat_id, thread_id),
     )

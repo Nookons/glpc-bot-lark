@@ -8632,3 +8632,100 @@ def test_oversized_photo_does_not_become_a_new_error():
     assert source.count("if _media_too_big(best):") == 2, (
         "проверка размера должна быть и в ветке осмотра, и в ветке ремонта"
     )
+
+
+# ============================================================
+# /online: КНОПКА SKIP И ТУПИК ПОСЛЕ ВЫБОРА ПРИЧИНЫ (18.10.2026)
+# ============================================================
+
+def test_skip_button_exists_for_online_too():
+    """🔴 У `/online` есть кнопка Skip — без неё оператор попадал в тупик.
+
+    Репорт владельца 18.10.2026: «/online тоже не работает». После выбора
+    причины бот писал «press «Skip»…», а **кнопки Skip у `/online` не было**: она
+    добавлялась только для офлайна. Выйти можно было лишь `/cancel` — то есть
+    отменив всё, ради чего человек пришёл.
+
+    Раньше считалось, что «возврат в работу без описания не нужен». На практике
+    причина уже выбрана кнопкой, и текст — необязательное дополнение: требовать
+    его значит держать робота вне работы ради формулировки.
+    """
+    for direction in ("offline", "online"):
+        keyboard = bot.reasons_keyboard(direction, 3259)
+        codes = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+
+        assert f"st:{direction}:3259:skip" in codes, (
+            f"у /{direction} нет кнопки Skip"
+        )
+
+
+def test_skip_changes_status_with_the_chosen_reason():
+    """🔴 Skip меняет статус, а не отвечает «Unknown reason».
+
+    Настоящий корень репорта «/online не работает»: кнопка Skip **никогда** не
+    работала. Кода `skip` нет в справочнике причин, поэтому `reason_label`
+    возвращал `None`, и бот отвечал «Unknown reason», ничего не делая. У офлайна
+    это не всплывало, потому что кнопки там не было вовсе.
+
+    Проверка на живых данных это подтверждает: в `change_status_robots`
+    `type_problem` почти всегда заполнен — операторы обходили дефект через
+    «Other», потому что Skip молчал.
+    """
+    # Стаб `fake_get_employee` ищет автора в `LINKS` и иначе возвращает `None` —
+    # тогда обработчик выйдет на «Register first: /reg» раньше кнопки Skip.
+    LINKS[4242] = "Huseyn Asgarov"
+
+    for direction in ("offline", "online"):
+        changed = []
+
+        def fake_change(robot, direction_, type_problem, problem_note, employee):
+            changed.append((direction_, type_problem, problem_note))
+            return {"robot": robot}
+
+        start_status = robot_status.OFFLINE if direction == "online" else robot_status.ONLINE
+
+        with mock.patch.object(bot.tg, "answer_callback_query", lambda *a, **k: None), \
+           mock.patch.object(bot.tg, "edit_message_text", lambda *a, **k: None), \
+           mock.patch.object(bot, "_delete_quiet", lambda *a, **k: None), \
+           mock.patch.object(bot, "_is_processed", lambda *a, **k: False), \
+           mock.patch.object(bot, "_set_route", lambda *a, **k: None), \
+           mock.patch.object(bot, "_send", lambda *a, **k: {"message_id": 1}), \
+           mock.patch.object(bot, "_ask_repair_photo", lambda *a, **k: None), \
+           mock.patch.object(bot, "_notify_lark_status", lambda *a, **k: None), \
+           mock.patch.object(
+               bot, "peek_pending_status",
+               lambda *a, **k: {"type_problem": "Solved without changing"},
+           ), \
+           mock.patch.object(bot.robot_status, "change_robot_status", fake_change), \
+           mock.patch.object(
+               bot.robot_status, "find_robot_by_id",
+               lambda rid, **k: {"id": 3259, "robot_number": 3437,
+                                 "status": start_status, "warehouse": "GLP-C"},
+           ):
+            bot.handle_status_callback({
+                "id": f"cb-{direction}", "from": {"id": 4242},
+                "data": f"st:{direction}:3259:skip",
+                "message": {"message_id": 10,
+                            "chat": {"id": -100, "type": "supergroup"},
+                            "message_thread_id": 2},
+            })
+
+        assert changed, f"/{direction} + Skip: статус не изменился (дефект вернулся)"
+        assert changed[0][0] == direction
+        # Причина берётся из состояния флоу — она уже выбрана кнопкой.
+        assert changed[0][1] == "Solved without changing", changed[0]
+        # Заметка пустая: «без описания» — осознанный выбор.
+        assert changed[0][2] == ""
+
+
+def test_online_prompt_does_not_promise_offline():
+    """Подсказка `/online` не говорит «take it offline».
+
+    Текст был скопирован из ветки офлайна и прямо противоречил кнопке, которую
+    человек только что нажал.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert "'take it offline' if direction == 'offline'" in source.replace('"', "'"), (
+        "подсказка не различает направления"
+    )
