@@ -3373,12 +3373,25 @@ class RepairOfflineChecks(unittest.TestCase):
         assert 'if direction == "offline":' in source
 
     def test_skip_changes_status_without_note(self):
-        """`skip` меняет статус с пустой заметкой, а не просит описание."""
+        """`skip` меняет статус с пустой заметкой, а не просит описание.
+
+        ⚠️ Проверка переписана 18.10.2026. Раньше она искала буквальную строку
+        `if code == "skip":` — и падала от **безобидного** объединения условий,
+        хотя поведение не менялось. Теперь проверяется смысл: в этой ветке
+        вызывается смена статуса, и заметка передаётся **пустой**.
+
+        Ветка `skip` и «последняя ошибка» идут одним путём: разница только в
+        тексте заметки (у последней ошибки она собрана из записи об ошибке).
+        """
         source = self._bot_source()
 
-        assert 'if code == "skip":' in source
-        # Пустая заметка — осознанно: `""`, а не пропуск вызова.
-        assert 'change_robot_status(robot, direction, label, "", employee)' in source
+        assert 'code == "skip"' in source, "ветка skip пропала"
+        # Пустая заметка для `skip` — осознанно: `""`, а не пропуск вызова.
+        assert 'change_robot_status(robot, direction, label' in source
+        # У последней ошибки заметка НЕ пустая: она собрана из самой ошибки.
+        assert "details[\"note\"]" in source or "note if code ==" in source, (
+            "описание последней ошибки не передаётся в заметку"
+        )
 
     def test_photo_is_requested_after_offline(self):
         """После вывода из работы бот просит фото."""

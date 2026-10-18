@@ -8355,8 +8355,18 @@ def test_last_issue_is_the_first_reason_button():
     rows = keyboard["inline_keyboard"]
 
     first = rows[0][0]
-    assert first["text"] == "🛠 Went off the road", first
+    # 🔴 Выделение из общего списка (владелец 18.10.2026: «кнопку нужно сделать
+    # выделенную от всех со старой ошибкой»): отдельный ряд во всю ширину и
+    # пометка «Last error». Telegram не даёт менять цвет кнопки, поэтому
+    # выделение — рядом и текстом.
+    assert first["text"] == "⟵ Last error: Went off the road", first
     assert first["callback_data"] == "st:offline:3259:last_issue"
+
+    # Она стоит **своим рядом**: в первой строке больше никого нет, иначе
+    # выделение пропало бы.
+    assert len(rows[0]) == 1, f"кнопка ошибки не отдельным рядом: {rows[0]}"
+    # Остальные причины — во втором ряду и дальше.
+    assert len(rows) > 1, "после кнопки ошибки нет причин справочника"
 
     # Справочник причин на месте: «Other» нужен, если ошибка не подходит.
     all_codes = [b["callback_data"] for row in rows for b in row]
@@ -8451,3 +8461,134 @@ def test_last_issue_returns_none_instead_of_unknown():
             sendToDataBase.rest_get = original_get
     finally:
         journal.meaningful_issue = original
+
+
+# ============================================================
+# ВЫДЕЛЕННАЯ КНОПКА ОШИБКИ И МГНОВЕННЫЙ ОФЛАЙН (18.10.2026)
+# ============================================================
+
+def test_video_is_accepted_as_media():
+    """🔴 Видео принимается наравне с фото.
+
+    Владелец 18.10.2026: «всё только фото или видео просила с возможностью
+    пропустить». До этого бот умел **только фото**: `message.get("photo")` — и
+    всё. Видео попадало в «неподдерживаемый тип» и **молча игнорировалось**:
+    оператор снимал поломку на видео и не получал ответа вообще — терял снимок
+    и не понимал, приняли его или нет.
+    """
+    cases = {
+        "photo": {"photo": [{"file_id": "a", "file_unique_id": "u1"}]},
+        "video": {"video": {"file_id": "b", "file_unique_id": "u2"}},
+        "video_note": {"video_note": {"file_id": "c", "file_unique_id": "u3"}},
+        "animation": {"animation": {"file_id": "d", "file_unique_id": "u4"}},
+    }
+
+    for expected, message in cases.items():
+        best, kind = bot._pick_media(message)
+        assert best is not None, f"{expected} не распознан"
+        assert kind in ("photo", "video"), kind
+
+    # Текст — не медиа: ветка не должна срабатывать.
+    best, kind = bot._pick_media({"text": "hello"})
+    assert best is None and kind is None
+
+
+def test_video_uses_video_extension_not_jpg():
+    """Видео сохраняется как видео, а не переименовывается в `.jpg`.
+
+    Имя файла строится из расширения, которое вернул Telegram, а при его
+    отсутствии — из **вида** медиа. Раньше запасным был всегда `.jpg`, и видео
+    без расширения легло бы в хранилище как картинка: браузер не смог бы его
+    открыть, а `content-type` при загрузке определился бы как `image/jpeg`.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert '".jpg" if media_kind == "photo" else ".mp4"' in source, (
+        "запасное расширение не учитывает вид медиа"
+    )
+
+
+def test_last_error_offline_takes_the_note_from_the_error():
+    """🔴 Описание офлайна берётся из самой ошибки, а спрашивать его не нужно.
+
+    Владелец 18.10.2026: «при выборе ошибка полностью сама переводила робота в
+    офлайн по данным с последней ошибки сама брала оттуда описание».
+
+    Проверяется **поведением**, а не строкой в исходнике: нажимаем кнопку и
+    смотрим, что ушло в смену статуса.
+    """
+    changed = []
+
+    def fake_change(robot, direction, type_problem, problem_note, employee):
+        changed.append((direction, type_problem, problem_note))
+        return {"robot": robot, "old_status": "Online", "new_status": "Offline"}
+
+    # 🔴 Стаб `fake_get_employee` (ставится `conftest`-ом перед каждым тестом)
+    # ищет автора в словаре `LINKS` и иначе возвращает `None` — тогда обработчик
+    # выходит на «Register first: /reg», до смены статуса не доходя. Регистрируем
+    # автора в этом словаре, а не подменяем функцию: так тест идёт тем же путём,
+    # что и настоящий вызов.
+    LINKS[4242] = "Huseyn Asgarov"
+
+    with mock.patch.object(bot.tg, "answer_callback_query", lambda *a, **k: None), \
+       mock.patch.object(bot.tg, "edit_message_text", lambda *a, **k: None), \
+       mock.patch.object(bot, "_delete_quiet", lambda *a, **k: None), \
+       mock.patch.object(bot, "set_pending_status", lambda *a, **k: None), \
+       mock.patch.object(bot, "_is_processed", lambda *a, **k: False), \
+       mock.patch.object(bot, "_chat_allowed", lambda *a, **k: True), \
+       mock.patch.object(bot, "_set_route", lambda *a, **k: None), \
+       mock.patch.object(bot, "_send", lambda *a, **k: {"message_id": 1}), \
+       mock.patch.object(
+           bot, "_output_topic_allowed", lambda *a, **k: True
+       ), \
+       mock.patch.object(bot, "_ask_repair_photo", lambda *a, **k: None), \
+       mock.patch.object(bot, "_notify_lark_status", lambda *a, **k: None), \
+       mock.patch.object(bot.robot_status, "change_robot_status", fake_change), \
+       mock.patch(
+           "journal.last_issue_details_for_robot",
+           lambda *a, **k: {
+               "issue": "Went off the road",
+               "module": "Chassis",
+               "cause": "Mechanical",
+               "note": "Went off the road · Chassis · Mechanical",
+           },
+       ), \
+       mock.patch.object(
+           bot.robot_status, "find_robot_by_id",
+           # Статус — **точное значение из справочника**, а не «Online»:
+           # `is_in_status` сравнивает строку с `DIRECTIONS[direction]`, и
+           # приблизительное написание дало бы «Already Offline» на живой
+           # проверке вместо смены статуса.
+           lambda rid, **k: {"id": 3259, "robot_number": 3437,
+                             "status": robot_status.ONLINE,
+                             "warehouse": "GLP-C"},
+       ):
+        bot.handle_status_callback({
+            "id": "cb", "from": {"id": 4242},
+            "data": "st:offline:3259:last_issue",
+            "message": {"message_id": 10, "chat": {"id": -100, "type": "supergroup"},
+                        "message_thread_id": 2},
+        })
+
+    assert changed, "статус не изменился — кнопка ничего не сделала"
+
+    direction, problem, note = changed[0]
+    assert direction == "offline"
+    assert problem == "Went off the road", problem
+    # 🔴 Описание собрано из ошибки: тип · модуль · причина.
+    assert note and "Chassis" in note and "Mechanical" in note, note
+
+
+def test_last_error_skips_the_description_step():
+    """После последней ошибки бот **не просит текст** — сразу просит снимок.
+
+    Лишний шаг там, где всё уже известно: тип, модуль и причина лежат в журнале.
+    Оператор повторил бы вручную то, что уже записано.
+    """
+    source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
+
+    assert 'code == "last_issue" and direction == "offline"' in source, (
+        "последняя ошибка не идёт путём «сразу в офлайн»"
+    )
+    # Описание берётся из деталей ошибки, а не из текста оператора.
+    assert 'details["note"]' in source or "note if code ==" in source

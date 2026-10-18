@@ -311,7 +311,19 @@ def last_issue_for_robot(
     # `meaningful_issue` читает словарь **уже полученной строки**, и отсутствие
     # ключа там безопасно; в `select` его просить нельзя.
     params = {
-        "select": "raw_fault,raw_template_title,reported_error,start_time",
+        # 🔴 **`module` и `cause` — для описания офлайна.**
+        #
+        # Владелец 18.10.2026: «при выборе ошибка полностью сама переводила
+        # робота в офлайн по данным с последней ошибки сама брала оттуда
+        # описание». Описание собирается из трёх полей: тип ошибки, модуль
+        # («где») и причина («почему»). Без них в заметку офлайна попадал бы
+        # только тип, и читатель не понимал бы, где искать.
+        #
+        # Проверено на живых данных: `module` заполнен у 3603 записей из 4129,
+        # `cause` — у 2622. Отсутствие любого из них не ошибка: описание
+        # собирается из того, что есть, и недостающее не оставляет пустых
+        # разделителей.
+        "select": "raw_fault,raw_template_title,reported_error,start_time,module,cause",
         "order": "start_time.desc",
         "limit": str(max(1, int(limit))),
     }
@@ -333,5 +345,85 @@ def last_issue_for_robot(
         # Предложить его причиной значило бы показать оператору бессмыслицу.
         if issue and issue != "unknown":
             return issue
+
+    return None
+
+
+def last_issue_details_for_robot(robot_id: Any, warehouse: Any = None) -> Optional[Dict[str, Any]]:
+    """
+    Последняя ошибка робота **целиком**: тип, модуль, причина.
+
+    🔴 **Зачем (владелец 18.10.2026):** «при выборе ошибка полностью сама
+    переводила робота в офлайн по данным с последней ошибки сама брала оттуда
+    описание и всё только фото или видео просила с возможностью пропустить».
+
+    То есть при выборе последней ошибки бот больше **не спрашивает текст
+    причины** — он берёт его из записи об ошибке. Здесь возвращается всё, что
+    для этого нужно.
+
+    Возвращает словарь:
+
+    * `issue` — тип ошибки (правилом `meaningful_issue`, как везде);
+    * `module` — модуль оборудования («где сломалось»), может быть `None`;
+    * `cause` — причина («почему»), может быть `None`;
+    * `note` — **готовое описание** для заметки офлайна: «Went off the road ·
+      Chassis · Mechanical». Именно оно уходит в `problem_note`, поэтому
+      собирается здесь, а не в трёх местах вызывающего кода.
+
+    `None` — ошибок нет или все неразборчивы (`unknown`). Пустой `note`
+    невозможен: если есть `issue`, он и станет текстом.
+
+    **Модуль и причина добавляются только когда заполнены.** В данных `cause`
+    есть у 2622 записей из 4129, `module` — у 3603. Пустые разделители («Went
+    off the road · ·») читались бы как сбой вывода, а не как отсутствие данных.
+    """
+    if robot_id in (None, "", 0) and not warehouse:
+        return None
+
+    try:
+        from sendToDataBase import rest_get
+    except ImportError:  # pragma: no cover — журнал без базы (тесты)
+        return None
+
+    params = {
+        "select": "raw_fault,raw_template_title,reported_error,start_time,module,cause",
+        "order": "start_time.desc",
+        "limit": "5",
+    }
+
+    if robot_id not in (None, "", 0):
+        try:
+            params["robot_id"] = f"eq.{int(robot_id)}"
+        except (TypeError, ValueError):
+            return None
+    else:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get("exceptions", params, optional=True)
+
+    if not rows:
+        return None
+
+    for row in rows:
+        issue = meaningful_issue(row)
+
+        if not issue or issue == "unknown":
+            continue
+
+        module = str(row.get("module") or "").strip()
+        cause = str(row.get("cause") or "").strip()
+
+        parts = [issue]
+        if module:
+            parts.append(module)
+        if cause:
+            parts.append(cause)
+
+        return {
+            "issue": issue,
+            "module": module or None,
+            "cause": cause or None,
+            "note": " · ".join(parts),
+        }
 
     return None

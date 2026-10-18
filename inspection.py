@@ -530,7 +530,11 @@ def item_caption(session: Session, item: Dict[str, Any]) -> str:
         lines.append("🖼 The photo above is the example — it should look like this")
 
     lines.append("")
-    lines.append("📷 Send a photo if it's OK, or tap ⚠️ Problem.")
+    # 🔴 **Фото ИЛИ видео** (владелец 18.10.2026). Раньше бот умел только фото,
+    # и видео молча игнорировалось — оператор снимал поломку и не получал
+    # ответа. Пропуск — кнопка `Cancel` рядом: пункт остаётся непроверенным, и
+    # это видно в итоге осмотра, а не теряется.
+    lines.append("📷 Send a photo or a video if it's OK, or tap ⚠️ Problem.")
 
     return "\n".join(lines)
 

@@ -1879,9 +1879,22 @@ def reasons_keyboard(direction: str, robot_id, last_issue: str = None) -> dict:
     #
     # **Кнопка только у офлайна.** Возврат в работу причиной не описывается:
     # там спрашивают, что сделали, а не почему сломалось.
+    # 🔴 **Кнопка последней ошибки — отдельным рядом и с пометкой.**
+    #
+    # Владелец 18.10.2026: «кнопку нужно сделать выделенную от всех со старой
+    # ошибкой». В общем ряду она сливалась с причинами справочника, хотя это
+    # **другой** ответ: не «что случилось по классификации», а «что реально
+    # последним произошло с этой машиной».
+    #
+    # Telegram не даёт менять цвет кнопки, поэтому выделение — **отдельный ряд +
+    # пометка ⟵ и слово «last error»**. Русская подпись не годится: интерфейс
+    # бота английский (правило проекта), а «last error» читается однозначно.
+    #
+    # Её нажатие сразу меняет статус (см. ветку `last_issue` в
+    # `handle_status_callback`), поэтому это самый быстрый путь.
     if direction == "offline" and last_issue:
         buttons.append({
-            "text": f"🛠 {last_issue}"[:60],
+            "text": f"⟵ Last error: {last_issue}"[:64],
             "callback_data": f"st:{direction}:{robot_id}:last_issue",
         })
 
@@ -1900,8 +1913,19 @@ def reasons_keyboard(direction: str, robot_id, last_issue: str = None) -> dict:
     #
     # Здесь список причин мал (4–5) и известен заранее, поэтому ��истание не
     # нужно: показываем все ряды целиком.
-    rows = keyboard_layout.grid_rows(
-        buttons, columns=columns, max_rows=len(buttons) or 1
+    # Первая кнопка (последняя ошибка) — **свой ряд во всю ширину**, остальные
+    # причины — обычной сеткой. Смешивать их в одной сетке значило бы вернуть
+    # ту самую «слитность», от которой владелец просил уйти.
+    rows: List[List[Dict[str, str]]] = []
+
+    rest = buttons
+
+    if direction == "offline" and last_issue and buttons:
+        rows.append([buttons[0]])
+        rest = buttons[1:]
+
+    rows.extend(
+        keyboard_layout.grid_rows(rest, columns=columns, max_rows=len(rest) or 1)
     )
 
     # **«Skip» — сразу в офлайн без описания.**
@@ -2436,13 +2460,27 @@ def handle_status_callback(callback: dict):
             )
             return
 
-        label = journal.last_issue_for_robot((fresh or {}).get("id")) if fresh else None
+        # 🔴 **Описание берётся из самой ошибки, спрашивать его не нужно.**
+        #
+        # Владелец 18.10.2026: «при выборе ошибка полностью сама переводила
+        # робота в офлайн по данным с последней ошибки сама брала оттуда
+        # описание и всё только фото или видео просила с возможностью
+        # пропустить».
+        #
+        # До этого выбор только запоминал причину и ждал **текст** от оператора —
+        # лишний шаг там, где всё уже известно: тип ошибки, модуль и причина
+        # лежат в журнале. Теперь статус меняется сразу, а у оператора
+        # остаётся **один** необязательный шаг — фото или видео.
+        details = journal.last_issue_details_for_robot((fresh or {}).get("id")) if fresh else None
 
-        if not label:
+        if not details:
             # Ошибку убрали или её не было: кнопка устарела. Честно говорим и не
             # подставляем ничего от себя — причина офлайна должна быть настоящей.
             tg.answer_callback_query(callback_id, "No recent error to use")
             return
+
+        label = details["issue"]
+        note = details["note"]
     else:
         label = robot_status.reason_label(direction, code)
 
@@ -2479,8 +2517,23 @@ def handle_status_callback(callback: dict):
     # Запись всё равно попадает в журнал: `type_problem` = выбранная причина,
     # `problem_note` = пусто. Пустая заметка честно означает «описания нет», а
     # не «данные потеряли».
-    if code == "skip":
-        result = robot_status.change_robot_status(robot, direction, label, "", employee)
+    # 🔴 **Последняя ошибка — сразу в офлайн, без шага описания.**
+    #
+    # Владелец 18.10.2026: «при выборе ошибка полностью сама переводила робота в
+    # офлайн по данным с последней ошибки… и всё только фото или видео просила с
+    # возможностью пропустить».
+    #
+    # Описание (`note`) уже собрано из записи об ошибке: тип · модуль · причина.
+    # Статус меняется сразу — ждать текст от оператора незачем, он всё равно
+    # повторил бы то, что записано в журнале. Остаётся один необязательный шаг:
+    # фото или видео (`_ask_repair_photo`), и его можно пропустить.
+    #
+    # **Почему не отдельная ветка «last_issue» рядом со `skip`.** Оба пути делают
+    # одно и то же — меняют статус и просят снимок; разница только в тексте
+    # заметки. Две копии разошлись бы, как только в одном из них поменяли бы
+    # порядок вызовов.
+    if code == "skip" or (code == "last_issue" and direction == "offline"):
+        result = robot_status.change_robot_status(robot, direction, label, note if code == "last_issue" else "", employee)
 
         if not result:
             tg.answer_callback_query(
@@ -2488,14 +2541,19 @@ def handle_status_callback(callback: dict):
             )
             return
 
-        tg.answer_callback_query(callback_id, f"{spec['label']} — no description")
+        tg.answer_callback_query(
+            callback_id,
+            f"{spec['label']} — from the last error" if code == "last_issue"
+            else f"{spec['label']} — no description",
+        )
         _delete_quiet(chat_id, message_id)
         _send(
             chat_id,
             "\n".join([
                 robot_status.status_title(direction, robot),
                 f"Reason: {label}",
-                "Note: —",
+                # Для последней ошибки заметка не пустая: в ней модуль и причина.
+                f"Note: {note if code == 'last_issue' else '—'}",
             ]),
         )
         _ask_repair_photo(chat_id, sender, direction, robot, label, message_id)
@@ -2829,8 +2887,13 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
 
     _send(
         chat_id,
-        "📷 Send a photo of the fault (or /cancel). It will be attached to the "
-        "repair record.",
+        # 🔴 **Фото ИЛИ видео, и можно пропустить** (владелец 18.10.2026:
+        # «всё только фото или видео просила с возможностью пропустить»).
+        # Пропуск — `/cancel`: робот уже выведен из работы, и держать его из-за
+        # отсутствия снимка нельзя.
+        "📷 Send a photo or a video of the fault — it will be attached to the "
+        "repair record.\n"
+        "Skip with /cancel: the robot stays offline either way.",
         reply_to_message_id=message_id,
         delete_after=CONFIRM_TTL_SECONDS,
     )
@@ -4800,25 +4863,25 @@ def handle_photo(chat_id, sender, message, message_id):
     Порядок: подпись к фото → недавняя ошибка этого же сотрудника
     (текст был раньше) → ожидание текста (текст придёт следующим).
     """
-    sizes = message.get("photo") or []
+    # Фото **или видео**: обе ветки идут через `_pick_media`, иначе видео
+    # молча не сохранялось бы, хотя оператор его прислал.
+    best, media_kind = _pick_media(message)
 
-    if not sizes:
+    if best is None:
         return
-
-    best = sizes[-1]
 
     file_path = tg.get_file(best.get("file_id"))
 
     if not file_path:
         _send(
             chat_id,
-            "⚠️ Can't download the photo from Telegram. Please try again.",
+            "⚠️ Can't download the file from Telegram. Please try again.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
         return
 
-    extension = os.path.splitext(file_path)[1] or ".jpg"
+    extension = os.path.splitext(file_path)[1] or (".jpg" if media_kind == "photo" else ".mp4")
     file_unique_id = best.get("file_unique_id") or best.get("file_id")
 
     destination = os.path.join(
@@ -4829,13 +4892,13 @@ def handle_photo(chat_id, sender, message, message_id):
     if not tg.download_file(file_path, destination):
         _send(
             chat_id,
-            "⚠️ Can't save the photo on the server. Please try again.",
+            "⚠️ Can't save the file on the server. Please try again.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
         return
 
-    console.print(f"[cyan]📷 Фото сохранено: {destination}[/cyan]")
+    console.print(f"[cyan]📎 Файл сохранён: {destination}[/cyan]")
 
     caption = (message.get("caption") or "").strip()
     employee_name = get_employee_name(sender.get("id"))
@@ -5205,7 +5268,14 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         _handle_text_message(chat_id, sender, text, message_id, chat)
         return
 
-    if message.get("photo"):
+    # 🔴 **Фото ИЛИ видео** (владелец 18.10.2026: «только фото или видео
+    # просила с возможностью пропустить»).
+    #
+    # Ветка была `if message.get("photo")` — видео не попадало сюда вовсе и
+    # уходило в «неподдерживаемый тип»: оператор снимал поломку на видео и не
+    # получал **никакого** ответа. Теперь обе ветки (осмотр и фото ремонта)
+    # получают файл через `_pick_media`.
+    if message.get("photo") or message.get("video") or message.get("video_note") or message.get("animation"):
         # **Фото пункта осмотра — раньше проверки топика ошибок.**
         #
         # Осмотр идёт в рабочем топике (в нём же живут статусы), а склад топика
@@ -5361,6 +5431,44 @@ def _handle_inspection_text(chat_id, sender, text, message_id) -> bool:
     return inspection_module.handle_text(chat_id, sender, text, message_id)
 
 
+def _pick_media(message: dict):
+    """
+    Файл из сообщения: фото или видео.
+
+    🔴 **Зачем (владелец 18.10.2026):** «всё только фото или видео просила с
+    возможностью пропустить». До этого бот умел **только фото**: `message.get
+    ("photo")` — и всё, а видео попадало в список неподдерживаемых типов и
+    молча игнорировалось. Оператор снимал поломку на видео и не получал ответа
+    вообще — то есть терял снимок и не понимал, приняли его или нет.
+
+    Возвращает `(best, kind)`, где `kind` — `"photo"` или `"video"`, либо
+    `(None, None)`.
+
+    **Почему последний размер фото.** Telegram присылает несколько размеров
+    одного снимка; последний — самый крупный. Первый был бы превью 90×90, и
+    «фото поломки» нельзя было бы разглядеть.
+    """
+    sizes = message.get("photo") or []
+
+    if sizes:
+        return sizes[-1], "photo"
+
+    video = message.get("video")
+
+    if video:
+        return video, "video"
+
+    # Видеосообщение (кружок) и анимация — тот же случай: это видео, и оператор
+    # ждёт, что оно сохранится.
+    for key in ("video_note", "animation"):
+        item = message.get(key)
+
+        if item:
+            return item, "video"
+
+    return None, None
+
+
 def _handle_inspection_photo(chat_id, sender, message, message_id) -> bool:
     """
     Фото для пункта осмотра. Скачивает файл и отдаёт диалогу.
@@ -5380,24 +5488,24 @@ def _handle_inspection_photo(chat_id, sender, message, message_id) -> bool:
     ):
         return False
 
-    sizes = message.get("photo") or []
+    # Фото **или видео**: владелец просил «только фото или видео» (18.10.2026).
+    best, media_kind = _pick_media(message)
 
-    if not sizes:
+    if best is None:
         return False
 
-    best = sizes[-1]
     file_path = tg.get_file(best.get("file_id"))
 
     if not file_path:
         _send(
             chat_id,
-            "⚠️ Can't download the photo from Telegram. Please try again.",
+            "⚠️ Can't download the file from Telegram. Please try again.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
         return True
 
-    extension = os.path.splitext(file_path)[1] or ".jpg"
+    extension = os.path.splitext(file_path)[1] or (".jpg" if media_kind == "photo" else ".mp4")
     file_unique_id = best.get("file_unique_id") or best.get("file_id")
 
     destination = os.path.join(
@@ -5408,13 +5516,13 @@ def _handle_inspection_photo(chat_id, sender, message, message_id) -> bool:
     if not tg.download_file(file_path, destination):
         _send(
             chat_id,
-            "⚠️ Can't save the photo on the server. Please try again.",
+            "⚠️ Can't save the file on the server. Please try again.",
             reply_to_message_id=message_id,
             delete_after=CONFIRM_TTL_SECONDS,
         )
         return True
 
-    _send_action(chat_id, "upload_photo")
+    _send_action(chat_id, "upload_video" if media_kind == "video" else "upload_photo")
 
     return inspection_module.handle_photo(
         chat_id, sender, message, message_id, destination
