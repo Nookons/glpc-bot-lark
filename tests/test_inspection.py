@@ -49,6 +49,7 @@ os.environ["TELEGRAM_WRONG_TOPIC_HINT"] = ""
 
 import pytest  # noqa: E402
 
+import lark_media
 import inspection as insp  # noqa: E402
 import inspection_api  # noqa: E402
 import telegram_api as tg  # noqa: E402
@@ -252,6 +253,25 @@ def rec(monkeypatch) -> Recorder:
     monkeypatch.setattr(validation, "find_elsewhere", lambda *a, **k: [])
     monkeypatch.setattr(
         insp, "list_templates", lambda auth_id, category: list(TEMPLATES)
+    )
+
+    # 🔴 **Lark: карточка осмотра не должна уходить в живую группу из теста.**
+    #
+    # С 23.10.2026 завершённый осмотр отправляет карточку в вебхук склада — тот
+    # же, куда уходят ошибки. Без подмены каждый тест, дошедший до конца
+    # осмотра, посылал бы **настоящее сообщение в рабочую группу владельца**.
+    # Сторож наружу это поймал (`requests.post → open.larksuite.com`), но
+    # правильнее не доводить до него: тест не должен даже пытаться.
+    #
+    # Заглушка стоит на уровне модуля отправки: подмена `_notify_lark_inspection`
+    # скрыла бы и сборку карточки, а её проверяет отдельный тест.
+    monkeypatch.setattr(
+        lark_media, "send_card_via_hook",
+        lambda hook_url, card: {"code": 0, "msg": "ok"},
+    )
+    monkeypatch.setattr(
+        lark_media, "send_text_via_hook",
+        lambda hook_url, text: {"code": 0, "msg": "ok"},
     )
 
     # 🔴 **Последний барьер: наружу из теста выйти нельзя.**
@@ -894,6 +914,177 @@ class TestItems:
         texts = "\n".join(item["text"] for item in rec.sent)
         assert "Inspection passed" in texts
         assert "Checked: 2 of 2" in texts
+
+    def _finish_with(self, rec, monkeypatch, verdict, items, share=True):
+        """Доводит осмотр до конца и возвращает отправленные в Lark карточки."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch, items=items)
+
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": verdict,
+                "template_id": 1, "warehouse": "GLP-C",
+                "done_at": "2026-10-23T10:45:00Z", "done_by": 60072001,
+                "equipment": {
+                    "code": "3780", "category": "robot", "sub_warehouse": "C2",
+                    "equipment_type": {"type": "RT_KUBOT_MINI_HAIFLEX"},
+                },
+                "items": items,
+            },
+        )
+        monkeypatch.setattr(
+            insp, "create_share",
+            lambda auth_id, inspection_id: (
+                {"public_token": "Tok123"} if share else {}
+            ),
+        )
+
+        cards = []
+        monkeypatch.setattr(
+            lark_media, "send_card_via_hook",
+            lambda hook_url, card: (cards.append(card), {"code": 0})[1],
+        )
+        path = _write_photo(monkeypatch)
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 41, path)
+        return cards
+
+    def test_lark_card_is_sent_on_success(self, rec, monkeypatch) -> None:
+        """🔴 Выполненный осмотр уходит карточкой в Lark-группу ошибок.
+
+        Требование владельца 23.10.2026: «после инспекции отправлялась карточка
+        в Lark куда отправляются ошибки по хуку, что была выполнена инспекция
+        вот такого оборудования таким то работником, краткий вывод всё хорошо,
+        были найдены проблемы и ссылка публичная на инспекцию».
+
+        Проверяем **каждый** из четырёх пунктов требования: оборудование,
+        работник, вывод и ссылка. Без любого из них карточка не отвечает на
+        вопрос, ради которого её читают.
+        """
+        cards = self._finish_with(
+            rec, monkeypatch, "ok",
+            [{"id": 101, "position": 1, "code": "R-01", "title": "Only point",
+              "verdict": "ok", "comment": None}],
+        )
+
+        assert len(cards) == 1, "карточка в Lark не отправлена"
+        card = cards[0]
+        title = card["header"]["title"]["content"]
+        body = "\n".join(
+            el.get("text", {}).get("content", "")
+            for el in card["elements"] if el.get("tag") == "div"
+        )
+        # 1. Оборудование — номер, а не внутренний id.
+        assert "3780" in title, title
+        assert "1339" not in title, "в заголовке внутренний id вместо номера"
+        # 2. Работник — в блоке `note` внизу карточки.
+        footer = "\n".join(
+            el.get("elements", [{}])[0].get("content", "")
+            for el in card["elements"] if el.get("tag") == "note"
+        )
+        # Имя берётся из сессии (фикстура: «Felipe Dominguez»), а не из
+        # `done_by` осмотра — бот знает, кто нажал, и это надёжнее.
+        assert "Felipe Dominguez" in footer, footer
+        # 3. Краткий вывод «всё хорошо».
+        assert "No problems found" in body, body
+        # 4. Публичная ссылка — и текстом (для таблицы), и кнопкой.
+        assert "Tok123" in body, "ссылка не попала в текст карточки"
+        assert any(el.get("tag") == "action" for el in card["elements"]), "нет кнопки"
+
+    def test_lark_card_lists_problems(self, rec, monkeypatch) -> None:
+        """Осмотр с проблемами: вывод говорит, **какие** проблемы найдены."""
+        cards = self._finish_with(
+            rec, monkeypatch, "warning",
+            [{"id": 101, "position": 1, "code": "K-01", "title": "Chassis Bottom",
+              "verdict": "warning", "comment": "Scratched"}],
+        )
+
+        assert len(cards) == 1
+        card = cards[0]
+        body = "\n".join(
+            el.get("text", {}).get("content", "")
+            for el in card["elements"] if el.get("tag") == "div"
+        )
+
+        assert card["header"]["template"] == "yellow", card["header"]["template"]
+        assert "problems found" in body.lower(), body
+        # Без перечня «были найдены проблемы» не говорит, какие, и карточку
+        # пришлось бы открывать ради этого.
+        assert "Chassis Bottom" in body, body
+        assert "Scratched" in body, body
+
+    def test_lark_falls_back_to_text(self, rec, monkeypatch) -> None:
+        """Карточка не прошла → сообщение уходит **текстом**, а не теряется."""
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{"id": 101, "position": 1, "code": "R-01", "title": "Only",
+                    "verdict": "ok", "comment": None}],
+        )
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": "ok", "template_id": 1,
+                "warehouse": "GLP-C", "done_at": "2026-10-23T10:45:00Z",
+                "equipment": {"code": "3780", "category": "robot"},
+                "items": [{"id": 101, "title": "Only", "verdict": "ok",
+                           "comment": None}],
+            },
+        )
+        monkeypatch.setattr(insp, "create_share",
+                            lambda *a, **k: {"public_token": "Tok123"})
+
+        texts = []
+        monkeypatch.setattr(lark_media, "send_card_via_hook",
+                            lambda hook_url, card: {"code": 9499, "msg": "bad"})
+        monkeypatch.setattr(lark_media, "send_text_via_hook",
+                            lambda hook_url, text: (texts.append(text), {"code": 0})[1])
+
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 41, _write_photo(monkeypatch))
+
+        assert len(texts) == 1, "текстовый запасной вариант не отправлен"
+        assert "3780" in texts[0]
+        assert "Tok123" in texts[0]
+
+    def test_lark_failure_does_not_break_the_inspection(
+        self, rec, monkeypatch
+    ) -> None:
+        """Сбой Lark не отменяет закрытый осмотр: работа уже сделана."""
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{"id": 101, "position": 1, "code": "R-01", "title": "Only",
+                    "verdict": "ok", "comment": None}],
+        )
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": "ok", "template_id": 1,
+                "warehouse": "GLP-C", "equipment": {"code": "3780"},
+                "items": [{"id": 101, "title": "Only", "verdict": "ok",
+                           "comment": None}],
+            },
+        )
+        monkeypatch.setattr(insp, "create_share",
+                            lambda *a, **k: {"public_token": "Tok123"})
+
+        def boom(*a, **k):
+            raise RuntimeError("Lark is down")
+
+        monkeypatch.setattr(lark_media, "send_card_via_hook", boom)
+        monkeypatch.setattr(lark_media, "send_text_via_hook", boom)
+
+        # Не должно бросить: осмотр закрыт, ссылка выдана, данные на сервере.
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 41, _write_photo(monkeypatch))
+
+        texts = "\n".join(item["text"] for item in rec.sent)
+        assert "for everyone on the web" in texts, "ссылка оператору не выдана"
 
     def test_public_link_is_sent(self, rec, monkeypatch) -> None:
         """Общая ссылка «для всех на веб-версию» приходит в чат."""

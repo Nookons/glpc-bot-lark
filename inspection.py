@@ -1633,13 +1633,120 @@ def _finish_inspection(session: Session, chat_id) -> None:
     link = _share_link(session)
 
     if link:
+        # 🔴 **Ссылка — текстом, а не только кнопкой.**
+        #
+        # Требование владельца: «выдавалась публичная ссылка для того чтобы
+        # вставлять в таблицу». Вставить в таблицу можно только **текст**:
+        # кнопку не выделить и не скопировать. Поэтому ссылка печатается
+        # отдельной строкой (в Telegram тап по ней копирует), а кнопка рядом
+        # нужна для открытия одним касанием — одно не заменяет другое.
         bot._send(
             chat_id,
             "🔗 Public report — for everyone on the web:\n"
-            f"{link}",
+            f"{link}\n"
+            "\n"
+            "Tap the link to copy it into your table.",
+            reply_markup={
+                "inline_keyboard": [[{
+                    "text": "📄 Open report",
+                    "url": link,
+                }]],
+            },
+        )
+
+    # 🔴 **Карточка в Lark-группу ошибок — после закрытия и после ссылки.**
+    #
+    # Требование владельца 23.10.2026: «после инспекции отправлялась карточка в
+    # Lark куда отправляются ошибки по хуку, что была выполнена инспекция вот
+    # такого оборудования таким то работником, краткий вывод всё хорошо, были
+    # найдены проблемы, и ссылка публичная на инспекцию».
+    #
+    # **Почему последним шагом.** Карточка содержит публичную ссылку, а ссылка
+    # выдаётся только на закрытый осмотр: отправить раньше значило бы послать в
+    # группу карточку без ссылки или с ошибкой.
+    #
+    # **Почему сбой Lark не отменяет ничего.** Осмотр уже закрыт, данные на
+    # сервере, ссылка у оператора. Внешняя сеть может не ответить, и терять
+    # из-за неё выполненную работу нельзя — `_notify_lark_inspection` сама
+    # логирует отказ и возвращает `False`.
+    #
+    # 🔴 **`try` обязателен, и это не перестраховка.** Внутри — `requests` к
+    # чужому серверу и сборка словаря для Lark. Сбой сети, таймаут, неожиданный
+    # ответ — всё это бросает **исключение**, а не возвращает `False`. Без
+    # `try` оно пробивало наружу из `_finish_inspection` **после** закрытия
+    # осмотра: оператор не получал ни итога, ни ссылки, хотя работа была
+    # сделана и сохранена. Найдено сторожем
+    # `test_lark_failure_does_not_break_the_inspection`.
+    try:
+        _notify_lark_inspection(session, inspection, link)
+    except Exception:  # noqa: BLE001 — внешняя сеть, любая ошибка не должна ломать осмотр
+        logger.exception(
+            "Осмотр %s: отправка карточки в Lark упала с исключением; "
+            "осмотр закрыт, ссылка выдана",
+            inspection.get("id"),
         )
 
     _close_session(session)
+
+
+def _notify_lark_inspection(
+    session: Session, inspection: dict, public_link: Optional[str]
+) -> bool:
+    """Карточка о выполненном осмотре в Lark-группу склада.
+
+    Идёт **в тот же вебхук, что и ошибки** (`error_hook`): владелец сказал
+    «куда отправляются ошибки по хуку». Осмотр — это событие по оборудованию, и
+    читают его там же, где ошибки; отдельный вебхук пришлось бы заводить и
+    настраивать, а группа была бы второй.
+
+    `False` — карточка не прошла (сеть/схема/лимит). Вызывающий это не
+    обрабатывает: осмотр к этому моменту уже закрыт, и отменять нечего.
+    """
+    import lark_hooks
+    from inspection_card import build_inspection_card, build_inspection_text
+    from lark_media import hook_ok, send_card_via_hook, send_text_via_hook
+
+    equipment = inspection.get("equipment") or {}
+    warehouse = inspection.get("warehouse") or session.warehouse
+    target = lark_hooks.error_hook(warehouse)
+
+    if not target:
+        logger.warning(
+            "Осмотр %s: вебхук Lark для склада %s не задан — карточка не отправлена",
+            inspection.get("id"),
+            warehouse,
+        )
+        return False
+
+    card = build_inspection_card(
+        inspection, session.employee_name, public_link or ""
+    )
+    result = send_card_via_hook(target, card)
+
+    if hook_ok(result):
+        logger.info(
+            "Осмотр %s отправлен в Lark карточкой (%s, %s)",
+            inspection.get("id"),
+            equipment.get("code"),
+            warehouse,
+        )
+        return True
+
+    # 🔴 **Откат на текст.** Карточка может не пройти из-за схемы или лимита, а
+    # сообщение о выполненном осмотре терять нельзя: по нему в группе узнают,
+    # что оборудование проверено. Тот же приём, что у статусов и сменных
+    # отчётов.
+    logger.warning(
+        "Карточка осмотра %s не прошла (%s) — отправляю текстом",
+        inspection.get("id"),
+        result,
+    )
+    send_text_via_hook(
+        target,
+        build_inspection_text(inspection, session.employee_name, public_link or ""),
+    )
+
+    return False
 
 
 def _share_link(session: Session) -> Optional[str]:
