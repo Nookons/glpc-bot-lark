@@ -877,9 +877,25 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
         answer("Cancelled")
 
         if session:
-            _delete_quiet(chat_id, session.data.get("prompt_message_id"))
-            _delete_quiet(chat_id, session.data.get("example_message_id"))
-            _delete_quiet(chat_id, session.data.get("photo_message_id"))
+            # 🔴 **Убираем ВСЁ, что бот отправил по этому осмотру.**
+            #
+            # Владелец 23.10.2026: «cancel работает криво очень». Дефект был в
+            # том, что список удаляемого **отставал** от списка отправляемого:
+            # `Cancel` знал про карточку пункта и образец, но не про сообщение
+            # «Describe what is wrong» — оно оставалось в чате с рабочими на
+            # вид кнопками.
+            #
+            # Хуже: после отмены человек видел **старые** кнопки `Problem` /
+            # `Cancel` и нажимал их снова. Сессии уже нет, и ответ был
+            # «This inspection expired» — то есть отмена выглядела как поломка.
+            _delete_quiet(chat_id, session.data.pop("prompt_message_id", None))
+            _delete_quiet(chat_id, session.data.pop("example_message_id", None))
+            _delete_quiet(chat_id, session.data.pop("photo_message_id", None))
+            _delete_quiet(chat_id, session.data.pop("problem_message_id", None))
+
+            # Само нажатие тоже убираем: иначе в чате остаётся сообщение с
+            # кнопками, которые уже ничего не делают.
+            _delete_quiet(chat_id, message_id)
 
         return True
 
@@ -1019,7 +1035,7 @@ def _start_problem(session: Session, arg: str, chat_id, message_id, answer) -> N
     answer("Describe the problem")
 
     bot = _bot()
-    bot._send(
+    sent = bot._send(
         chat_id,
         f"⚠️ Problem at: {session.current_item().get('title')}\n"
         "\n"
@@ -1027,6 +1043,22 @@ def _start_problem(session: Session, arg: str, chat_id, message_id, answer) -> N
         "A critical point marked as a problem fails the whole inspection.",
         reply_markup=problem_keyboard(),
     )
+
+    # 🔴 **Сообщение проблемы запоминаем, иначе Cancel его не уберёт.**
+    #
+    # Владелец 23.10.2026: «cancel работает криво очень». Причина: `Cancel`
+    # удалял `prompt_message_id` (карточку пункта) и `example_message_id`
+    # (образец), а это сообщение **нигде не сохранялось** — и оставалось в
+    # чате после отмены. За осмотр из четырнадцати пунктов, где оператор
+    # несколько раз нажимал `Problem`, топик забивался брошенными
+    # «Describe what is wrong» с живыми на вид кнопками.
+    #
+    # Ключ отдельный, а не `prompt_message_id`: карточка пункта и этот вопрос —
+    # **разные** сообщения, и затирание одного id другим оставило бы мусор.
+    if sent:
+        session.data["problem_message_id"] = sent.get("message_id")
+        put_session(session)
+
     _delete_quiet(chat_id, message_id)
 
 
@@ -1186,39 +1218,37 @@ def _handle_problem_comment(session: Session, text: str, chat_id, message_id) ->
         bot._send(chat_id, "⚠️ Please describe the problem in one message.")
         return
 
-    # 🔴 **Пункт с обязательным снимком не закрывается без снимка (23.10.2026).**
+    # 🔴 **«Problem» ВСЕГДА требует снимок — требование владельца (23.10.2026).**
     #
-    # Вторая половина того же дефекта, что дал `Couldn't close the inspection:
-    # A photo is required for: K-12`. Кнопка `Problem` ведёт сюда, а здесь
-    # вызывался `_finish_item` **без `photo_path`**: у пункта с
-    # `requires_photo` появлялся вердикт и **не появлялось фото**, после чего
-    # осмотр нельзя было закрыть **уже никак** — человек даже не мог вернуться
-    # и доснять, потому что пункт считался пройденным.
+    # Дословно: «Если Problem то тоже нужно фото просто пометить что проблемное».
+    # То есть снимок нужен **любому** проблемному пункту, а не только тому, у
+    # которого шаблон требует фото: именно снимок и есть доказательство поломки,
+    # и без него тому, кто будет чинить, нечего смотреть.
     #
-    # Такую мину ставил сам бот: путь «сообщил проблему» вёл в гарантированный
-    # тупик на каждом пункте с требованием снимка.
+    # **Что было до этого.** Снимок просился только при `requires_photo`, а в
+    # остальных случаях `_finish_item` вызывался **без `photo_path`**: пункт
+    # закрывался вердиктом `warning`/`failed` и **без фотографии**. Для пунктов
+    # шаблона это ещё и вело в тупик — сервер отказывался закрывать осмотр,
+    # если снимок обязателен (`A photo is required for: K-12`), а пункт уже
+    # считался пройденным.
     #
-    # **Что делаем.** Просим снимок **до** вердикта и оставляем пункт открытым.
-    # Это не придирка: сервер всё равно откажет в закрытии осмотра, и лучше
-    # сказать об этом сейчас, когда человек стоит у робота, чем оставить ему
-    # черновик, который невозможно завершить.
-    #
-    # 🔴 **Комментарий сохраняем, а не теряем.** Первая редакция просто просила
-    # фото — и человек, написав «Horn is cracked», терял текст: после снимка
-    # пункт закрывался как `ok`, будто проблемы нет. Теперь объяснение лежит в
-    # `session.problem_comment`, и снимок закрывает пункт **с этим
-    # комментарием** и вердиктом `failed`/`warning` (`handle_photo`).
-    if item.get("requires_photo") and not item.get("photo_url"):
+    # **Комментарий сохраняем, а не теряем.** Человек уже написал «Horn is
+    # cracked» — текст кладём в `session.problem_comment`, и снимок закрывает
+    # пункт **с этим объяснением** и вердиктом `failed`/`warning`
+    # (`handle_photo`). Иначе после фото пункт стал бы `ok`, то есть «проблемы
+    # нет», и слова оператора пропали бы.
+    if not item.get("photo_url"):
         session.problem_comment = comment
         session.step = STEP_PROBLEM
         put_session(session)
         bot._send(
             chat_id,
-            f"📷 This point needs a photo: {item.get('title')}.\n"
+            f"📷 Send a photo of the problem: {item.get('title')}.\n"
             "\n"
-            "The problem is noted. Send a photo now — it will be saved with "
-            "your description.\n"
-            "Without a photo the inspection can't be closed.",
+            f"Your description is saved: “{comment}”\n"
+            "The photo will be attached together with it, and the point will be "
+            "marked as a problem.\n"
+            "Without a photo the point can't be closed.",
             reply_markup=problem_keyboard(),
         )
         return
@@ -1275,10 +1305,37 @@ def handle_photo(chat_id, sender, message, message_id, photo_path: str) -> bool:
         return False
 
     if session.step == STEP_PROBLEM:
-        # Комментарий ждали текстом, а прислали фото. Фото прикрепляем к пункту
-        # и просим всё-таки описать проблему: молча проглотить снимок значило
-        # бы потерять объяснение, без которого вердикт бесполезен.
+        # 🔴 **Фото на шаге проблемы = снимок доказательства (23.10.2026).**
+        #
+        # Требование владельца: «если Problem то тоже нужно фото просто пометить
+        # что проблемное». Поэтому здесь два случая, и они **разные**:
+        #
+        # 1. **Объяснение уже есть** (`problem_comment`) — снимок дополняет его,
+        #    и пункт закрывается **сразу** с вердиктом `failed`/`warning`.
+        #    Раньше бот и в этом случае просил текст заново, хотя человек его
+        #    уже написал.
+        # 2. **Объяснения ещё нет** — снимок прикрепили, но описание нужно:
+        #    «что-то не так» без слов не объясняет, что чинить.
         if not _attach_photo(session, photo_path, chat_id, message_id):
+            return True
+
+        problem_comment = str(session.problem_comment or "").strip()
+
+        if problem_comment:
+            _finish_item(
+                session,
+                verdict=(
+                    "failed"
+                    if (session.current_item() or {}).get("is_critical")
+                    else "warning"
+                ),
+                comment=problem_comment,
+                chat_id=chat_id,
+                delete_message_id=message_id,
+                # Фото уже прикреплено внутри `_attach_photo` — передавать
+                # `photo_path` нельзя: снимок загрузился бы второй раз.
+                photo_path=None,
+            )
             return True
 
         bot = _bot()
@@ -1341,7 +1398,7 @@ def _attach_photo(session: Session, photo_path: str, chat_id, message_id) -> boo
         return False
 
     try:
-        upload_item_photo(
+        uploaded = upload_item_photo(
             session.auth_id,
             inspection_id=int(session.inspection["id"]),
             item_id=int(item["id"]),
@@ -1357,6 +1414,24 @@ def _attach_photo(session: Session, photo_path: str, chat_id, message_id) -> boo
             "Please send the photo again.",
         )
         return False
+
+    # 🔴 **Снимок запоминаем в сессии (23.10.2026).**
+    #
+    # Раньше сюда приходило `upload_item_photo(...)` без сохранения результата:
+    # фото уходило на сервер, но в `session.items[i]["photo_url"]` оставалось
+    # пусто. Из-за этого **следующая** проверка «есть ли у пункта снимок»
+    # считала, что его нет, — и предлагала снять ещё раз, хотя снимок уже был.
+    #
+    # Проверка нужна в двух местах: при `Problem` на пункте с обязательным фото
+    # и при повторной отправке. Оба смотрят в сессию, а не в API: лишний запрос
+    # на каждый шаг незачем, а после успешной загрузки ответ API всё равно
+    # содержит `photo_url`.
+    if isinstance(uploaded, dict):
+        url = uploaded.get("photo_url") or (uploaded.get("data") or {}).get("photo_url")
+
+        if url:
+            item["photo_url"] = url
+            put_session(session)
 
     return True
 
@@ -1429,6 +1504,15 @@ def _finish_item(
     # `photo_message_id` нигде не заполнялся — оставлено на случай, если
     # появится путь, где фото приходит от бота отдельным сообщением.
     _delete_quiet(chat_id, session.data.pop("photo_message_id", None))
+
+    # 🔴 **Вопрос «Describe what is wrong» тоже убираем.**
+    #
+    # Он появляется при нажатии `Problem` и раньше **не удалялся нигде**: ни
+    # при переходе к следующему пункту, ни при отмене. За осмотр из
+    # четырнадцати пунктов с несколькими проблемами в топике оставалась стопка
+    # сообщений с кнопкой `Cancel` — и оператор не понимал, какая из них
+    # относится к текущему пункту (владелец: «cancel работает криво очень»).
+    _delete_quiet(chat_id, session.data.pop("problem_message_id", None))
 
     session.item_index += 1
     session.problem_comment = ""
@@ -1582,8 +1666,12 @@ def _share_link(session: Session) -> Optional[str]:
 
 
 def _close_session(session: Session) -> None:
+    # 🔴 `problem_message_id` — третье сообщение осмотра, и раньше оно
+    # переживало закрытие: после завершённого осмотра в чате оставался вопрос
+    # «Describe what is wrong» с кнопкой `Cancel`.
     _delete_quiet(session.chat_id, session.data.get("example_message_id"))
     _delete_quiet(session.chat_id, session.data.get("prompt_message_id"))
+    _delete_quiet(session.chat_id, session.data.get("problem_message_id"))
     drop_session(session.chat_id, session.user_id)
 
 
@@ -1605,6 +1693,10 @@ def cancel(chat_id, sender) -> bool:
 
     _delete_quiet(chat_id, session.data.get("example_message_id"))
     _delete_quiet(chat_id, session.data.get("prompt_message_id"))
+    # Вопрос «Describe what is wrong» — третье сообщение осмотра. Без этой
+    # строки `/cancel` оставлял его в чате с живой на вид кнопкой `Cancel`
+    # (владелец: «cancel работает криво очень»).
+    _delete_quiet(chat_id, session.data.get("problem_message_id"))
 
     bot = _bot()
     text = "✖️ Inspection cancelled."

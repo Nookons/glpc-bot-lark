@@ -731,6 +731,77 @@ class TestItems:
         assert (CHAT_ID, 4242) in rec.deleted, "фото оператора осталось"
         assert (CHAT_ID, example_message_id) in rec.deleted, "фото-пример осталось"
 
+    def test_cancel_removes_the_problem_question(self, rec, monkeypatch) -> None:
+        """🔴 Cancel убирает и вопрос «Describe what is wrong».
+
+        Владелец 23.10.2026: «cancel работает криво очень».
+
+        Причина дефекта: `Cancel` удалял карточку пункта и фото-пример, но
+        сообщение, которое бот присылает **после кнопки `Problem`**, нигде не
+        сохранялось — и оставалось в чате после отмены. За осмотр из
+        четырнадцати пунктов топик забивался брошенными «Describe what is
+        wrong» с кнопками, которые уже ничего не делают.
+
+        Хуже: человек нажимал эти старые кнопки снова, получал «This inspection
+        expired» и решал, что бот сломан.
+        """
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_PROBLEM, "0"], 50, "cb3"
+        )
+
+        problem_message_id = _session().data.get("problem_message_id")
+
+        assert problem_message_id, "id вопроса о проблеме не сохранён — Cancel его не найдёт"
+
+        rec.deleted.clear()
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_CANCEL], 70, "cb9"
+        )
+
+        assert _session() is None
+        assert (CHAT_ID, problem_message_id) in rec.deleted, (
+            "вопрос «Describe what is wrong» остался в чате после отмены"
+        )
+        # Само нажатие тоже убираем: иначе кнопки висят без владельца.
+        assert (CHAT_ID, 70) in rec.deleted
+
+    def test_cancel_removes_the_question_after_a_problem_was_reported(
+        self, rec, monkeypatch
+    ) -> None:
+        """Cancel после описания проблемы (шаг фото) тоже чистит чат."""
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{
+                "id": 101, "position": 1, "code": "R-01", "title": "Horn",
+                "requires_photo": True, "is_critical": False, "verdict": None,
+            }, {
+                "id": 102, "position": 2, "code": "R-02", "title": "Button",
+                "requires_photo": False, "is_critical": False, "verdict": None,
+            }],
+        )
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_PROBLEM, "0"], 50, "cb3"
+        )
+        insp.handle_text(CHAT_ID, {"id": USER_ID}, "Horn is cracked", 51)
+
+        problem_message_id = _session().data.get("problem_message_id")
+
+        assert problem_message_id
+
+        rec.deleted.clear()
+        insp.cancel(CHAT_ID, {"id": USER_ID})
+
+        assert (CHAT_ID, problem_message_id) in rec.deleted, (
+            "после /cancel вопрос о проблеме остался"
+        )
+
     def test_step_message_is_deleted_before_the_next_point(self, rec, monkeypatch) -> None:
         """🔴 Сообщение пункта убирается из чата при переходе к следующему.
 
@@ -927,6 +998,13 @@ class TestProblemButton:
         )
         insp.handle_text(CHAT_ID, {"id": USER_ID}, "Horn is cracked", 51)
 
+        # 🔴 Снимок доказательства обязателен и для критичного пункта
+        # (владелец 23.10.2026). Без него вердикта быть не должно.
+        assert verdict_calls == [], "вердикт поставлен без снимка доказательства"
+
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 52, _write_photo(monkeypatch))
+
         assert verdict_calls == [(101, "failed", "Horn is cracked")], verdict_calls
         assert _session().item_index == 1
 
@@ -986,8 +1064,13 @@ class TestProblemButton:
 
         texts = "\n".join(item["text"] for item in rec.sent)
 
-        assert "This point needs a photo" in texts, texts[-400:]
+        # Текст изменился 23.10.2026: снимок теперь требуется **любому**
+        # проблемному пункту, и сообщение говорит не «нужно фото», а «пришлите
+        # фото проблемы» — вместе с сохранённым описанием.
+        assert "Send a photo of the problem" in texts, texts[-400:]
         assert "Lower Lens" in texts
+        # Человек видит, что его объяснение не потеряно.
+        assert "Lens is dirty" in texts
 
     def test_non_critical_problem_is_warning(self, rec, monkeypatch) -> None:
         """Некритичный пункт → `warning`: осмотр не «падает» из-за мелочи."""
@@ -1031,6 +1114,14 @@ class TestProblemButton:
             CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_PROBLEM, "1"], 61, "cb4"
         )
         insp.handle_text(CHAT_ID, {"id": USER_ID}, "Dust on the button", 62)
+
+        # 🔴 **Снимок обязателен для ЛЮБОГО проблемного пункта** (владелец
+        # 23.10.2026: «если Problem то тоже нужно фото просто пометить что
+        # проблемное»). До этой правки вердикт ставился сразу, и снимка у
+        # проблемного пункта не было вовсе.
+        assert verdict_calls == [], "вердикт поставлен без снимка доказательства"
+
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 63, _write_photo(monkeypatch))
 
         assert verdict_calls == [(102, "warning", "Dust on the button")]
 
