@@ -875,10 +875,28 @@ class TestProblemButton:
         """Критичный пункт → `failed`, комментарий сохраняется.
 
         Требование владельца: кнопка «Problem» — если что-то не так. Провал
-        требует объяснения, иначе тому, кто будет чинить, нечего дел��ть.
+        требует объяснения, иначе тому, кто будет чинить, нечего делать.
+
+        **Пункт без обязательного снимка (уточнено 23.10.2026).** Раньше тест
+        брал пункт из общего набора, а у него `requires_photo=True`. После
+        исправления дефекта `A photo is required for: K-12` такой пункт
+        **нельзя** закрыть без снимка — и тест падал, хотя поведение верное.
+        Здесь проверяется именно вердикт, поэтому снимок не требуется; путь
+        «проблема + обязательный снимок» проверяет следующий тест.
         """
         _start(rec, monkeypatch)
-        _choose_template(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{
+                "id": 101, "position": 1, "code": "R-01", "title": "Horn",
+                "requires_photo": False, "is_critical": True, "verdict": None,
+            }, {
+                # Второй пункт нужен, чтобы сессия пережила вердикт первого:
+                # на последнем пункте диалог закрывается и сессии уже нет.
+                "id": 102, "position": 2, "code": "R-02", "title": "Button",
+                "requires_photo": False, "is_critical": False, "verdict": None,
+            }],
+        )
 
         verdict_calls = []
         monkeypatch.setattr(
@@ -886,6 +904,22 @@ class TestProblemButton:
             lambda auth_id, inspection_id, item_id, verdict, comment=None: (
                 verdict_calls.append((item_id, verdict, comment)), {}
             )[1],
+        )
+        # Осмотр после последнего пункта закрывается — сеть в тестах запрещена.
+        # `create_share` создаёт публичную ссылку отдельным запросом.
+        monkeypatch.setattr(insp, "create_share", lambda *a, **k: {"token": "t"})
+        # Возвращаем правдоподобный итог: код читает `id` и `items`.
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": "failed", "template_id": 1,
+                "warehouse": "GLP-C", "equipment_id": 5,
+                "items": [{
+                    "id": 101, "code": "R-01", "title": "Horn",
+                    "verdict": "failed", "comment": "Horn is cracked",
+                    "requires_photo": False, "is_critical": True,
+                }],
+            },
         )
 
         insp.handle_callback(
@@ -895,6 +929,65 @@ class TestProblemButton:
 
         assert verdict_calls == [(101, "failed", "Horn is cracked")], verdict_calls
         assert _session().item_index == 1
+
+    def test_problem_on_photo_point_asks_for_photo_and_keeps_comment(
+        self, rec, monkeypatch
+    ) -> None:
+        """🔴 Пункт с обязательным снимком: сначала фото, но текст НЕ теряется.
+
+        Дефект 23.10.2026 из живого бота:
+        `⚠️ Couldn't close the inspection: A photo is required for: K-12`.
+
+        `Problem` ставил вердикт **без снимка**, и пункт с `requires_photo`
+        оказывался закрыт «без фото» — после чего осмотр **нельзя было
+        завершить никак**: сервер требовал снимок, а вернуться к пункту уже
+        нельзя, он считался пройденным.
+
+        Проверяем два свойства исправления:
+          1. вердикт **не ставится**, пока нет снимка (иначе тупик);
+          2. объяснение человека **сохраняется** — иначе после снимка пункт
+             закрылся бы как `ok`, то есть «проблемы нет».
+        """
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{
+                "id": 101, "position": 1, "code": "K-12", "title": "Lower Lens",
+                "requires_photo": True, "is_critical": False, "verdict": None,
+            }],
+        )
+
+        verdict_calls = []
+        monkeypatch.setattr(
+            insp, "set_item_verdict",
+            lambda auth_id, inspection_id, item_id, verdict, comment=None: (
+                verdict_calls.append((item_id, verdict, comment)), {}
+            )[1],
+        )
+        # Сеть в тесте запрещена (`tests/conftest.py`): путь до вердикта не
+        # доходит, но заглушки нужны, чтобы тест не зависел от порядка веток.
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_PROBLEM, "0"], 50, "cb3"
+        )
+        insp.handle_text(CHAT_ID, {"id": USER_ID}, "Lens is dirty", 51)
+
+        # Вердикта нет: снимка ещё нет.
+        assert verdict_calls == [], "пункт закрыт без обязательного снимка"
+
+        session = _session()
+
+        # Объяснение сохранено, а не выброшено.
+        assert session.problem_comment == "Lens is dirty"
+
+        # Пункт НЕ сдвинулся: он всё ещё открыт.
+        assert session.item_index == 0
+
+        texts = "\n".join(item["text"] for item in rec.sent)
+
+        assert "This point needs a photo" in texts, texts[-400:]
+        assert "Lower Lens" in texts
 
     def test_non_critical_problem_is_warning(self, rec, monkeypatch) -> None:
         """Некритичный пункт → `warning`: осмотр не «падает» из-за мелочи."""

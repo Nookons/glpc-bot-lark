@@ -530,11 +530,26 @@ def item_caption(session: Session, item: Dict[str, Any]) -> str:
         lines.append("🖼 The photo above is the example — it should look like this")
 
     lines.append("")
-    # 🔴 **Фото ИЛИ видео** (владелец 18.10.2026). Раньше бот умел только фото,
-    # и видео молча игнорировалось — оператор снимал поломку и не получал
-    # ответа. Пропуск — кнопка `Cancel` рядом: пункт остаётся непроверенным, и
-    # это видно в итоге осмотра, а не теряется.
-    lines.append("📷 Send a photo or a video if it's OK, or tap ⚠️ Problem.")
+    # 🔴 **Только ФОТО, без обещания видео** (исправлено 23.10.2026).
+    #
+    # Раньше здесь стояло «Send a photo or a video if it's OK». Обещание было
+    # **ложным сразу в двух местах**, и это выяснилось на живой ошибке:
+    #
+    # 1. **API не принимает видео.** `validate_image` определяет тип по
+    #    сигнатуре файла и знает только JPEG/PNG/WebP — MP4 и MOV отклоняются с
+    #    `400 File content does not match a supported image type`. Проверено.
+    # 2. **Веб не умеет показывать видео.** Страница осмотра рисует
+    #    `<img src={item.photo_url}>`, то есть видео в этой колонке не
+    #    отобразилось бы даже при удачной загрузке.
+    #
+    # Хуже всего было следствие: оператор снимал видео, бот его забирал и
+    # пытался приложить, получал отказ и **пункт не закрывался**. Со стороны это
+    # выглядело как «бот завис» — при том, что инструкция сама предлагала видео.
+    #
+    # Поэтому обещание убрано, а не «поддержано втихую»: обещать то, чего нет,
+    # хуже, чем не обещать. Если видео понадобится, сначала API и веб, потом
+    # текст.
+    lines.append("📷 Send a photo if it's OK, or tap ⚠️ Problem.")
 
     return "\n".join(lines)
 
@@ -1171,6 +1186,43 @@ def _handle_problem_comment(session: Session, text: str, chat_id, message_id) ->
         bot._send(chat_id, "⚠️ Please describe the problem in one message.")
         return
 
+    # 🔴 **Пункт с обязательным снимком не закрывается без снимка (23.10.2026).**
+    #
+    # Вторая половина того же дефекта, что дал `Couldn't close the inspection:
+    # A photo is required for: K-12`. Кнопка `Problem` ведёт сюда, а здесь
+    # вызывался `_finish_item` **без `photo_path`**: у пункта с
+    # `requires_photo` появлялся вердикт и **не появлялось фото**, после чего
+    # осмотр нельзя было закрыть **уже никак** — человек даже не мог вернуться
+    # и доснять, потому что пункт считался пройденным.
+    #
+    # Такую мину ставил сам бот: путь «сообщил проблему» вёл в гарантированный
+    # тупик на каждом пункте с требованием снимка.
+    #
+    # **Что делаем.** Просим снимок **до** вердикта и оставляем пункт открытым.
+    # Это не придирка: сервер всё равно откажет в закрытии осмотра, и лучше
+    # сказать об этом сейчас, когда человек стоит у робота, чем оставить ему
+    # черновик, который невозможно завершить.
+    #
+    # 🔴 **Комментарий сохраняем, а не теряем.** Первая редакция просто просила
+    # фото — и человек, написав «Horn is cracked», терял текст: после снимка
+    # пункт закрывался как `ok`, будто проблемы нет. Теперь объяснение лежит в
+    # `session.problem_comment`, и снимок закрывает пункт **с этим
+    # комментарием** и вердиктом `failed`/`warning` (`handle_photo`).
+    if item.get("requires_photo") and not item.get("photo_url"):
+        session.problem_comment = comment
+        session.step = STEP_PROBLEM
+        put_session(session)
+        bot._send(
+            chat_id,
+            f"📷 This point needs a photo: {item.get('title')}.\n"
+            "\n"
+            "The problem is noted. Send a photo now — it will be saved with "
+            "your description.\n"
+            "Without a photo the inspection can't be closed.",
+            reply_markup=problem_keyboard(),
+        )
+        return
+
     # **Критичный пункт → `failed`, остальное → `warning`.** Требование
     # владельца: кнопка «Problem» — для «что-то не так». Провал (failed) требует
     # комментария и делает осмотр провальным; для некритичного пункта достаточно
@@ -1196,7 +1248,27 @@ def handle_photo(chat_id, sender, message, message_id, photo_path: str) -> bool:
 
     **Фото = «норма» (`ok`)** — требование владельца. Отдельного «подтвердите,
     что всё хорошо» не нужно: снимок и есть подтверждение.
+
+    🔴 **Видео получает честный отказ (23.10.2026).** Раньше видео уходило в
+    загрузку как фото и падало на `validate_image` с
+    `400 File content does not match a supported image type`. Оператор видел
+    «Couldn't save the photo. Please send the photo again» и **не понимал, что
+    не так**: он сделал ровно то, что предлагала подсказка.
+
+    Теперь видео распознаётся **до** попытки загрузки, и ответ называет
+    причину. Пункт при этом **не закрывается** — снимка всё ещё нет, и
+    выдавать видео за подтверждённую проверку нельзя.
     """
+    # Видео и «кружок» — не фото: API принимает только изображения, а веб
+    # рисует `<img>`. Говорим об этом прямо, а не «фото не сохранилось».
+    if message.get("video") or message.get("video_note") or message.get("animation"):
+        _bot()._send(
+            chat_id,
+            "⚠️ Video isn't supported for the inspection — send a photo instead.\n"
+            "A photo is what gets attached to the point and shown on the web.",
+        )
+        return True
+
     session = get_session(chat_id, sender.get("id"))
 
     if session is None or session.step not in (STEP_ITEM, STEP_PROBLEM):
@@ -1206,13 +1278,35 @@ def handle_photo(chat_id, sender, message, message_id, photo_path: str) -> bool:
         # Комментарий ждали текстом, а прислали фото. Фото прикрепляем к пункту
         # и просим всё-таки описать проблему: молча проглотить снимок значило
         # бы потерять объяснение, без которого вердикт бесполезен.
-        _attach_photo(session, photo_path, chat_id, message_id)
+        if not _attach_photo(session, photo_path, chat_id, message_id):
+            return True
 
         bot = _bot()
         bot._send(
             chat_id,
             "📷 Photo saved. Now describe the problem in one message.",
             reply_markup=problem_keyboard(),
+        )
+        return True
+
+    # 🔴 **Фото на пункте, который заявлен как проблемный (23.10.2026).**
+    #
+    # `Problem` просит снимок **первым** (`STEP_PROBLEM`), но снимок может
+    # прийти и раньше — пока пункт ещё открыт. В этом случае нельзя ставить
+    # `ok`: человек уже нажал `Problem`, и «норма» перечеркнула бы его слова.
+    #
+    # Проверяем это **до** `_finish_item`, иначе снимок закрывал пункт как
+    # исправный — то есть ровно противоположно тому, что оператор сообщил.
+    problem_comment = str(session.problem_comment or "").strip()
+
+    if problem_comment:
+        _finish_item(
+            session,
+            verdict="failed" if session.current_item().get("is_critical") else "warning",
+            comment=problem_comment,
+            chat_id=chat_id,
+            delete_message_id=message_id,
+            photo_path=photo_path,
         )
         return True
 
