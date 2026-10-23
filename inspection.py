@@ -554,7 +554,7 @@ def item_caption(session: Session, item: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def result_text(session: Session) -> str:
+def result_text(session: Session, link: str = None) -> str:
     """
     Итог осмотра: сколько проверено, сколько проблем, вердикт.
 
@@ -605,6 +605,16 @@ def result_text(session: Session) -> str:
             suffix = f" — {comment}" if comment else ""
             lines.append(f"{mark} {item.get('title')}{suffix}")
 
+    # Ссылка — **в этом же сообщении**, а не отдельной плашкой.
+    # Требование владельца 23.10.2026: «оставлять только последнее сообщение
+    # в чате». Два сообщения (итог и ссылка) дублировали друг друга.
+    if link:
+        lines.append("")
+        lines.append("🔗 Public report — for everyone on the web:")
+        lines.append(link)
+        lines.append("")
+        lines.append("Tap the link to copy it into your table.")
+
     return "\n".join(lines)
 
 
@@ -641,6 +651,90 @@ def _delete_user_message(chat_id, message_id) -> bool:
     return _bot()._delete_user_message(chat_id, message_id)
 
 
+#: Ключ в `session.data`, где лежит **журнал всех** сообщений осмотра.
+#:
+#: 🔴 **Зачем журнал, а если есть `prompt_message_id` и прочие.** Точечные поля
+#: хранят **последнее** сообщение каждого вида: одно «карточка пункта», одно
+#: «образец», одно «вопрос о проблеме». За осмотр из 14 пунктов бот отправляет
+#: **десятки** сообщений — карточки пунктов, примеры, подтверждения, ответы
+#: «Found: …», — и точечные поля запоминают лишь последнее из каждого вида.
+#: Всё остальное оставалось в чате навсегда: после осмотра человек видел стопку
+#: из десятков сообщений с кнопками, которые уже ничего не делают.
+#:
+#: Требование владельца 23.10.2026: «бот должен чистить все сообщения после
+#: себя и юзера и оставлять только последнее сообщение в чате».
+TRAIL_KEY = "message_trail"
+
+#: Сколько ID помнить. Осмотр — 14 пунктов, каждое сообщение даёт 1–3 за��иси
+#: (карточка, пример, подтверждение) — 200 с запасом хватает, а бесконечный
+#: список в сессии рос бы без причины.
+TRAIL_LIMIT = 200
+
+#: Ключ с ID **итогового** сообщения — единственного, что остаётся в чате.
+#: Отдельный ключ, а не «последний элемент журнала»: журнал чистится, и порядок
+#: в нём после удалений не гарантирован.
+LAST_MESSAGE_KEY = "last_message_id"
+
+
+def _remember_message(session: Session, message_id) -> None:
+    """Запоминает сообщение бота, чтобы убрать его при закрытии осмотра."""
+    if message_id is None:
+        return
+
+    trail = session.data.setdefault(TRAIL_KEY, [])
+
+    if not isinstance(trail, list):
+        trail = session.data[TRAIL_KEY] = []
+
+    trail.append(message_id)
+
+    if len(trail) > TRAIL_LIMIT:
+        del trail[: len(trail) - TRAIL_LIMIT]
+
+
+def _send_tracked(session: Session, text: str, **kwargs):
+    """Отправляет сообщение и **сразу запоминает** его ID.
+
+    Тонкость: `_send` возвращает словарь с `message_id`, но многие места в этом
+    модуле вызывали его, отбрасывая результат (`bot._send(chat_id, text)`).
+    Именно поэтому журнал и нужен отдельной обёрткой: не приходится править
+    каждый вызов под запоминание — достаточно заменить вызов на этот.
+    """
+    sent = _bot()._send(session.chat_id, text, **kwargs)
+
+    if isinstance(sent, dict):
+        _remember_message(session, sent.get("message_id"))
+
+    return sent
+
+
+def _wipe_trail(session: Session, keep=None) -> int:
+    """Убирает из чата **все** сообщения осмотра, кроме `keep`.
+
+    Возвращает число удалённых. Ошибки удаления не поднимаются: сообщение могло
+    быть уже удалено (его стёр сам Telegram по таймеру, или человек убрал
+    вручную), и падать из-за этого на завершённом осмотре нельзя.
+    """
+    trail = session.data.pop(TRAIL_KEY, None)
+
+    if not isinstance(trail, list):
+        return 0
+
+    removed = 0
+
+    for message_id in trail:
+        if keep is not None and message_id == keep:
+            continue
+
+        try:
+            if _delete_quiet(session.chat_id, message_id):
+                removed += 1
+        except Exception:  # noqa: BLE001 — чужое сообщение могли уже удалить
+            logger.debug("не удалось удалить сообщение %s осмотра", message_id)
+
+    return removed
+
+
 # ============================================================
 # СТАРТ ДИАЛОГА
 # ============================================================
@@ -655,8 +749,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
     bot = _bot()
 
     if not api_configured():
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ Inspections are not available: the service is not configured "
             "on the bot (TK_ASSIST_API_URL / SUPABASE_JWT_SECRET).",
             reply_to_message_id=reply_to,
@@ -676,8 +769,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
         # реэкспортировать, и это ломалось бы при безобидной правке импортов.
         employee_name, employee = get_employee_context(sender.get("id"), strict=True)
     except StoreUnavailable:
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ Can't read the database right now. Please try again in a minute.",
             reply_to_message_id=reply_to,
         )
@@ -686,8 +778,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
         employee = None
 
     if not employee_name or not employee:
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ You are not registered yet.\n"
             "Send /reg <Your Name> (the name as it is written in Lark), e.g.\n"
             "/reg Ivan Petrenko",
@@ -701,8 +792,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
         # `auth_id` есть у всех сотрудников (проверено: 37 из 37), но если
         # появится карточка без него — осмотр записался бы без автора, а
         # владелец требует помнить, кто делал.
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ Your account is not linked to a system user (no auth_id), "
             "so inspections can't be attributed to you. Ask a leader to fix "
             "your employee card.",
@@ -742,8 +832,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
             session.thread_id,
             service_thread,
         )
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ /inspection works only in the Inspection topic.",
             reply_to_message_id=reply_to,
         )
@@ -765,8 +854,7 @@ def start(chat_id, sender, reply_to=None) -> bool:
     if not choices:
         # Склады не настроены вовсе (`TELEGRAM_WAREHOUSES` пуст). Предлагать
         # нечего, а поиск без склада запрещён — честно объясняем.
-        bot._send(
-            chat_id,
+        bot._send(chat_id, 
             "⚠️ No warehouses are configured for this bot "
             "(TELEGRAM_WAREHOUSES), so inspections can't run.",
             reply_to_message_id=reply_to,
@@ -864,7 +952,6 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
     if not parts or parts[0] != CB_PREFIX:
         return False
 
-    bot = _bot()
     action = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
 
@@ -922,12 +1009,12 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             return True
     except InspectionApiUnavailable as error:
         answer("Service unavailable")
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         drop_session(chat_id, sender.get("id"))
         return True
     except InspectionApiError as error:
         answer("Rejected")
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         return True
 
     return True
@@ -952,9 +1039,7 @@ def _choose_warehouse(session: Session, title: str, chat_id, message_id, answer)
 
     answer(title)
 
-    bot = _bot()
-    bot._send(
-        chat_id,
+    _send_tracked(session, 
         type_prompt(),
         reply_markup=type_keyboard(),
     )
@@ -975,9 +1060,7 @@ def _choose_type(session: Session, category: str, chat_id, message_id, answer) -
 
     answer(labels[category])
 
-    bot = _bot()
-    bot._send(
-        chat_id,
+    _send_tracked(session, 
         number_prompt(session),
         reply_markup={"inline_keyboard": [[cancel_button()]]},
     )
@@ -1093,7 +1176,6 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
 
 
 def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
-    bot = _bot()
     value = str(text or "").strip()
 
     # **Формат — жёстко, справочник — мягко** (решение владельца 12.10.2026).
@@ -1101,7 +1183,7 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
     format_error = validation.validate_format(session.kind, value)
 
     if format_error:
-        bot._send(chat_id, f"⚠️ {format_error}")
+        _send_tracked(session, f"⚠️ {format_error}")
         return
 
     found = validation.find_equipment(session.kind, session.warehouse, value)
@@ -1110,7 +1192,7 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
         # Номер не найден **в выбранной категории**. Владелец требует не
         # подменять категорию молча — показываем, где он всё-таки есть.
         elsewhere = validation.find_elsewhere(session.kind, session.warehouse, value)
-        bot._send(chat_id, _not_found_text(session, value, elsewhere))
+        _send_tracked(session, _not_found_text(session, value, elsewhere))
         return
 
     session.equipment = found
@@ -1124,8 +1206,7 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
     status = str(found.get("status") or "")
 
     if status == "not_in_work":
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"⛔ {found.get('equipment_code')} is NOT IN WORK "
             "(under repair or written off).\n"
             "Inspections are not done on equipment that is out of service.\n"
@@ -1141,15 +1222,14 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
             if t.get("items")
         ]
     except InspectionApiUnavailable as error:
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         return
     except InspectionApiError as error:
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         return
 
     if not session.templates:
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"⚠️ No inspection checklist is configured for "
             f"{session.category}. Ask a leader to add one.",
         )
@@ -1169,8 +1249,7 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
             f"{STATUS_LABELS.get(status, status)}.\n\n"
         )
 
-    bot._send(
-        chat_id,
+    _send_tracked(session, 
         warning + template_prompt(session),
         reply_markup=template_keyboard(session),
     )
@@ -1205,7 +1284,6 @@ def _not_found_text(session: Session, value: str, elsewhere: list) -> str:
 
 
 def _handle_problem_comment(session: Session, text: str, chat_id, message_id) -> None:
-    bot = _bot()
     item = session.current_item()
 
     if item is None:
@@ -1215,7 +1293,7 @@ def _handle_problem_comment(session: Session, text: str, chat_id, message_id) ->
     comment = str(text or "").strip()
 
     if not comment:
-        bot._send(chat_id, "⚠️ Please describe the problem in one message.")
+        _send_tracked(session, "⚠️ Please describe the problem in one message.")
         return
 
     # 🔴 **«Problem» ВСЕГДА требует снимок — требование владельца (23.10.2026).**
@@ -1241,8 +1319,7 @@ def _handle_problem_comment(session: Session, text: str, chat_id, message_id) ->
         session.problem_comment = comment
         session.step = STEP_PROBLEM
         put_session(session)
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"📷 Send a photo of the problem: {item.get('title')}.\n"
             "\n"
             f"Your description is saved: “{comment}”\n"
@@ -1338,9 +1415,7 @@ def handle_photo(chat_id, sender, message, message_id, photo_path: str) -> bool:
             )
             return True
 
-        bot = _bot()
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             "📷 Photo saved. Now describe the problem in one message.",
             reply_markup=problem_keyboard(),
         )
@@ -1381,7 +1456,6 @@ def handle_photo(chat_id, sender, message, message_id, photo_path: str) -> bool:
 
 def _attach_photo(session: Session, photo_path: str, chat_id, message_id) -> bool:
     """Загружает фото пункта в API. True — прикрепилось."""
-    bot = _bot()
     item = session.current_item()
 
     if item is None:
@@ -1391,8 +1465,7 @@ def _attach_photo(session: Session, photo_path: str, chat_id, message_id) -> boo
         with open(photo_path, "rb") as handle:
             content = handle.read()
     except OSError:
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             "⚠️ Can't read the photo file on the server. Please send it again.",
         )
         return False
@@ -1405,11 +1478,10 @@ def _attach_photo(session: Session, photo_path: str, chat_id, message_id) -> boo
             content=content,
         )
     except InspectionApiUnavailable as error:
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         return False
     except InspectionApiError as error:
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"⚠️ Couldn't save the photo: {error.message}\n"
             "Please send the photo again.",
         )
@@ -1451,7 +1523,6 @@ def _finish_item(
     загрузки пункт остался бы с вердиктом «норма» и без снимка — то есть
     непроверенное выдано за проверенное.
     """
-    bot = _bot()
     item = session.current_item()
 
     if item is None:
@@ -1471,11 +1542,10 @@ def _finish_item(
             comment=comment,
         )
     except InspectionApiUnavailable as error:
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         return
     except InspectionApiError as error:
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"⚠️ Couldn't save the point: {error.message}",
         )
         return
@@ -1602,22 +1672,20 @@ def _finish_inspection(session: Session, chat_id) -> None:
     Публичная ссылка выдаётся **только на закрытый осмотр** — иначе API
     откажет. Поэтому порядок именно такой: закрыть, затем поделиться.
     """
-    bot = _bot()
 
     try:
         inspection = complete_inspection(
             session.auth_id, int(session.inspection["id"])
         )
     except InspectionApiUnavailable as error:
-        bot._send(chat_id, f"⚠️ {error.message}")
+        _send_tracked(session, f"⚠️ {error.message}")
         _close_session(session)
         return
     except InspectionApiError as error:
         # Самая частая содержательная причина — не все пункты заполнены.
         # Осмотр при этом остаётся в базе и виден на веб-версии незакрытым,
         # поэтому говорим об этом прямо, а не «что-то пошло не так».
-        bot._send(
-            chat_id,
+        _send_tracked(session, 
             f"⚠️ Couldn't close the inspection: {error.message}\n"
             "It is saved as a draft — you can finish it on the web version.",
         )
@@ -1628,31 +1696,36 @@ def _finish_inspection(session: Session, chat_id) -> None:
     session.step = STEP_DONE
     put_session(session)
 
-    bot._send(chat_id, result_text(session))
-
+    # 🔴 **Ссылка выдаётся ДО итогового сообщения — оно теперь одно.**
+    #
+    # Владелец 23.10.2026: «бот должен чистить все сообщения после себя и юзера
+    # и оставлять только последнее сообщение в чате». Поэтому итог и ссылка —
+    # **одно сообщение**, а не два: раньше после осмотра в чате оставались итог
+    # и отдельная плашка ссылки, и они дублировали друг друга.
+    #
+    # Порядок важен: ссылка выдаётся только на **закрытый** осмотр, поэтому
+    # сначала закрываем, потом делимся, и лишь затем печатаем одно сообщение.
     link = _share_link(session)
 
-    if link:
-        # 🔴 **Ссылка — текстом, а не только кнопкой.**
-        #
-        # Требование владельца: «выдавалась публичная ссылка для того чтобы
-        # вставлять в таблицу». Вставить в таблицу можно только **текст**:
-        # кнопку не выделить и не скопировать. Поэтому ссылка печатается
-        # отдельной строкой (в Telegram тап по ней копирует), а кнопка рядом
-        # нужна для открытия одним касанием — одно не заменяет другое.
-        bot._send(
-            chat_id,
-            "🔗 Public report — for everyone on the web:\n"
-            f"{link}\n"
-            "\n"
-            "Tap the link to copy it into your table.",
-            reply_markup={
+    final = _send_tracked(
+        session,
+        result_text(session, link),
+        reply_markup=(
+            {
                 "inline_keyboard": [[{
                     "text": "📄 Open report",
                     "url": link,
                 }]],
-            },
-        )
+            }
+            if link
+            else None
+        ),
+    )
+
+    # **ID итогового сообщения — единственное, что переживёт очистку.**
+    if isinstance(final, dict) and final.get("message_id") is not None:
+        session.data[LAST_MESSAGE_KEY] = final.get("message_id")
+        put_session(session)
 
     # 🔴 **Карточка в Lark-группу ошибок — после закрытия и после ссылки.**
     #
@@ -1685,6 +1758,37 @@ def _finish_inspection(session: Session, chat_id) -> None:
             "осмотр закрыт, ссылка выдана",
             inspection.get("id"),
         )
+
+    # 🔴 **Чистим чат: остаётся ТОЛЬКО итоговое сообщение.**
+    #
+    # Требование владельца 23.10.2026, дословно: «бот должен чистить все
+    # сообщения после себя и юзера и оставлять только последнее сообщение в
+    # чате что я тебе выслал».
+    #
+    # **Что убирается.** Всё, что бот отправил за осмотр: карточку склада,
+    # список типов, «Found: 3780», вопрос шаблона, карточки всех 14 пунктов,
+    # фото-образцы, вопросы «Describe what is wrong», подтверждения. За осмотр
+    # из 14 пунктов это десятки сообщений — и все они оставались в чате с
+    # кнопками, которые уже ничего не делают.
+    #
+    # **Что остаётся.** Итоговое сообщение со ссылкой и кнопкой `Open report`.
+    # Оно последнее, и оно же — единственное, что нужно после осмотра: по нему
+    # копируют ссылку и смотрят результат.
+    #
+    # **Чьи сообщения бот не может удалить.** Свои (карточки пунктов, фото)
+    # удаляет; сообщения оператора (номер устройства, описания проблем) тоже
+    # удаляются, если пришли в диалоге — их ID передаются в `_finish_item` и
+    # удаляются на месте. Чужие сообщения в группе бот не трогает: у него нет
+    # на это права, и попытка вернула бы ошибку, а не тишину.
+    kept = session.data.get(LAST_MESSAGE_KEY)
+    removed = _wipe_trail(session, keep=kept)
+
+    logger.info(
+        "Осмотр %s: чат очищен, удалено сообщений %s, оставлено итоговое %s",
+        inspection.get("id"),
+        removed,
+        kept,
+    )
 
     _close_session(session)
 
@@ -1751,13 +1855,12 @@ def _notify_lark_inspection(
 
 def _share_link(session: Session) -> Optional[str]:
     """Публичная ссылка осмотра или None, если её не удалось выдать."""
-    bot = _bot()
 
     try:
         share = create_share(session.auth_id, int(session.inspection["id"]))
     except (InspectionApiError, InspectionApiUnavailable) as error:
         # Итог осмотра уже отправлен — из-за ссылки его терять нельзя.
-        bot._send(
+        _send_tracked(session, 
             session.chat_id,
             f"⚠️ The inspection is done, but I couldn't create the public link: "
             f"{error.message}",
@@ -1813,6 +1916,6 @@ def cancel(chat_id, sender) -> bool:
             "\nThe draft is kept — you can finish it on the web version."
         )
 
-    bot._send(chat_id, text, delete_after=bot.CONFIRM_TTL_SECONDS)
+    _send_tracked(session, text, delete_after=bot.CONFIRM_TTL_SECONDS)
 
     return True

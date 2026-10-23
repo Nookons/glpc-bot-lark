@@ -47,7 +47,8 @@ for _key in ("STATUS", "STATS", "SERVICE"):
     os.environ[f"TELEGRAM_TOPIC_{_key}"] = ""
 os.environ["TELEGRAM_WRONG_TOPIC_HINT"] = ""
 
-import pytest  # noqa: E402
+import pytest
+from types import SimpleNamespace  # noqa: E402
 
 import lark_media
 import inspection as insp  # noqa: E402
@@ -321,6 +322,24 @@ def _start_in_service_topic(rec, monkeypatch, warehouse="SMALL-P3", category="ro
         CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_TYPE, category], 2, "cb1"
     )
     insp.handle_text(CHAT_ID, {"id": USER_ID}, number, 3)
+
+
+def _final_message_id(rec):
+    """ID итогового сообщения осмотра: в нём есть вердикт и/или ссылка.
+
+    Ищем **по содержимому**, а не по номеру: тест не должен зависеть от того,
+    сколько сообщений бот отправил по пути. Итог опознаётся по заголовку
+    вердикта — он есть только в одном сообщении.
+    """
+    markers = ("Inspection passed", "Inspection failed", "passed with warnings")
+
+    for entry in reversed(rec.sent):
+        text = str(entry.get("text") or "")
+
+        if any(marker in text for marker in markers):
+            return entry["message_id"]
+
+    return None
 
 
 def _session():
@@ -1085,6 +1104,163 @@ class TestItems:
 
         texts = "\n".join(item["text"] for item in rec.sent)
         assert "for everyone on the web" in texts, "ссылка оператору не выдана"
+
+    def test_chat_is_wiped_except_the_final_message(
+        self, rec, monkeypatch
+    ) -> None:
+        """🔴 После осмотра в чате остаётся **только** итоговое сообщение.
+
+        Требование владельца 23.10.2026, дословно: «бот должен чистить все
+        сообщения после себя и юзера и оставлять только последнее сообщение в
+        чате что я тебе выслал».
+
+        За осмотр из нескольких пунктов бот отправляет **десятки** сообщений:
+        карточку склада, список типов, «Found», вопрос шаблона, карточки
+        пунктов, фото-образцы, подтверждения. Раньше каждое из них оставалось
+        в чате с кнопками, которые уже ничего не делают, и человек не понимал,
+        какое сообщение активное.
+        """
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[
+                {"id": 101, "position": 1, "code": "R-01", "title": "One",
+                 "requires_photo": False, "is_critical": False, "verdict": None},
+                {"id": 102, "position": 2, "code": "R-02", "title": "Two",
+                 "requires_photo": False, "is_critical": False, "verdict": None},
+            ],
+        )
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": "ok", "template_id": 1,
+                "warehouse": "GLP-C", "done_at": "2026-10-23T10:45:00Z",
+                "equipment": {"code": "3780", "category": "robot"},
+                "items": [
+                    {"id": 101, "title": "One", "verdict": "ok", "comment": None},
+                    {"id": 102, "title": "Two", "verdict": "ok", "comment": None},
+                ],
+            },
+        )
+        monkeypatch.setattr(insp, "create_share",
+                            lambda *a, **k: {"public_token": "Tok123"})
+
+        path = _write_photo(monkeypatch)
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 41, path)
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 42, path)
+
+        final_id = _final_message_id(rec)
+
+        assert final_id is not None, "итоговое сообщение не найдено"
+
+        # 🔴 **Считаем по факту, а не по намерению.**
+        #
+        # Карточки пунктов удаляются **по ходу** (`_finish_item`), поэтому к
+        # концу их уже нет в списке «живых». Проверять надо не «все ли
+        # удалены», а **сколько осталось** — иначе тест проходит и при
+        # полностью отключённой очистке (проверено: так и произошло, сторож
+        # пришлось переписать).
+        surviving = [
+            entry for entry in rec.sent
+            if entry["message_id"] != final_id
+            and (CHAT_ID, entry["message_id"]) not in rec.deleted
+        ]
+
+        assert not surviving, (
+            "после осмотра в чате остались сообщения: "
+            + ", ".join(
+                f"{e['message_id']}={str(e.get('text') or '')[:30]!r}"
+                for e in surviving
+            )
+        )
+
+        # Итоговое — на месте: его не удаляют.
+        assert (CHAT_ID, final_id) not in rec.deleted, "удалено итоговое сообщение"
+
+    def test_wipe_trail_removes_everything_but_the_kept_message(self) -> None:
+        """🔴 Прямая проверка очистки: журнал → удаления, кроме одного.
+
+        **Почему отдельный тест, а не проверка «в потоке».** Карточки пунктов
+        удаляются **по ходу** осмотра (`_finish_item`), поэтому к концу в чате
+        их уже нет. Из-за этого потоковый тест проходил и при **полностью
+        выключенной** очистке — проверено: `_wipe_trail` отключён, а сторож
+        зелёный. Сторож, который не ловит возврат дефекта, — декорация.
+
+        Здесь очистка проверяется **напрямую**: дан журнал из пяти сообщений и
+        одно «итоговое», и проверяется, что удалены ровно остальные четыре.
+        """
+        session = SimpleNamespace(
+            chat_id=CHAT_ID,
+            data={
+                insp.TRAIL_KEY: [11, 12, 13, 14, 15],
+                insp.LAST_MESSAGE_KEY: 15,
+            },
+        )
+        deleted = []
+        monkeypatched = lambda chat_id, message_id: (
+            deleted.append(message_id), True
+        )[1]
+
+        original = insp._delete_quiet
+        insp._delete_quiet = monkeypatched
+
+        try:
+            removed = insp._wipe_trail(
+                session, keep=session.data[insp.LAST_MESSAGE_KEY]
+            )
+        finally:
+            insp._delete_quiet = original
+
+        assert deleted == [11, 12, 13, 14], deleted
+        assert 15 not in deleted, "удалено итоговое сообщение"
+        assert removed == 4, removed
+        # Журнал очищен: повторная очистка не должна ничего удалять.
+        assert insp.TRAIL_KEY not in session.data
+
+    def test_link_is_inside_the_final_message(self, rec, monkeypatch) -> None:
+        """Ссылка печатается **в итоговом** сообщении, а не отдельной плашкой.
+
+        Два сообщения (итог + ссылка) дублировали друг друга и нарушали
+        требование «оставлять только последнее сообщение».
+        """
+        _start(rec, monkeypatch)
+        _choose_template(
+            rec, monkeypatch,
+            items=[{"id": 101, "position": 1, "code": "R-01", "title": "Only",
+                    "verdict": "ok", "comment": None}],
+        )
+        monkeypatch.setattr(insp, "upload_item_photo", lambda *a, **k: {})
+        monkeypatch.setattr(insp, "set_item_verdict", lambda *a, **k: {})
+        monkeypatch.setattr(
+            insp, "complete_inspection",
+            lambda *a, **k: {
+                "id": 77, "status": "done", "verdict": "ok", "template_id": 1,
+                "warehouse": "GLP-C", "equipment": {"code": "3780"},
+                "items": [{"id": 101, "title": "Only", "verdict": "ok",
+                           "comment": None}],
+            },
+        )
+        monkeypatch.setattr(insp, "create_share",
+                            lambda *a, **k: {"public_token": "Tok123"})
+
+        insp.handle_photo(CHAT_ID, {"id": USER_ID}, {}, 41, _write_photo(monkeypatch))
+
+        final_id = _final_message_id(rec)
+        final = next(e for e in rec.sent if e["message_id"] == final_id)
+
+        # Ссылка — в том же сообщении, что и итог.
+        assert "Inspection passed" in final["text"]
+        assert "Tok123" in final["text"], final["text"]
+
+        # Отдельной плашки «Public report» больше нет.
+        link_messages = [
+            e for e in rec.sent
+            if e["message_id"] != final_id and "Public report" in e.get("text", "")
+        ]
+
+        assert not link_messages, "ссылка всё ещё отдельным сообщением"
 
     def test_public_link_is_sent(self, rec, monkeypatch) -> None:
         """Общая ссылка «для всех на веб-версию» приходит в чат."""
