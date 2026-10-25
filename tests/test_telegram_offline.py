@@ -7945,6 +7945,57 @@ def test_error_menu_photo_flow():
             bot._pending_error_choice.clear()
 
 
+def test_private_chat_is_not_blocked_by_topic_barrier():
+    """🔴 В личке бот отвечает, даже когда топики настроены.
+
+    **Найдено аудитом 25.10.2026:** `_output_topic_allowed` возвращала `False`
+    для `thread_id is None`. В **личном чате** топика нет никогда, поэтому
+    барьер отклонял **каждую** отправку.
+
+    Проверено: `/id`, `/help` и `/reg` в ЛС давали **0 ответов**. В проде это
+    значит: **новый сотрудник не может зарегистрироваться** — он пишет боту в
+    личку и не получает ничего.
+
+    🔴 Запрет владельца (07.10.2026) — про **другие топики группы**: «ни в
+    какой больше топик он не должен писать». Личный чат — не топик группы.
+    """
+    import telegram_bot as bot
+
+    # Топики настроены — иначе барьер не активен и тест ничего не проверяет.
+    saved = set(bot._ALLOWED_OUTPUT_TOPICS)
+    bot._ALLOWED_OUTPUT_TOPICS = {555, 777}
+
+    try:
+        # Личный чат: положительный chat_id, топика нет.
+        assert bot._output_topic_allowed(100500, None) is True
+
+        # Группа без топика (General) — по-прежнему нельзя.
+        assert bot._output_topic_allowed(-500, None) is False
+
+        # Свой топик — можно, чужой — нельзя.
+        assert bot._output_topic_allowed(-500, 555) is True
+        assert bot._output_topic_allowed(-500, 999) is False
+    finally:
+        bot._ALLOWED_OUTPUT_TOPICS = saved
+
+
+def test_caption_robot_number_is_parsed():
+    """Номер робота из подписи — для отсева чужого фото."""
+    import telegram_bot as bot
+
+    # Явные формы.
+    assert bot._robot_number_from_caption("robot 3780") == 3780
+    assert bot._robot_number_from_caption("робот 3780") == 3780
+    assert bot._robot_number_from_caption("#3780") == 3780
+    assert bot._robot_number_from_caption("3780") == 3780
+
+    # 🔴 Артикул не должен приниматься за номер: в нём точки.
+    assert bot._robot_number_from_caption("2.01.08.000051") is None
+    # Без номера — `None`: фото остаётся за ремонтом, как и раньше.
+    assert bot._robot_number_from_caption("Went off the road") is None
+    assert bot._robot_number_from_caption(None) is None
+
+
 def main():
     tests = [
         test_parse_command,
@@ -8080,6 +8131,11 @@ def main():
         # `exit 1` — с коммита 4581153 (13.10.2026) шаг CI «Офлайн-набор бота»
         # был красным, а 21 проверка не исполнялась.
         test_intake_tree_endpoint_is_closed_without_a_token,
+        # 🔴 Найдено аудитом 25.10.2026: барьер глушил личные чаты (регистрация
+        # нового сотрудника была невозможна), а ожидание фото перехватывало
+        # снимок другого робота.
+        test_private_chat_is_not_blocked_by_topic_barrier,
+        test_caption_robot_number_is_parsed,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.
@@ -8734,3 +8790,4 @@ def test_online_prompt_does_not_promise_offline():
     assert "'take it offline' if direction == 'offline'" in source.replace('"', "'"), (
         "подсказка не различает направления"
     )
+
