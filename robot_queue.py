@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Optional
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -283,8 +284,31 @@ def autoclose_loop(interval_seconds: int = None):
         time.sleep(interval)
 
 
-def start_queue_autoclose() -> threading.Thread:
-    """Запускает фоновое автозакрытие очереди (только у опрашивающего)."""
+def start_queue_autoclose() -> Optional[threading.Thread]:
+    """Запускает фоновое автозакрытие очереди (только у опрашивающего).
+
+    🔴 **Флаг `QUEUE_AUTOCLOSE_ENABLED` теперь работает** (найдено аудитом
+    25.10.2026).
+
+    ## Что было сломано
+
+    Константа `AUTOCLOSE_ENABLED` читалась из окружения и **нигде не
+    проверялась**: `start_queue_autoclose()` вызывался безусловно. Переменная
+    `QUEUE_AUTOCLOSE_ENABLED=false` в `.env` **ничего не выключала** — то есть
+    документированный выключатель был мёртвым.
+
+    🔴 **Почему это важно:** автозакрытие меняет данные (закрывает заявки), и
+    «выключить на время разбора» — рабочая операторская задача. Молча
+    проигнорированный флаг означает, что заявки закрылись, когда их не должны
+    были.
+    """
+    if not AUTOCLOSE_ENABLED:
+        logger.info(
+            "Robot queue autoclose is disabled by QUEUE_AUTOCLOSE_ENABLED"
+        )
+
+        return None
+
     thread = threading.Thread(
         target=autoclose_loop,
         name="robot-queue-autoclose",

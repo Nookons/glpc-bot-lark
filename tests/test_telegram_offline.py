@@ -8075,6 +8075,11 @@ def main():
         test_menu_on_any_photo_and_caption_kept,
         test_error_menu_photo_flow,
         test_expected_telegram_errors_are_not_logged_as_errors,
+        # 🔴 **Добавлено 25.10.2026:** этот тест был определён, но не
+        # зарегистрирован. Сторож ниже (T6) срабатывал и ронял ВЕСЬ набор с
+        # `exit 1` — с коммита 4581153 (13.10.2026) шаг CI «Офлайн-набор бота»
+        # был красным, а 21 проверка не исполнялась.
+        test_intake_tree_endpoint_is_closed_without_a_token,
     ]
 
     # T6: ручной список легко забыть обновить — проверяем это явно.

@@ -2607,3 +2607,85 @@ class TestTokenDependencies:
             inspection_api._request("GET", "/v1/inspections", "some-auth-id")
 
         assert "PyJWT" in str(exc.value)
+
+
+class TestShareLinkFailureIsReported:
+    """🔴 Сбой ссылки сообщается, а не роняет осмотр.
+
+    **Найдено аудитом 25.10.2026:** в `inspection._share_link` стояло
+
+    ```python
+    _send_tracked(session, session.chat_id, text)   # три позиционных
+    ```
+
+    при сигнатуре `_send_tracked(session, text, **kwargs)`. При **любом** сбое
+    `create_share` вместо сообщения летел `TypeError`, и оператор не получал
+    ни итога осмотра, ни ссылки — хотя осмотр уже был закрыт на сервере.
+
+    ## Почему это не поймали
+
+    Все тесты подставляли **успешный** `create_share`. Ветка сбоя не
+    исполнялась ни разу.
+    """
+
+    def test_failure_sends_a_message_instead_of_raising(self, monkeypatch) -> None:
+        """Сбой `create_share` → сообщение человеку, а не `TypeError`."""
+        import inspection as insp
+
+        def boom(*args, **kwargs):
+            raise insp.InspectionApiUnavailable("api is down")
+
+        monkeypatch.setattr(insp, "create_share", boom)
+
+        sent: list[str] = []
+        monkeypatch.setattr(
+            insp,
+            "_send_tracked",
+            lambda session, text, **kwargs: sent.append(text) or {},
+        )
+
+        session = type(
+            "S",
+            (),
+            {"auth_id": "auth-1", "chat_id": 555, "inspection": {"id": 77}},
+        )()
+
+        result = insp._share_link(session)
+
+        # 🔴 Ссылки нет — это правильно: создать её не удалось.
+        assert result is None
+        # 🔴 Но человек узнал, почему её нет, и итог осмотра не потерян.
+        assert sent, "оператор не получил сообщения о сбое ссылки"
+        assert "public link" in sent[0]
+
+    def test_send_is_called_with_two_positional_arguments(
+        self, monkeypatch
+    ) -> None:
+        """`_send_tracked` получает `session` и `text`, без `chat_id` третьим."""
+        import inspection as insp
+
+        def boom(*args, **kwargs):
+            raise insp.InspectionApiError("nope")
+
+        monkeypatch.setattr(insp, "create_share", boom)
+
+        calls: list[tuple] = []
+
+        def record(session, text, **kwargs):
+            calls.append((session, text))
+            return {}
+
+        monkeypatch.setattr(insp, "_send_tracked", record)
+
+        session = type(
+            "S",
+            (),
+            {"auth_id": "auth-1", "chat_id": 555, "inspection": {"id": 77}},
+        )()
+
+        insp._share_link(session)
+
+        assert len(calls) == 1
+        # 🔴 Ровно два позиционных: третий (`chat_id`) — это `TypeError`.
+        assert len(calls[0]) == 2
+        assert calls[0][0] is session

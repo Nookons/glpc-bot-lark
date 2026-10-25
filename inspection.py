@@ -1860,8 +1860,27 @@ def _share_link(session: Session) -> Optional[str]:
         share = create_share(session.auth_id, int(session.inspection["id"]))
     except (InspectionApiError, InspectionApiUnavailable) as error:
         # Итог осмотра уже отправлен — из-за ссылки его терять нельзя.
-        _send_tracked(session, 
-            session.chat_id,
+        #
+        # 🔴 **Два аргумента, а не три** (найдено аудитом 25.10.2026).
+        #
+        # Сигнатура: `_send_tracked(session, text, **kwargs)`. Здесь
+        # передавалось `session, session.chat_id, text` — три позиционных.
+        #
+        # ## Что это значило на деле
+        #
+        # При **любом** сбое `create_share` вместо сообщения «ссылка не
+        # создалась» летел `TypeError`. Он всплывал из `_finish_inspection` —
+        # **до** итогового сообщения, — и оператор не получал **ни итога
+        # осмотра, ни ссылки**, хотя осмотр уже был закрыт на сервере.
+        #
+        # Ловил только общий `except` диспетчера с текстом «Не удалось
+        # обработать нажатие кнопки» — то есть человек видел бессмысленную
+        # ошибку там, где всё уже сохранено.
+        #
+        # 🔴 **Тесты этот путь не проходили:** все подставляли успешный
+        # `create_share`. Тест на сбой добавлен вместе с правкой.
+        _send_tracked(
+            session,
             f"⚠️ The inspection is done, but I couldn't create the public link: "
             f"{error.message}",
         )
