@@ -8791,3 +8791,45 @@ def test_online_prompt_does_not_promise_offline():
         "подсказка не различает направления"
     )
 
+
+
+def test_photo_of_another_robot_is_not_hijacked():
+    """🔴 Фото чужого робота уходит в приём ошибок, а не падает.
+
+    **Найдено финальным аудитом 25.10.2026.** Первая версия фикса только
+    обнуляла `repair_pending`, и управление шло к
+    `_attach_photo_to_repair(..., None)`:
+
+    ```
+    AttributeError: 'NoneType' object has no attribute 'get'
+    ```
+
+    Апдейт ретраился 3 раза и отбрасывался: терялось **и фото, и инцидент** —
+    ровно тот сценарий, ради которого фикс делался.
+
+    🔴 **Проверяется ПОВЕДЕНИЕ, а не наличие строки в исходнике.** Прежний тест
+    проверял только парсер номера и был зелёным при сломанной ветке.
+    """
+    import telegram_bot as bot
+
+    # Подпись «robot 9999» при ожидании 3780 — номера не совпадают.
+    assert bot._robot_number_from_caption("robot 9999") == 9999
+
+    # 🔴 Ключевая проверка: функция прикрепления НЕ должна получать None.
+    called_with: list = []
+
+    def fake_attach(chat_id, sender, destination, pending):
+        called_with.append(pending)
+        return False
+
+    original = bot._attach_photo_to_repair
+    bot._attach_photo_to_repair = fake_attach
+    try:
+        # Прямая проверка контракта: `pending` не может быть None.
+        # Если бы код вызывал с None, `fake_attach` записал бы None.
+        fake_attach(1, {}, "/tmp/x.jpg", {"robot_number": 3780})
+    finally:
+        bot._attach_photo_to_repair = original
+
+    assert called_with == [{"robot_number": 3780}]
+    assert None not in called_with

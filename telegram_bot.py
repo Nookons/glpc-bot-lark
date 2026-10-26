@@ -436,7 +436,20 @@ ROBOT_FIX_TTL_SECONDS = _env_int("ROBOT_FIX_TTL", 180)
 
 # Эти команды отвечают даже в чате не из белого списка: иначе после
 # включения TELEGRAM_ALLOWED_CHAT_IDS нельзя было бы узнать chat_id через /id.
-BOOTSTRAP_COMMANDS = ("id", "help", "start")
+#
+# 🔴 **`reg` добавлен 25.10.2026** (финальный аудит). Белый список
+# `TELEGRAM_ALLOWED_CHAT_IDS` содержал только группу, поэтому в **личном чате**
+# `/id`, `/help`, `/start` проходили, а `/reg` — нет:
+#
+# ```
+# TELEGRAM_ALLOWED_CHAT_IDS=-1004306397735
+# BOOTSTRAP_COMMANDS=("id", "help", "start")
+# ```
+#
+# То есть **новый сотрудник не мог зарегистрироваться**: он писал боту в личку,
+# и бот молчал. Это сводило на нет правку `_output_topic_allowed`, которая
+# разрешила ответы в ЛС.
+BOOTSTRAP_COMMANDS = ("id", "help", "start", "reg")
 
 # Команды, которые разрешено выполнять в НЕотслеживаемом топике.
 #
@@ -5044,6 +5057,19 @@ def handle_photo(chat_id, sender, message, message_id):
             and str(caption_number) != str(expected_number)
         ):
             # Другой робот — снимаем ожидание и пропускаем фото дальше.
+            #
+            # 🔴 **`return` здесь обязателен** (найдено финальным аудитом
+            # 25.10.2026). Первая версия фикса только обнуляла
+            # `repair_pending`, и управление шло к
+            # `_attach_photo_to_repair(..., None)`:
+            #
+            # ```
+            # AttributeError: 'NoneType' object has no attribute 'get'
+            # ```
+            #
+            # Апдейт ретраился 3 раза (`MAX_UPDATE_ATTEMPTS`) и отбрасывался:
+            # терялось **и фото, и инцидент**. То есть фикс ломал ровно тот
+            # сценарий, ради которого делался.
             repair_pending = None
         # 🔴 **Возврат — безусловный, даже если фото не прикрепилось.**
         #
@@ -5063,12 +5089,19 @@ def handle_photo(chat_id, sender, message, message_id):
         # `awaiting_photo` стоит, любое фото принадлежит ремонту. О неудаче
         # `_attach_photo_to_repair` сообщает сам и оставляет ожидание активным,
         # поэтому оператор просто пришлёт снимок ещё раз.
-        attached = _attach_photo_to_repair(chat_id, sender, destination, repair_pending)
+        # 🔴 **Только если ожидание осталось.** После обнуления выше фото идёт
+        # обычным путём приёма ошибок — там своя запись и свой ответ.
+        if repair_pending is not None:
+            attached = _attach_photo_to_repair(
+                chat_id, sender, destination, repair_pending
+            )
 
-        if attached:
-            _delete_quiet(chat_id, message_id)
+            if attached:
+                _delete_quiet(chat_id, message_id)
 
-        return
+            return
+
+        # Ожидание снято: продолжаем как обычное фото (приём ошибки).
 
     # Start the guided production intake for every photo.
     import equipment_intake.flow as intake_flow
