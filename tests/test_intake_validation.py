@@ -1361,3 +1361,63 @@ class DeviceBranchesAreBuildable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestManuallyAddedRobotIsFound:
+    """🔴 Робот, заведённый через веб, находится и в боте.
+
+    **Исправлено 27.10.2026:** «почему бот говорит что нету такого робота если
+    он есть на Web версии?»
+
+    ## Что было не так
+
+    Робот **6775** есть в вебе (карточка открывается, статус `online`), но бот
+    отвечал «not in the registry».
+
+    **Причина:** `robot_row` читал `robots_maintenance_list` — **старую**
+    таблицу, а веб читает `equipment`. Роботы, заведённые через интерфейс,
+    создаются с `legacy_table = 'manual'` и `legacy_id = NULL`: **старой строки у
+    них нет по определению**, и триггер `equipment_push_to_legacy` при `NULL`
+    «возвращает строку не трогая».
+
+    Проверено: таких роботов **18**, для бота они все «не существовали».
+
+    ## 🔴 Вторая половина дефекта: FK
+
+    `exceptions.robot_id` — внешний ключ на `robots_maintenance_list(id)`.
+    Записать туда `equipment.id` ручного робота значило бы получить
+    `23503 foreign key violation` и **потерять всю запись отчёта**.
+
+    Поэтому `robot_id` остаётся пустым у ручных роботов, а номер и зона — есть.
+    """
+
+    def test_lookup_reads_equipment_not_only_legacy(self) -> None:
+        """`robot_row` читает `equipment` — единый реестр."""
+        import inspect
+
+        from equipment_intake import report_writer
+
+        source = inspect.getsource(report_writer.robot_row)
+
+        # 🔴 Ручные роботы есть только в `equipment`.
+        assert '"equipment"' in source or "'equipment'" in source
+        # 🔴 Запасной путь в легаси остаётся: записи до 12.10 живут там.
+        assert "ROBOTS_TABLE" in source
+
+    def test_manual_robot_gets_no_robot_id(self) -> None:
+        """У ручного робота `robot_id` пуст — иначе FK упадёт."""
+        from equipment_intake.report_writer import _robot_id_from_row
+
+        manual = {"id": 48963, "in_legacy": False}
+
+        # 🔴 `exceptions.robot_id` ссылается на `robots_maintenance_list`,
+        # а ручной записи там нет.
+        assert _robot_id_from_row(manual) is None
+
+    def test_synced_robot_keeps_robot_id(self) -> None:
+        """У синхронизированного робота `robot_id` остаётся."""
+        from equipment_intake.report_writer import _robot_id_from_row
+
+        synced = {"id": 1437, "in_legacy": True}
+
+        assert _robot_id_from_row(synced) == 1437

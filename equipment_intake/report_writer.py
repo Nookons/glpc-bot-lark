@@ -533,17 +533,64 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
 
     from sendToDataBase import rest_get
 
-    # `optional=True`: сбой справочника не должен ронять запись отчёта.
+    # 🔴 **Источник — единый реестр `equipment`, а не `robots_maintenance_list`**
+    # (исправлено 27.10.2026: «почему бот говорит что нету такого робота если он
+    # есть на Web версии?»).
+    #
+    # ## Что было не так
+    #
+    # Робот **6775** есть в вебе (карточка открывается, статус `online`), но бот
+    # отвечал «not in the registry». Причина: бот читал
+    # `robots_maintenance_list` — **старую** таблицу, а веб читает `equipment`.
+    #
+    # ## Почему робота там нет
+    #
+    # Роботы, заведённые через интерфейс, создаются в `equipment` с
+    # `legacy_table = 'manual'` и `legacy_id = NULL`: **старой строки у них нет по
+    # определению**. Триггер `equipment_push_to_legacy` при `NULL` «возвращает
+    # строку не трогая» — обратной записи не бывает.
+    #
+    # Проверено: таких роботов **18**, и для бота они все «не существуют».
+    #
+    # 🔴 **`equipment` содержит всё нужное:** `id`, `sub_warehouse` (зону) и
+    # `status`. Поиск по `category='robot'` + `equipment_code` + `warehouse`.
     rows = rest_get(
-        ROBOTS_TABLE,
+        "equipment",
         {
-            "select": "id,sub_warehouse",
+            "select": "id,sub_warehouse,status,legacy_table",
+            "category": "eq.robot",
             "warehouse": f"eq.{warehouse}",
-            "robot_number": f"eq.{number}",
+            "equipment_code": f"eq.{number}",
             "limit": "1",
         },
         optional=True,
     )
+
+    # 🔴 **Запасной путь в старую таблицу.** Записи, созданные переносом до
+    # 12.10.2026, живут в `robots_maintenance_list`; если в реестре их почему-то
+    # нет, ищем там — молчание хуже лишнего запроса.
+    if not rows:
+        rows = rest_get(
+            ROBOTS_TABLE,
+            {
+                "select": "id,sub_warehouse",
+                "warehouse": f"eq.{warehouse}",
+                "robot_number": f"eq.{number}",
+                "limit": "1",
+            },
+            optional=True,
+        )
+
+        # Найдено в легаси — значит `robot_id` писать можно.
+        if rows:
+            rows = [{**rows[0], "in_legacy": True}]
+    elif rows:
+        # 🔴 **Ручная запись (`legacy_table = 'manual'`) в легаси отсутствует:**
+        # `robot_id` ссылается на `robots_maintenance_list`, и писать туда
+        # `equipment.id` нельзя — база отвергнет запись целиком.
+        rows = [
+            {**rows[0], "in_legacy": rows[0].get("legacy_table") != "manual"}
+        ]
 
     if not rows:
         # 🔴 **«Не найден» НЕ кэшируется** (найдено аудитом 25.10.2026).
@@ -576,13 +623,43 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
 
 
 def _robot_id_from_row(row: Optional[Dict[str, Any]]) -> Optional[int]:
-    """`id` робота из уже прочитанной строки справочника."""
+    """`id` робота в **старой** таблице — или `None`.
+
+    🔴 **Только `robots_maintenance_list`, а не `equipment`** (исправлено
+    27.10.2026).
+
+    ## Почему это важно
+
+    `exceptions.robot_id` — внешний ключ на `robots_maintenance_list(id)`
+    (проверено: `exceptions_robot_id_fkey`). Если записать туда `equipment.id`
+    ручного робота, база ответит `23503 foreign key violation`, и **вся запись
+    отчёта потеряется**.
+
+    ## Почему нельзя просто взять `equipment.id`
+
+    `robot_row` теперь читает единый реестр (там есть ручные роботы), но их `id`
+    в легаси **не существует**: у ручной записи `legacy_id = NULL`, и обратной
+    записи не бывает. Проверено: **18** ручных роботов, ни одного в легаси.
+
+    🔴 **У синхронизированных записей id совпадают** (проверено: 2088 из 2088),
+    поэтому для них возврат `id` из реестра корректен. Отличаем по наличию
+    записи в легаси — её даёт `robot_row` при запасном чтении.
+    """
     if not row:
         return None
 
+    # `legacy_id` есть только у синхронизированных записей; ручные его не имеют.
+    in_legacy = row.get("in_legacy")
     robot_id = row.get("id")
 
-    return robot_id if isinstance(robot_id, int) else None
+    if not isinstance(robot_id, int):
+        return None
+
+    # 🔴 Ручной робот: `robot_id` писать некуда — колонка ссылается на легаси.
+    if in_legacy is False:
+        return None
+
+    return robot_id
 
 
 def robot_id_for(number, warehouse: str = "") -> Optional[int]:
