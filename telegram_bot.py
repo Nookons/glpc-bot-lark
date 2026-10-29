@@ -911,6 +911,30 @@ def topic_configuration_problems(chat_id=None) -> list:
 
     seen = {}
 
+    # 🔴 **Склад без топика ошибок — это дыра, а не «настройка не нужна».**
+    #
+    # ## Что было
+    #
+    # `thread_id is None` → `continue`. Склад, у которого топик не задан,
+    # просто пропускался, и проверка молчала.
+    #
+    # ## Чем это плохо
+    #
+    # `warehouse_for_thread` для неизвестного топика возвращает
+    # `DEFAULT_WAREHOUSE`. То есть **все ошибки склада без топика записывались
+    # на склад по умолчанию** — их статистика смешивалась, и заметить это было
+    # нечем: предупреждений нет, ошибок нет, числа просто неверные.
+    #
+    # 🔴 **Найдено 29.10.2026**, когда GLP-C разделили на `GLP-C` и `GLP-C1`:
+    # у нового склада топика нет, и все инциденты C1 уходили бы на C2.
+    for title in titles:
+        if error_topics.get(title) is None:
+            problems.append(
+                f"Warehouse {title} has no error topic: its issues would be "
+                f"recorded on {DEFAULT_WAREHOUSE}. Set TELEGRAM_TOPIC_ERROR_* "
+                f"for it or remove it from TELEGRAM_WAREHOUSES."
+            )
+
     for title in titles:
         thread_id = error_topics.get(title)
 
