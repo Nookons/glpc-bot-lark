@@ -3466,3 +3466,70 @@ class RepairOfflineChecks(unittest.TestCase):
         assert "stays offline" in body
         # Возврат статуса назад в ветке фото быть не должен.
         assert "change_robot_status" not in body
+
+
+class TestEveryRealWarehouseIsConfigured:
+    """🔴 Каждый склад из базы должен быть настроен в боте.
+
+    **Инцидент в проде 29.10.2026:** оператор прислал ошибку робота из C1 и
+    получил:
+
+    ```
+    ⚠️ Not filed in the journal: Warehouse 'GLP-C1' is not configured.
+    Configured: GLP-C, SMALL-P3.
+    ```
+
+    ## Что было не так
+
+    Дефолт в коде я обновил (`glpc=GLP-C,c1=GLP-C1,sp3=SMALL-P3`), но на Railway
+    жила **переменная окружения** со старым значением:
+
+    ```
+    TELEGRAM_WAREHOUSES = glpc=GLP-C,sp3=SMALL-P3
+    ```
+
+    🔴 **Переменная перекрывает дефолт** — значит правка кода ничего не дала, а
+    проверка «в ключе есть C1» ничего не поймала, потому что проверяла код.
+
+    ## Что проверяет сторож
+
+    Дефолт **и** типичная прод-конфигурация содержат все три склада. Это не
+    ловит забытую переменную на Railway, но ловит регрессию в дефолте — а
+    переменную видно в логе старта, который печатает карту складов.
+    """
+
+    def test_default_configuration_has_every_warehouse(self) -> None:
+        """Дефолт `TELEGRAM_WAREHOUSES` знает GLP-C, GLP-C1 и SMALL-P3."""
+        import os as _os
+
+        saved = _os.environ.pop("TELEGRAM_WAREHOUSES", None)
+
+        try:
+            import importlib
+
+            import warehouses as warehouses_module
+
+            importlib.reload(warehouses_module)
+
+            titles = set(warehouses_module.WAREHOUSES.values())
+
+            # 🔴 Три склада: C2, C1 и SMALL-P3.
+            assert "GLP-C" in titles
+            assert "GLP-C1" in titles
+            assert "SMALL-P3" in titles
+        finally:
+            if saved is not None:
+                _os.environ["TELEGRAM_WAREHOUSES"] = saved
+                import importlib
+
+                import warehouses as warehouses_module
+
+                importlib.reload(warehouses_module)
+
+    def test_production_configuration_parses_c1(self) -> None:
+        """Прод-значение переменной даёт все три склада."""
+        from warehouses import parse_warehouses
+
+        parsed = parse_warehouses("glpc=GLP-C,c1=GLP-C1,sp3=SMALL-P3")
+
+        assert set(parsed.values()) == {"GLP-C", "GLP-C1", "SMALL-P3"}
