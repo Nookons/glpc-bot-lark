@@ -1881,7 +1881,10 @@ class TestWarehouseStep:
             if b["callback_data"] != "ins:x"
         ]
         assert labels == list(WAREHOUSES.values()), labels
-        assert labels == ["GLP-C", "SMALL-P3"], labels
+        # 🔴 **Три склада, а не два** (29.10.2026): GLP-C разделён на
+        # `GLP-C` (C2) и `GLP-C1` (C1). Решение владельца «две кнопки» означало
+        # «все склады бота», а не арифметическую двойку.
+        assert labels == ["GLP-C", "GLP-C1", "SMALL-P3"], labels
 
 
 class TestWarehouseButtons:
@@ -1912,7 +1915,7 @@ class TestWarehouseButtons:
         from warehouses import WAREHOUSES
 
         assert insp._warehouse_choices() == list(WAREHOUSES.values())
-        assert insp._warehouse_choices() == ["GLP-C", "SMALL-P3"]
+        assert insp._warehouse_choices() == ["GLP-C", "GLP-C1", "SMALL-P3"]
 
     def test_choices_need_no_arguments(self) -> None:
         """У функции нет аргументов — роль и карточка в неё не попадают.
@@ -1989,7 +1992,7 @@ class TestWarehouseButtons:
 
         session = _session()
         assert session is not None, "диалог не должен обрываться из-за склада карточки"
-        assert session.warehouses == ["GLP-C", "SMALL-P3"]
+        assert session.warehouses == ["GLP-C", "GLP-C1", "SMALL-P3"]
 
     def test_warehouse_cancel_works_on_the_new_step(self, rec, monkeypatch) -> None:
         """`/cancel` работает на шаге склада, как и на любом другом."""

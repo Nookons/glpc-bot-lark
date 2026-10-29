@@ -927,8 +927,14 @@ def topic_configuration_problems(chat_id=None) -> list:
     #
     # 🔴 **Найдено 29.10.2026**, когда GLP-C разделили на `GLP-C` и `GLP-C1`:
     # у нового склада топика нет, и все инциденты C1 уходили бы на C2.
+    # 🔴 **Склад по умолчанию имеет запасной топик** (`TELEGRAM_TOPIC_ID`).
+    # `error_topic` его учитывает, и здесь проверяем то же — иначе склад, у
+    # которого всё настроено через историческую переменную, получал бы ложное
+    # предупреждение.
     for title in titles:
-        if error_topics.get(title) is None:
+        if error_topics.get(title) is None and not (
+            title == DEFAULT_WAREHOUSE and TELEGRAM_TOPIC_ID is not None
+        ):
             problems.append(
                 f"Warehouse {title} has no error topic: its issues would be "
                 f"recorded on {DEFAULT_WAREHOUSE}. Set TELEGRAM_TOPIC_ERROR_* "

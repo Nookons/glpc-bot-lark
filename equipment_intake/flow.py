@@ -772,6 +772,56 @@ def unregistered_numbers(session: Session) -> List[str]:
     return missing
 
 
+def resolve_warehouse_from_path(session) -> Optional[str]:
+    """Склад по номеру оборудования из уже введённого пути.
+
+    🔴 **Требование владельца (29.10.2026):** «номера оборудования не могут
+    повторяться; именно по номеру можно и понимать, какой склад обрабатывается
+    оператором — не нужен отдельный топик».
+
+    ## Зачем
+
+    Склад брался из топика Telegram. Для второй очереди GLP-C отдельного топика
+    нет — и её инциденты записывались бы на склад по умолчанию (C2).
+
+    ## Как
+
+    Первый номер в пути ищется **без фильтра по складу** (`find_equipment`
+    умеет это с 29.10.2026). Если он нашёлся ровно на одном складе — это и есть
+    склад операции.
+
+    🔴 **`None`, если номер неоднозначен или не найден.** Догадка хуже
+    отсутствия: инцидент ушёл бы на чужой склад, а `can_access_warehouse` потом
+    не дал бы его исправить.
+    """
+    from .validation import (
+        EQUIPMENT_CATEGORY,
+        find_equipment,
+        parts_with_lookup,
+    )
+
+    for step in session.path:
+        node = session.tree.node(step.node_id)
+
+        if not is_number_node(node):
+            continue
+
+        kind = session.number_kind_for_step(step)
+
+        if kind not in EQUIPMENT_CATEGORY:
+            continue
+
+        # Пустой склад = искать везде; результат скажет, где железо.
+        for part, _found in parts_with_lookup(kind, "", step.value):
+            row = find_equipment(kind, "", part)
+            title = str((row or {}).get("warehouse") or "").strip()
+
+            if title:
+                return title
+
+    return None
+
+
 def _kind_label(kind: str) -> str:
     """Как назвать устройство в предупреждении оператору."""
     return {
@@ -1048,7 +1098,20 @@ def _confirm(
     _show_confirm_progress(chat_id, session, callback_id, message_id)
 
     result = session.result()
-    result["warehouse"] = session.data.get("warehouse") or ""
+    # 🔴 **Склад из номера оборудования — приоритетнее топика** (29.10.2026).
+    #
+    # Владелец: «номера оборудования не могут повторяться; именно по номеру
+    # можно и понимать, какой склад обрабатывается оператором — не нужен
+    # отдельный топик».
+    #
+    # Склад из топика остаётся **запасным**: у второй очереди GLP-C своего
+    # топика нет, и без этого её инциденты уходили бы на склад по умолчанию.
+    #
+    # 🔴 **`resolve_warehouse_from_path` возвращает `None`, если номер
+    # неоднозначен** (бывает у `121` — он есть и в C1, и в SMALL-P3). Тогда
+    # остаётся топик: догадка отправила бы инцидент на чужой склад.
+    from_number = resolve_warehouse_from_path(session)
+    result["warehouse"] = from_number or (session.data.get("warehouse") or "")
     result["note"] = session.data.get("note") or ""
     # Признак «номер не найден в справочнике» доезжает до записи: строка
     # пишется, но помечается на разбор (`review_reason`). Пустое значение —

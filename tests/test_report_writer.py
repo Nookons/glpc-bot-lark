@@ -1534,14 +1534,28 @@ class TopicDiagnosticsChecks(unittest.TestCase):
     def test_learned_topic_name_is_not_reported(self):
         self.bot.remember_topic(-100, 42, "Ex GLPC")
 
-        problems = self.problems(topic_id=None, topic_name="Ex GLPC")
+        # 🔴 **Второй склад GLP-C1 тоже должен иметь топик** (29.10.2026):
+        # склад разделён, и без топика бот честно предупреждает, что ошибки C1
+        # уйдут на склад по умолчанию.
+        problems = self.problems(
+            topic_id=None,
+            topic_name="Ex GLPC",
+            # 🔴 Все три склада бота должны иметь топик (29.10.2026): GLP-C,
+            # GLP-C1 и SMALL-P3. Иначе проверка честно сообщает, что ошибки
+            # этого склада уйдут на склад по умолчанию.
+            **{"error:GLP-C1": "322", "error:SMALL-P3": "318"},
+        )
 
         self.assertEqual(problems, [])
 
     def test_numeric_ids_produce_no_warnings(self):
         """The production shape: ids for both warehouses and shared topics."""
         problems = self.problems(**{
-            "error": "2", "error:SMALL-P3": "318",
+            # 🔴 **Топик C1 обязателен** (29.10.2026): GLP-C разделён на
+            # `GLP-C` (C2) и `GLP-C1` (C1). Без топика бот предупреждает, что
+            # ошибки C1 уйдут на склад по умолчанию — и это верное
+            # предупреждение, а не ложное.
+            "error:GLP-C": "2", "error:GLP-C1": "322", "error:SMALL-P3": "318",
             "status": "319", "stats": "320", "service": "321",
         })
 

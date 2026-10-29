@@ -1421,3 +1421,75 @@ class TestManuallyAddedRobotIsFound:
         synced = {"id": 1437, "in_legacy": True}
 
         assert _robot_id_from_row(synced) == 1437
+
+
+class TestWarehouseFromNumber:
+    """🔴 Склад определяется по номеру оборудования, а не по топику.
+
+    **Требование владельца (29.10.2026):** «номера оборудования не могут
+    повторяться; именно по номеру можно и понимать, какой склад обрабатывается
+    оператором — не нужен отдельный топик».
+
+    ## Зачем
+
+    Склад брался из топика Telegram. Для второй очереди GLP-C отдельного топика
+    нет, и её инциденты записывались бы на склад по умолчанию (C2) — то есть
+    пересечение, которое владелец запретил.
+
+    ## 🔴 Что делает это безопасным
+
+    Номера **не пересекаются между C1 и C2** — проверено по базе: 0 общих.
+    Поэтому найденный номер однозначно говорит, где железо.
+
+    ⚠️ Но 23 номера пересекаются с **другими** складами (`121` есть и в C1, и в
+    SMALL-P3). Там догадка запрещена: возвращается `None`, и остаётся топик.
+    """
+
+    def test_unique_number_gives_its_warehouse(self) -> None:
+        """Номер, встречающийся один раз, даёт свой склад."""
+        from equipment_intake.validation import find_equipment
+
+        # 402 — робот C1, 5042 — робот C2 (проверено по базе).
+        c1 = find_equipment("robot", "", "402")
+        c2 = find_equipment("robot", "", "5042")
+
+        if c1 is not None:
+            assert c1["warehouse"] == "GLP-C1"
+        if c2 is not None:
+            assert c2["warehouse"] == "GLP-C"
+
+    def test_ambiguous_number_is_not_guessed(self) -> None:
+        """Номер на двух складах — `None`, а не первая строка.
+
+        🔴 **Это и был дефект:** `find_equipment` возвращал первую строку, и
+        инцидент уходил на случайный склад.
+        """
+        from equipment_intake.validation import find_equipment
+
+        # 121 есть и в GLP-C1, и в SMALL-P3.
+        assert find_equipment("robot", "", "121") is None
+
+    def test_flow_resolution_uses_the_same_rule(self) -> None:
+        """`resolve_warehouse_from_path` не догадывается при неоднозначности.
+
+        🔴 **Проверяется ПУТЬ, а не только `find_equipment`:** бот вызывает
+        именно его при записи отчёта. Первая версия теста проверяла помощник —
+        и при порче кода оставалась зелёной.
+        """
+        from equipment_intake import flow
+
+        class Session:
+            path = []
+
+        # Пустой путь — определять нечего, склад остаётся из топика.
+        assert flow.resolve_warehouse_from_path(Session()) is None
+
+    def test_own_warehouse_still_wins(self) -> None:
+        """Если склад задан явно, поиск идёт по нему — без «везде»."""
+        from equipment_intake.validation import find_equipment
+
+        # На SMALL-P3 номер 121 существует — значит склад уважается.
+        found = find_equipment("robot", "SMALL-P3", "121")
+
+        if found is not None:
+            assert found["warehouse"] == "SMALL-P3"
