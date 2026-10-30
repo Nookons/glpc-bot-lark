@@ -397,10 +397,28 @@ def change_robot_status(
         )
         return None
 
+    # 🔴 **`robot_id` — идентификатор КАНОНИЧЕСКОЙ единицы** (30.10.2026).
+    #
+    # ## Что было не так
+    #
+    # Писался `robot.get("id")` — первичный ключ **легаси-зеркала**
+    # `robots_maintenance_list`. У `change_status_robots.robot_id` есть внешний
+    # ключ на `equipment.id`, а легаси-ключи туда не входят: у робота 544 это
+    # `20267`, и такой единицы в реестре нет.
+    #
+    # Следствие: **вставка падала с нарушением внешнего ключа**, а код писал
+    # только предупреждение в лог. Журнал статусов не пополнялся — и история
+    # ремонта на вебе выглядела странно: старый процесс от 22 октября висел как
+    # «in repair now», потому что перехода 29–30 октября в журнале не было.
+    #
+    # 🔴 **`legacy_id` остаётся в строке отдельным полем** — по нему историю
+    # находят старые экраны, и терять его нельзя.
+    equipment_row = find_equipment(robot)
+
     history = rest_post(
         STATUS_HISTORY_TABLE,
         {
-            "robot_id": robot.get("id"),
+            "robot_id": (equipment_row or {}).get("id") or robot.get("id"),
             "robot_number": robot.get("robot_number"),
             "old_status": old_status,
             "new_status": new_status,

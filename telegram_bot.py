@@ -2765,6 +2765,76 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
     return False
 
 
+def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
+    """Кладёт фото в `repair_attachments` канонического ремонта.
+
+    Возвращает `True`, если файл записан (или ремонт уже имеет его).
+
+    🔴 **Тот же путь, что у веб-интерфейса.** Экран ремонта читает файлы из
+    `repair_attachments`; бот, писавший в легаси `photo_urls`, был невидим для
+    экрана — владелец описал это как «нету медиа, что было загружено».
+
+    🔴 **Единицу ищем по `legacy_id`**, а не по номеру: номера повторяются между
+    складами (`121` есть и в GLP-C1, и в SMALL-P3), и поиск по номеру привязал
+    бы фото к чужому роботу.
+    """
+    from sendToDataBase import rest_get, rest_post
+
+    import robot_status
+
+    legacy_id = pending.get("robot_id")
+
+    if not legacy_id:
+        return False
+
+    equipment = robot_status.find_equipment({"id": legacy_id})
+
+    if not equipment:
+        # Единицы нет в реестре — пусть решает легаси-ветка.
+        return False
+
+    open_rows = rest_get(
+        "repair_assignments",
+        {
+            "select": "id",
+            "equipment_id": f"eq.{equipment.get('id')}",
+            "status": "eq.open",
+            "order": "assigned_at.desc",
+            "limit": "1",
+        },
+        optional=True,
+    )
+
+    if not open_rows:
+        # 🔴 Ремонта ещё нет — заводим его тем же кодом, что и `/offline`, чтобы
+        # у фото была запись. Это не дубль: открытого поручения не существовало.
+        repair_id = robot_status.open_repair(
+            {"id": legacy_id, "robot_number": pending.get("robot_number")},
+            {},
+            str(pending.get("type_problem") or ""),
+            "",
+        )
+    else:
+        repair_id = open_rows[0].get("id")
+
+    if not repair_id:
+        return False
+
+    created = rest_post(
+        "repair_attachments",
+        {
+            "repair_id": repair_id,
+            "kind": "photo",
+            "url": url,
+            "card_id": (get_employee(sender.get("id")) or {}).get("card_id"),
+            "caption": str(pending.get("type_problem") or "") or None,
+        },
+        ignore_conflict=True,
+    )
+
+    return created is not None
+
+
 def _attach_photo_to_repair(chat_id, sender, photo_path, pending: dict) -> bool:
     """Приписывает фото к ремонту выведенного из работы робота.
 
@@ -2803,6 +2873,46 @@ def _attach_photo_to_repair(chat_id, sender, photo_path, pending: dict) -> bool:
         return False
 
     from sendToDataBase import rest_get, rest_patch, rest_post
+
+    # 🔴 **Фото — в каноническую запись ремонта** (30.10.2026).
+    #
+    # ## Что было не так
+    #
+    # Владелец: «после добавления через бота нету медиа, что было загружено».
+    #
+    # Бот писал ссылку в `robot_repair_assignments.photo_urls` — в **легаси**.
+    # А экран ремонта читает файлы через `repair_attachments` канонической
+    # записи (или `photo_urls` через её `legacy_id`). У записи, созданной ботом
+    # напрямую в `repair_assignments`, `legacy_id` нет — и фото не находилось.
+    #
+    # 🔴 **Хуже: бот заводил ВТОРУЮ запись.** Открытого легаси-ремонта он не
+    # находил (в канонической таблице `status=open`), создавал новую строку в
+    # `robot_repair_assignments` — и у робота оказывалось два открытых ремонта.
+    #
+    # ## Как теперь
+    #
+    # 1. Находим единицу по `legacy_id` робота (номер повторяется между
+    #    складами, поэтому номером не ищем).
+    # 2. Находим её **открытое** поручение в `repair_assignments`.
+    # 3. Кладём файл в `repair_attachments` — туда же, куда пишет веб.
+    #
+    # 🔴 Легаси-ветка остаётся запасной: если единицы в реестре нет (старые
+    # роботы), пишем как раньше, чтобы фото не потерялось вовсе.
+    canonical_saved = _attach_photo_to_canonical_repair(
+        sender, pending, url
+    )
+
+    if canonical_saved:
+        done = dict(pending)
+        done.pop("awaiting_photo", None)
+        set_pending_status(chat_id, sender.get("id"), done)
+
+        _send(
+            chat_id,
+            "📎 Photo attached to the repair record.",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return True
 
     # Ищем открытый ремонт этого робота: фото дописывается к нему, а не создаёт
     # вторую запись.

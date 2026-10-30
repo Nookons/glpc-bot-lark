@@ -1690,3 +1690,49 @@ class TestStatusFlowBeatsStaleIntake:
             "работает криво»: статус меняется без причины, а приём начинает "
             "новый отчёт"
         )
+
+
+class TestRepairPhotoReachesTheWeb:
+    """🔴 Фото из бота видно на экране ремонта.
+
+    **Жалоба владельца 30.10.2026:** «после добавления через бота нету медиа,
+    что было загружено».
+
+    ## Что было не так
+
+    Бот писал ссылку в `robot_repair_assignments.photo_urls` — в **легаси**.
+    Экран читает `repair_attachments` канонической записи (или `photo_urls`
+    через её `legacy_id`). У ремонта, созданного ботом напрямую в
+    `repair_assignments`, `legacy_id` нет — фото не находилось.
+
+    🔴 **И бот заводил ВТОРУЮ запись:** открытого легаси-ремонта он не находил и
+    создавал новую строку — у робота оказывалось два открытых ремонта.
+    """
+
+    def test_photo_goes_to_canonical_attachments(self) -> None:
+        """Бот пишет в `repair_attachments`, а не только в легаси."""
+        import inspect
+
+        import telegram_bot
+
+        source = inspect.getsource(telegram_bot._attach_photo_to_canonical_repair)
+
+        assert "repair_attachments" in source
+        # 🔴 Единицу ищем по `legacy_id`: номера повторяются между складами.
+        assert "find_equipment" in source
+
+    def test_journal_uses_canonical_equipment_id(self) -> None:
+        """Журнал статусов получает `equipment.id`, а не легаси-ключ.
+
+        🔴 **Из-за легаси-ключа вставка падала** по внешнему ключу, и в журнале
+        не появлялось ни возврата, ни нового вывода — от этого история ремонта
+        на вебе выглядела странно.
+        """
+        import inspect
+
+        import robot_status
+
+        source = inspect.getsource(robot_status.change_robot_status)
+
+        assert 'equipment_row = find_equipment(robot)' in source
+        assert '"robot_id": (equipment_row or {}).get("id")' in source
