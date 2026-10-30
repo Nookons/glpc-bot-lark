@@ -2401,6 +2401,23 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     robot_warehouse, robot = matches[0]
     spec = robot_status.DIRECTIONS[direction]
 
+    # 🔴 **Подвисшая сессия приёма ошибок закрывается** (30.10.2026).
+    #
+    # Пока она жива, её кнопки и запросы показываются рядом с диалогом смены
+    # статуса — на скриншоте владельца «Describe the reason» и «Send the
+    # equipment number» пришли вперемешку. Человек не понимает, какой диалог
+    # главный, и следующий текст уходит не туда.
+    #
+    # 🔴 **Явная команда сильнее забытого состояния:** человек только что набрал
+    # `/offline` — значит намерение сменилось, и старый отчёт по ошибке
+    # продолжать не нужно.
+    try:
+        import equipment_intake.flow as intake_flow
+
+        intake_flow.drop_session(chat_id, sender.get("id"))
+    except Exception:  # noqa: BLE001 — приём не должен ломать смену статуса
+        logger.warning("Не удалось закрыть сессию приёма ошибок", exc_info=True)
+
     if robot_status.is_in_status(robot, direction):
         other = "online" if direction == "offline" else "offline"
 
@@ -5843,19 +5860,44 @@ def _handle_text_message(chat_id, sender, text, message_id, chat):
     if _handle_inspection_text(chat_id, sender, text, message_id):
         return
 
-    # Handle text only when this employee has an active intake step.
-    import equipment_intake.flow as intake_flow
-
-    if intake_flow.handle_text(chat_id, sender, text, message_id):
-        return
-
-    # Handle option editor text only while an editor prompt is pending.
-    import equipment_intake.editor as intake_editor
-
-    if intake_editor.handle_text(chat_id, sender, text, message_id):
-        return
-
+    # 🔴 **Описание причины смены статуса — РАНЬШЕ приёма ошибок**
+    # (исправлено 30.10.2026).
+    #
+    # ## Что было не так
+    #
+    # Владелец: «/offline работает криво». На скриншоте видно: после выбора
+    # причины бот просит «Describe the reason in one message», и **тут же**
+    # приём ошибок показывает «Send the equipment number» — два диалога живы
+    # одновременно, и следующий текст уходит не туда.
+    #
+    # 🔴 **Приём ошибок забирал сообщение первым:** у него тоже есть текстовый
+    # шаг (номер устройства), и `handle_text` возвращал `True`, съедая описание
+    # причины. Смена статуса оставалась без причины, а приём ошибок начинал
+    # новый отчёт с этим текстом.
+    #
+    # 🔴 **Порядок был разным в двух ветках: у фото осмотр проверялся раньше
+    # приёма, у текста — нет.** Ровно та асимметрия, о которой предупреждает
+    # комментарий ниже: «кнопка сработала, а текст ушёл не туда».
+    #
+    # ## Почему это правильный порядок
+    #
+    # Ожидание причины **уже создано действием человека** (он нажал кнопку), а
+    # сессия приёма может быть старой и забытой. Явное действие сильнее
+    # подвисшего состояния.
     pending = take_pending_status(chat_id, sender.get("id"))
+
+    if not pending:
+        # Handle text only when this employee has an active intake step.
+        import equipment_intake.flow as intake_flow
+
+        if intake_flow.handle_text(chat_id, sender, text, message_id):
+            return
+
+        # Handle option editor text only while an editor prompt is pending.
+        import equipment_intake.editor as intake_editor
+
+        if intake_editor.handle_text(chat_id, sender, text, message_id):
+            return
 
     if pending:
         # Это описание причины для смены статуса, а не сообщение об ошибке.

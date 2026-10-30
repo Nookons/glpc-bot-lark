@@ -1584,3 +1584,109 @@ class TestBotRepairSystemRules:
         import robot_status
 
         assert robot_status.REPAIRS_TABLE == "repair_assignments"
+
+
+class TestStatusFlowBeatsStaleIntake:
+    """🔴 Описание причины смены статуса не уходит в приём ошибок.
+
+    **Жалоба владельца 30.10.2026:** «/offline работает криво».
+
+    На скриншоте видно два диалога одновременно: «Describe the reason in one
+    message» от смены статуса и «Send the equipment number» от приёма ошибок.
+    Следующий текст уходил не туда.
+
+    ## 🔴 Причина
+
+    В обработчике текста приём ошибок проверялся **раньше**, чем ожидание
+    причины. У приёма есть свой текстовый шаг (номер устройства), он возвращал
+    `True` и **съедал описание причины**: статус менялся без причины, а приём
+    начинал новый отчёт с этого текста.
+
+    🔴 **Порядок был разным в двух ветках:** у фото осмотр проверялся раньше
+    приёма, у текста — нет. Та же асимметрия, о которой предупреждает
+    комментарий рядом.
+    """
+
+    def test_pending_status_is_checked_before_intake(self) -> None:
+        """`take_pending_status` стоит в исходнике раньше `intake_flow.handle_text`."""
+        import inspect
+
+        import telegram_bot
+
+        source = inspect.getsource(telegram_bot)
+
+        pending_at = source.index('pending = take_pending_status(chat_id')
+        intake_at = source.index('if intake_flow.handle_text(')
+
+        assert pending_at < intake_at, (
+            "ожидание причины должно проверяться раньше приёма ошибок: иначе "
+            "описание причины съедает приём и статус меняется без причины"
+        )
+
+    def test_status_command_drops_stale_intake_session(self) -> None:
+        """`/offline` закрывает подвисшую сессию приёма.
+
+        🔴 **Иначе два диалога живы одновременно:** кнопки приёма показываются
+        рядом с причинами, и человек не понимает, какой диалог главный.
+        """
+        import inspect
+
+        import telegram_bot
+
+        source = inspect.getsource(telegram_bot._handle_status_command)
+
+        assert "drop_session" in source, (
+            "команда /offline обязана закрывать сессию приёма: иначе её "
+            "запросы остаются на экране рядом с причинами"
+        )
+
+    def test_reason_text_does_not_reach_intake(self) -> None:
+        """Живой прогон: текст причины не доходит до приёма ошибок.
+
+        🔴 **Проверяется поведение, а не текст исходника.** Прошлая версия
+        сторожа смотрела порядок строк в файле — такую защиту легко обойти
+        перестановкой, не меняя смысла.
+        """
+        import telegram_bot
+
+        calls = {"intake": 0, "status": 0}
+
+        class _Sender(dict):
+            pass
+
+        sender = _Sender(id=1)
+
+        # Приём ошибок «съел бы» сообщение, если бы вызывался первым.
+        original_intake = None
+
+        import equipment_intake.flow as intake_flow
+
+        original_intake = intake_flow.handle_text
+        intake_flow.handle_text = lambda *a, **k: (calls.__setitem__("intake", calls["intake"] + 1), True)[1]
+
+        original_take = telegram_bot.take_pending_status
+        original_finish = telegram_bot.finish_status_change
+        telegram_bot.take_pending_status = lambda *a, **k: {
+            "robot_number": 544,
+            "direction": "offline",
+            "reason": "Other",
+        }
+        telegram_bot.finish_status_change = lambda *a, **k: (calls.__setitem__("status", calls["status"] + 1), True)[1]
+        telegram_bot._delete_user_message = lambda *a, **k: None
+        telegram_bot.logger = telegram_bot.logger
+
+        try:
+            telegram_bot._handle_text_message(
+                -500, sender, "сломан ролик", 7, {"type": "supergroup", "id": -500}
+            )
+        finally:
+            intake_flow.handle_text = original_intake
+            telegram_bot.take_pending_status = original_take
+            telegram_bot.finish_status_change = original_finish
+
+        assert calls["status"] == 1, "описание причины не дошло до смены статуса"
+        assert calls["intake"] == 0, (
+            "приём ошибок перехватил текст причины — это и есть «/offline "
+            "работает криво»: статус меняется без причины, а приём начинает "
+            "новый отчёт"
+        )
