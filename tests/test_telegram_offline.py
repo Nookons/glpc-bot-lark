@@ -2669,10 +2669,16 @@ def test_robot_status_module():
         robot_status.rest_patch = original_patch
         robot_status.rest_post = original_post
 
+    # 🔴 **Статус — `maintenance`, а не `offline`** (30.10.2026).
+    #
+    # Владелец: «/offline не работает — сделай под новую систему починки».
+    # База требует, чтобы **проблема стояла только у единицы в `maintenance`**
+    # (`enforce_problem_only_in_repair`). С `offline` PATCH отвечал `400`, и
+    # статус не менялся вовсе.
     check(
         "status: PATCH статуса робота",
         patched and patched[0][0] == "robots_maintenance_list"
-        and patched[0][2]["status"] == robot_status.OFFLINE,
+        and patched[0][2]["status"] == robot_status.MAINTENANCE,
         patched,
     )
     check(
@@ -2690,7 +2696,7 @@ def test_robot_status_module():
         "status: запись в журнал change_status_robots",
         posted and posted[0][0] == "change_status_robots"
         and posted[0][1]["old_status"] == robot_status.ONLINE
-        and posted[0][1]["new_status"] == robot_status.OFFLINE
+        and posted[0][1]["new_status"] == robot_status.MAINTENANCE
         and posted[0][1]["add_by"] == 60072001
         and posted[0][1]["robot_id"] == 3542,
         posted,
@@ -2704,7 +2710,7 @@ def test_robot_status_module():
     check(
         "status: результат для карточки",
         result and result["old_status"] == robot_status.ONLINE
-        and result["new_status"] == robot_status.OFFLINE,
+        and result["new_status"] == robot_status.MAINTENANCE,
         result,
     )
 
@@ -2793,8 +2799,10 @@ def test_offline_command_validation():
     codes = [button["callback_data"] for row in keyboard for button in row]
 
     check(
+        # 🔴 Переход теперь «Online → Maintenance»: `/offline` выводит единицу в
+        # ремонт (30.10.2026), а не просто снимает связь.
         "offline: показан робот и переход статуса",
-        "Online" in sent[0]["text"] and "Offline" in sent[0]["text"],
+        "Online" in sent[0]["text"] and "Maintenance" in sent[0]["text"],
         sent,
     )
     check(
@@ -2872,8 +2880,8 @@ def test_status_flow_end_to_end():
         bot.send_card_via_hook = original_card
 
     check(
-        "flow: статус робота изменён на Offline",
-        patched and patched[0][2]["status"] == robot_status.OFFLINE,
+        "flow: статус робота изменён на Maintenance",
+        patched and patched[0][2]["status"] == robot_status.MAINTENANCE,
         patched,
     )
     check(

@@ -1493,3 +1493,94 @@ class TestWarehouseFromNumber:
 
         if found is not None:
             assert found["warehouse"] == "SMALL-P3"
+
+
+class TestBotRepairSystemRules:
+    """🔴 `/offline` и `/online` подчиняются правилам базы, а не удобству.
+
+    **Жалоба владельца 30.10.2026:** «/online, /offline на боте не работает, и
+    работает неправильно. Сделай правильно под новую систему починки:
+    Device → go to repair».
+
+    ## 🔴 Почему не работало
+
+    База отклоняла `PATCH` с `400`, и **статус не менялся вообще**:
+
+    | Правило базы | Что делал бот | Итог |
+    |---|---|---|
+    | проблему можно ставить **только** в `maintenance` | ставил `offline` + `type_problem` | `23514 Only equipment in maintenance can carry a problem` |
+    | в `online` нельзя, **пока ремонт открыт** | сначала менял статус, потом закрывал | `23514 cannot be online: repair is open` |
+
+    Снаружи это выглядело как «команда не работает» — сообщения об ошибке
+    человек не видел, статус оставался прежним.
+
+    ## 🔴 И третье: ремонт вообще не заводился
+
+    Бот менял только легаси-зеркало. Панель простоя и отчёт ремонта считают
+    время по `repair_assignments.offline_at → closed_at` — записи нет, часов нет.
+    """
+
+    def test_offline_sets_maintenance_not_offline(self) -> None:
+        """`/offline` ставит `maintenance`: иначе проблема не записывается.
+
+        🔴 **Это и был первый отказ:** `offline` + проблема → база отвечает
+        `23514`, и статус не меняется.
+        """
+        import robot_status
+
+        assert robot_status.DIRECTIONS["offline"]["new_status"] == robot_status.MAINTENANCE
+
+    def test_maintenance_status_is_recognised_by_the_database(self) -> None:
+        """Строка `维护 | Maintenance` распознаётся триггером как `maintenance`.
+
+        🔴 **Без этого статус в `equipment` не стал бы `maintenance`,** и
+        проблема снова упёрлась бы в проверку.
+        """
+        import robot_status
+
+        assert "maintenance" in robot_status.MAINTENANCE.lower()
+        assert "维护" in robot_status.MAINTENANCE
+
+    def test_online_closes_repair_before_status_change(self) -> None:
+        """`/online` закрывает ремонт **до** смены статуса.
+
+        🔴 **Второй отказ:** база не даёт вернуть единицу в `online`, пока по ней
+        открыт ремонт. Порядок шагов — часть контракта, поэтому проверяется
+        исходником: сначала `close_repair`, потом `rest_patch` статуса.
+        """
+        import inspect
+
+        import robot_status
+
+        source = inspect.getsource(robot_status.change_robot_status)
+        close_at = source.index('close_repair(robot, employee')
+        patch_at = source.index('updated = rest_patch(')
+
+        assert close_at < patch_at, (
+            "close_repair должен стоять ДО изменения статуса: база не даст "
+            "вернуть единицу в online, пока ремонт открыт"
+        )
+
+    def test_offline_opens_repair_after_status_change(self) -> None:
+        """`/offline` открывает ремонт **после** смены статуса.
+
+        🔴 Обратное правило: открыть ремонт единице в `online` база не даст.
+        """
+        import inspect
+
+        import robot_status
+
+        source = inspect.getsource(robot_status.change_robot_status)
+        patch_at = source.index('updated = rest_patch(')
+        open_at = source.index('repair_id = open_repair(')
+
+        assert open_at > patch_at, (
+            "open_repair должен стоять ПОСЛЕ изменения статуса: единице в "
+            "online база не даст открыть ремонт"
+        )
+
+    def test_repair_goes_to_the_canonical_table(self) -> None:
+        """Ремонт пишется в `repair_assignments`, а не в легаси."""
+        import robot_status
+
+        assert robot_status.REPAIRS_TABLE == "repair_assignments"
