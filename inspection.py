@@ -95,6 +95,7 @@ from inspection_api import (
     api_configured,
     complete_inspection,
     create_inspection,
+    ensure_session_on,
     create_share,
     list_templates,
     public_url,
@@ -1082,6 +1083,19 @@ def _choose_template(session: Session, template_id: str, chat_id, message_id, an
         return
 
     answer("Starting…")
+
+    # 🔴 **Смена выравнивается на склад осмотра** (31.10.2026).
+    #
+    # Бот берёт склад из **топика**, а API проверяет склад **активной смены**.
+    # Сотрудник со сменой на `GLP-C` при осмотре в топике `SMALL-P3` получал
+    # 403 «Equipment belongs to another warehouse» — хотя оборудование найдено.
+    #
+    # 🔴 Топик — это и есть переключение склада, как список в вебе: он тоже
+    # открывает смену. Без этого бот «работает в одном складе, а смотрит другой».
+    ensure_session_on(
+        session.auth_id,
+        str(session.equipment.get("warehouse") or session.warehouse or ""),
+    )
 
     inspection = create_inspection(
         session.auth_id,

@@ -2692,3 +2692,61 @@ class TestShareLinkFailureIsReported:
         # 🔴 Ровно два позиционных: третий (`chat_id`) — это `TypeError`.
         assert len(calls[0]) == 2
         assert calls[0][0] is session
+
+
+class TestInspectionAlignsShiftWithTopic:
+    """🔴 Осмотр в топике другого склада выравнивает смену.
+
+    **Жалоба владельца 31.10.2026:** «есть проблема с инспекциями на
+    SMALL-P3».
+
+    ## Что было не так
+
+    Бот определяет склад по **топику** и находит оборудование там. А API
+    проверяет склад **активной смены**:
+
+    ```python
+    if not principal.can_access_warehouse(row.get("warehouse")):
+        raise PermissionDenied("Equipment belongs to another warehouse")
+    ```
+
+    Сотрудник со сменой на `GLP-C`, осматривающий робота в топике `SMALL-P3`,
+    получал **403** — хотя оборудование найдено, а топик и есть его рабочее
+    место.
+
+    ## Почему смена, а не ослабление проверки
+
+    🔴 **Топик — это и есть переключение склада**, как выпадающий список в вебе:
+    он тоже открывает смену. Ослаблять проверку в API ради бота значило бы
+    открыть запись в чужой склад всем.
+    """
+
+    def test_inspection_switches_shift_before_creating(self) -> None:
+        """`ensure_session_on` вызывается ДО `create_inspection`."""
+        import inspect as _inspect
+
+        import inspection
+
+        source = _inspect.getsource(inspection)
+
+        ensure_at = source.index("ensure_session_on(")
+        create_at = source.index("inspection = create_inspection(")
+
+        assert ensure_at < create_at, (
+            "смену нужно выравнивать до создания осмотра: иначе API ответит "
+            "403 «Equipment belongs to another warehouse»"
+        )
+
+    def test_active_sessions_asks_for_employee_id(self) -> None:
+        """`GET /v1/sessions` требует `employee_id` — иначе `422`.
+
+        🔴 **Это была вторая ошибка:** ручка объявлена как `GET /v1/sessions?
+        employee_id=…`, и без параметра отвечает `422`, а не пустым списком.
+        """
+        import inspect as _inspect
+
+        import inspection_api
+
+        source = _inspect.getsource(inspection_api.active_sessions)
+
+        assert "employee_id=" in source

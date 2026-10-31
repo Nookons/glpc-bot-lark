@@ -441,3 +441,114 @@ PUBLIC_SITE_BASE = os.environ.get(
 def public_url(token: str) -> str:
     """Адрес публичной страницы осмотра по токену."""
     return f"{PUBLIC_SITE_BASE}/inspection/share/{token}"
+
+
+# --- Склад смены под осмотр --------------------------------------------------
+#
+# 🔴 **Зачем** (владелец 31.10.2026): «есть проблема с инспекциями на SMALL-P3».
+#
+# ## Что было не так
+#
+# Бот определяет склад по **топику** и находит оборудование там. А API проверяет
+# склад **активной смены сотрудника**:
+#
+#     if not principal.can_access_warehouse(row.get("warehouse")):
+#         raise PermissionDenied("Equipment belongs to another warehouse")
+#
+# Сотрудник со сменой на `GLP-C`, осматривающий робота в топике `SMALL-P3`,
+# получал **403** — хотя оборудование найдено, а топик и есть его рабочее место.
+#
+# ## Почему смена, а не ослабление проверки
+#
+# 🔴 **Топик — это и есть переключение склада**, как выпадающий список в вебе.
+# Веб при переключении открывает смену на выбранном складе; бот обязан делать то
+# же, иначе он «работает в одном складе, а смотрит другой».
+#
+# 🔴 **Проверку в API не трогаем:** она защищает запись от чужого склада, и
+# ослаблять её ради бота значило бы открыть то же всем.
+
+def active_sessions(auth_id: str, employee_id: int) -> list:
+    """Активные смены сотрудника.
+
+    🔴 **`employee_id` обязателен:** ручка объявлена как `GET /v1/sessions?
+    employee_id=…`, и без параметра отвечает `422`, а не пустым списком.
+    """
+    data = _request(
+        "GET", f"/v1/sessions?employee_id={int(employee_id)}", auth_id
+    )
+
+    return data if isinstance(data, list) else []
+
+
+def warehouses(auth_id: str) -> list:
+    """Справочник складов — нужен `id` по названию из топика."""
+    data = _request("GET", "/v1/warehouses", auth_id)
+
+    return data if isinstance(data, list) else []
+
+
+def me(auth_id: str) -> dict:
+    """Карточка сотрудника, которому принадлежит токен."""
+    data = _request("GET", "/v1/employees/me", auth_id)
+
+    return data if isinstance(data, dict) else {}
+
+
+def ensure_session_on(auth_id: str, warehouse_title: str) -> bool:
+    """Открывает смену на складе, если сотрудник сейчас не там.
+
+    Возвращает `True`, если смена уже была или открылась.
+
+    🔴 **Смена не переключается без нужды:** если сотрудник уже на этом складе,
+    запроса нет. Иначе каждый осмотр закрывал бы и открывал смену заново, и в
+    истории смен появилась бы сотня пустых строк.
+    """
+    if not warehouse_title:
+        return False
+
+    try:
+        employee_id = int(me(auth_id).get("id") or 0)
+
+        if not employee_id:
+            return False
+
+        for session in active_sessions(auth_id, employee_id):
+            if str(session.get("warehouse_sessions") or "") == warehouse_title:
+                return True
+
+        target = next(
+            (
+                row
+                for row in warehouses(auth_id)
+                if str(row.get("title") or "") == warehouse_title
+            ),
+            None,
+        )
+
+        if not target:
+            return False
+
+        _request(
+            "POST",
+            "/v1/sessions",
+            auth_id,
+            json_body={
+                "employee_id": employee_id,
+                "warehouse_id": int(target["id"]),
+                "warehouse_sessions": warehouse_title,
+            },
+        )
+
+        logger.info(
+            "Смена переключена на %r перед осмотром (сотрудник %s)",
+            warehouse_title,
+            employee_id,
+        )
+
+        return True
+    except Exception:  # noqa: BLE001 — не роняем осмотр из-за смены
+        logger.warning(
+            "Не удалось выровнять склад смены на %r", warehouse_title, exc_info=True
+        )
+
+        return False
