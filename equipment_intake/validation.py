@@ -230,7 +230,18 @@ def parts_with_lookup(kind: str, warehouse: str, value) -> List[Tuple[str, Optio
 #: требование владельца 16.10.2026 «привязывай инспекцию к устройству через
 #: ключ». Номер между складами и категориями повторяется (проверено на живой
 #: базе), и осмотр «за номером» уехал бы не на ту единицу.
-EQUIPMENT_SELECT = "id, equipment_code, category, warehouse, sub_warehouse, status, equipment_type_id"
+# 🔴 **Модель тянется вместе с единицей** (31.10.2026).
+#
+# Раньше приходил только `equipment_type_id` — число, по которому нельзя ни
+# показать модель человеку, ни выбрать чек-лист. Владелец: «мы знаем модель с
+# сервера сразу, будем подставлять и переходить к следующему вопросу».
+#
+# Вложенная выборка, а не второй запрос: `equipment` ссылается на
+# `equipment_types` по внешнему ключу, и PostgREST отдаёт тип тем же ответом.
+EQUIPMENT_SELECT = (
+    "id, equipment_code, category, warehouse, sub_warehouse, status, "
+    "equipment_type_id, equipment_type:equipment_type_id(type, sub_type)"
+)
 
 
 def find_equipment(kind: str, warehouse: str, code: str) -> Optional[dict]:

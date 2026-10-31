@@ -2750,3 +2750,74 @@ class TestInspectionAlignsShiftWithTopic:
         source = _inspect.getsource(inspection_api.active_sessions)
 
         assert "employee_id=" in source
+
+
+class TestChecklistIsPickedFromServerModel:
+    """🔴 Чек-лист подставляется по модели с сервера (31.10.2026).
+
+    **Требование владельца:** «если работник вписывает номер робота и мы
+    находим его на сервере, то дальше спрашивается модель робота — нам это не
+    нужно, так как мы знаем модель с сервера сразу. Будем подставлять модель с
+    сервера и переходить к следующему вопросу».
+
+    ## Почему это правильная экономия
+
+    Модель робота уже лежит в справочнике рядом с номером. Вопрос «K50H или
+    A42T» человек всё равно решает не задумываясь — за него это уже знает
+    сервер. Лишний тап на каждом осмотре умножен на смену.
+    """
+
+    def _session_with(self, model: str, template_names: list[str]):
+        session = insp.Session(chat_id=1, user_id=2, warehouses=["GLP-C"])
+        session.category = "robot"
+        session.equipment = {"equipment_code": "3780", "equipment_type": {"type": model}}
+        session.templates = [
+            {"id": index + 1, "name": name, "items": [{"code": "K-01"}]}
+            for index, name in enumerate(template_names)
+        ]
+        return session
+
+    def test_known_model_picks_its_checklist(self) -> None:
+        session = self._session_with(
+            "RT_KUBOT_MINI_HAIFLEX",
+            ["K50H daily inspection", "A42T daily inspection"],
+        )
+
+        picked = insp._template_for_model(session)
+
+        assert picked is not None
+        assert picked["name"] == "K50H daily inspection"
+
+    def test_second_model_picks_the_other_checklist(self) -> None:
+        session = self._session_with(
+            "RT_KUBOT_E2", ["K50H daily inspection", "A42T daily inspection"]
+        )
+
+        picked = insp._template_for_model(session)
+
+        assert picked is not None
+        assert picked["name"] == "A42T daily inspection"
+
+    def test_unknown_model_asks_instead_of_guessing(self) -> None:
+        """🔴 Незнакомая модель — спрашиваем, а не берём первый попавшийся.
+
+        Чужой чек-лист означает чужие пункты: человек отметит «ок» там, где
+        проверять было нечего, и это уйдёт в отчёт как пройденный осмотр.
+        """
+        session = self._session_with("P1200", ["K50H daily inspection"])
+
+        assert insp._template_for_model(session) is None
+
+    def test_two_matching_checklists_are_ambiguous(self) -> None:
+        session = self._session_with(
+            "RT_KUBOT_MINI_HAIFLEX",
+            ["K50H daily inspection", "K50H deep inspection"],
+        )
+
+        assert insp._template_for_model(session) is None
+
+    def test_model_comes_with_the_number(self) -> None:
+        """Модель обязана приходить вместе с номером, а не вторым запросом."""
+        from equipment_intake import validation
+
+        assert "equipment_type:equipment_type_id(" in validation.EQUIPMENT_SELECT

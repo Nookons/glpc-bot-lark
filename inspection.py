@@ -141,6 +141,27 @@ CATEGORIES = (
     ("workstation", "🏭 Workstation", validation.KIND_WORKSTATION),
 )
 
+#: 🔴 **Модель оборудования → код в названии чек-листа** (31.10.2026).
+#:
+#: Владелец: «если работник вписывает номер робота и мы находим его на сервере,
+#: то дальше спрашивается модель — нам это не нужно, мы знаем модель с сервера.
+#: Будем подставлять модель и переходить к следующему вопросу».
+#:
+#: ## Почему таблица, а не поиск по подстроке
+#:
+#: Модели в справочнике называются `RT_KUBOT_MINI_HAIFLEX`, а чек-листы —
+#: `K50H daily inspection` и `A42T daily inspection`: **общих слов у них нет**.
+#: Сопоставить их можно только явно — это знание о заводских обозначениях, а не
+#: правило, которое выводится из строки.
+#:
+#: 🔴 **Нет модели в таблице — спрашиваем как раньше.** Молчаливый выбор «первого
+#: попавшегося» чек-листа отправил бы человека осматривать робота по чужому
+#: списку пунктов, и заметил бы это не он, а тот, кто читает отчёт.
+TEMPLATE_CODE_BY_MODEL = {
+    "RT_KUBOT_MINI_HAIFLEX": "K50H",
+    "RT_KUBOT_E2": "A42T",
+}
+
 #: Подписи статуса устройства для человека. `not_in_work` пишется заглавными
 #: не для красоты: это единственный статус, при котором осмотр **отказан**, и
 #: он должен бросаться в глаза.
@@ -1249,6 +1270,29 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
         )
         return
 
+    # 🔴 **Модель известна — чек-лист подставляем сами** (31.10.2026).
+    #
+    # Вопрос «какой чек-лист» человек не решает: модель робота пришла из
+    # справочника вместе с номером. Спрашиваем только тогда, когда подставить
+    # нечего (незнакомая модель или несколько подходящих чек-листов).
+    preset = _template_for_model(session)
+
+    if preset is not None:
+        session.step = STEP_TEMPLATE
+        put_session(session)
+
+        # Тот же путь, что и нажатие кнопки: один код на оба входа, иначе
+        # автоподстановка и ручной выбор разойдутся при первой правке.
+        _choose_template(
+            session,
+            str(preset.get("id")),
+            chat_id,
+            message_id,
+            lambda text: _send_tracked(session, text),
+        )
+
+        return
+
     session.step = STEP_TEMPLATE
     put_session(session)
 
@@ -1267,6 +1311,43 @@ def _handle_number(session: Session, text: str, chat_id, message_id) -> None:
         warning + template_prompt(session),
         reply_markup=template_keyboard(session),
     )
+
+
+def _template_for_model(session: Session) -> Optional[dict]:
+    """Чек-лист под модель найденной единицы — или `None`, если не знаем.
+
+    ## 🔴 Зачем это (31.10.2026)
+
+    Владелец: «мы знаем модель с сервера сразу, будем подставлять и переходить к
+    следующему вопросу». Вопрос «K50H daily inspection / A42T daily inspection»
+    человек и так не решает — модель робота известна из справочника, и выбор из
+    двух кнопок был **работой ради кнопок**.
+
+    ## Почему возвращаем `None` в сомнительных случаях
+
+    Нет модели в таблице, нет чек-листа с таким кодом или подходит сразу
+    несколько — значит подставлять нечего. Отправить человека осматривать робота
+    по чужому списку пунктов хуже, чем один лишний тап: заметит это не он, а тот,
+    кто читает отчёт.
+    """
+    model = str(
+        ((session.equipment or {}).get("equipment_type") or {}).get("type") or ""
+    ).strip()
+
+    code = TEMPLATE_CODE_BY_MODEL.get(model)
+
+    if not code:
+        return None
+
+    matches = [
+        template
+        for template in session.templates
+        if str(template.get("name") or "").strip().lower().startswith(code.lower())
+    ]
+
+    # 🔴 Ровно один. Два чек-листа на один код модели — это неоднозначность,
+    # которую должен решить человек, а не бот.
+    return matches[0] if len(matches) == 1 else None
 
 
 def _not_found_text(session: Session, value: str, elsewhere: list) -> str:
