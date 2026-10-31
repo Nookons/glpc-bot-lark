@@ -1736,3 +1736,78 @@ class TestRepairPhotoReachesTheWeb:
 
         assert 'equipment_row = find_equipment(robot)' in source
         assert '"robot_id": (equipment_row or {}).get("id")' in source
+
+
+class TestRobotModelComesFromRegistry:
+    """🔴 Модель робота подставляется из справочника (31.10.2026).
+
+    **Жалоба владельца:** «робот был найден, модель не была подставлена» —
+    после номера бот спрашивал «Choose the robot model: K50H / A42T / A42T C2».
+
+    ## Почему это правильная экономия
+
+    Модель лежит в справочнике рядом с номером. Оператор, вводящий `3780`, не
+    «выбирает» модель — он её знает и всё равно нажмёт ту же кнопку.
+    """
+
+    def _session(self, value: str):
+        from equipment_intake.engine import Session
+        from equipment_intake.tree_config import DEFAULT_TREE
+
+        session = Session(DEFAULT_TREE)
+        session.select("robot")
+        session.submit_text(value)
+        session.data["warehouse"] = "GLP-C"
+
+        return session
+
+    def _patch_lookup(self, monkeypatch, rows):
+        """Подменяет справочник: `{номер: модель}`."""
+        from equipment_intake import validation
+
+        def fake(kind, warehouse, code):
+            model = rows.get(code)
+            if not model:
+                return None
+            return {"equipment_type": {"type": model}}
+
+        monkeypatch.setattr(validation, "find_equipment", fake)
+
+    def test_known_model_skips_the_question(self, monkeypatch):
+        session = self._session("3780")
+        self._patch_lookup(monkeypatch, {"3780": "RT_KUBOT_MINI_HAIFLEX"})
+
+        from equipment_intake import flow
+
+        assert flow._skip_robot_model_question(session) is True
+        assert session.answers().get("device_type") == "K50H"
+
+    def test_second_model_picks_its_option(self, monkeypatch):
+        session = self._session("5316")
+        self._patch_lookup(monkeypatch, {"5316": "RT_KUBOT_E2"})
+
+        from equipment_intake import flow
+
+        assert flow._skip_robot_model_question(session) is True
+        assert session.answers().get("device_type") == "A42T"
+
+    def test_unknown_model_keeps_the_question(self, monkeypatch):
+        """🔴 Незнакомая модель — спрашиваем, а не угадываем."""
+        session = self._session("9999")
+        self._patch_lookup(monkeypatch, {"9999": "P1200"})
+
+        from equipment_intake import flow
+
+        assert flow._skip_robot_model_question(session) is False
+
+    def test_two_numbers_with_different_models_keep_the_question(self, monkeypatch):
+        """`3544/5316` — две разные модели, подставлять одну нельзя."""
+        session = self._session("3544/5316")
+        self._patch_lookup(
+            monkeypatch,
+            {"3544": "RT_KUBOT_MINI_HAIFLEX", "5316": "RT_KUBOT_E2"},
+        )
+
+        from equipment_intake import flow
+
+        assert flow._skip_robot_model_question(session) is False

@@ -594,6 +594,14 @@ def handle_text(chat_id, sender, text: str, message_id) -> bool:
     if _paused_for_registry_review(chat_id, session):
         return True
 
+    # 🔴 **Модель известна — вопрос пропускаем** (31.10.2026).
+    #
+    # Номер найден, модель пришла из справочника: спрашивать «K50H / A42T» —
+    # работа ради кнопок, ответ на неё уже есть на сервере.
+    if _skip_robot_model_question(session):
+        render(session, chat_id, session.data.get("menu_message_id"), edit=True)
+        return True
+
     _redraw(chat_id, session, session.data.get("menu_message_id"))
     return True
 
@@ -620,6 +628,98 @@ def _paused_for_registry_review(chat_id, session: Session) -> bool:
         session,
         reply_markup=keyboard,
     )
+
+    return True
+
+
+#: 🔴 **Модель с сервера → вариант дерева** (31.10.2026).
+#:
+#: Владелец: «робот был найден, модель не была подставлена». После номера бот
+#: спрашивал «Choose the robot model» (K50H / A42T / A42T C2), хотя модель уже
+#: пришла из справочника вместе с номером.
+#:
+#: ## Почему таблица
+#:
+#: В справочнике модели называются `RT_KUBOT_MINI_HAIFLEX`, `RT_KUBOT_E2`, а в
+#: дереве — `k50h`, `a42t`, `a42t_c2`: общих слов нет, сопоставление только явное.
+MODEL_OPTION_BY_TYPE = {
+    "RT_KUBOT_MINI_HAIFLEX": "k50h",
+    "RT_KUBOT_E2": "a42t",
+}
+
+#: Узел дерева, на котором спрашивается модель робота.
+ROBOT_TYPE_NODE = "robot_type"
+
+
+def _robot_model_from_registry(session: Session) -> Optional[str]:
+    """Вариант модели робота по номеру из пути — или `None`.
+
+    ## 🔴 Почему `None`, а не «первый попавшийся»
+
+    Нескольких роботов в одной строке (`3544/1234`) может быть две модели —
+    подставлять одну из них значит записать в отчёт чужую модель. Не нашли,
+    модель незнакомая, справочник недоступен — спрашиваем как раньше.
+    """
+    from .validation import find_equipment
+
+    warehouse = str(session.data.get("warehouse") or "")
+
+    models = set()
+
+    for step in session.path:
+        node = session.tree.node(step.node_id)
+
+        if not is_number_node(node):
+            continue
+
+        if session.number_kind_for_step(step) != "robot":
+            continue
+
+        for part in str(step.value or "").split("/"):
+            number = part.strip()
+
+            if not number:
+                continue
+
+            found = find_equipment("robot", warehouse, number)
+
+            if not found:
+                continue
+
+            model = str(
+                ((found.get("equipment_type") or {}).get("type")) or ""
+            ).strip()
+
+            option = MODEL_OPTION_BY_TYPE.get(model)
+
+            if option:
+                models.add(option)
+
+    # Ровно одна модель на все найденные номера — иначе не угадываем.
+    return models.pop() if len(models) == 1 else None
+
+
+def _skip_robot_model_question(session: Session) -> bool:
+    """Подставляет модель с сервера и уводит с шага выбора модели.
+
+    Возвращает `True`, если шаг был пройден автоматически.
+    """
+    node = session.current_node()
+
+    if node is None or node.id != ROBOT_TYPE_NODE:
+        return False
+
+    option = _robot_model_from_registry(session)
+
+    if not option:
+        return False
+
+    # Вариант обязан существовать в узле: справочник мог разойтись с деревом,
+    # и `select` на несуществующем id бросил бы `EngineError` посреди диалога.
+    if not any(candidate.id == option for candidate in session.visible_options()):
+        return False
+
+    session.select(option)
 
     return True
 
