@@ -78,7 +78,13 @@ def identify(photo_path: str) -> dict:
         response = requests.post(
             f"{VISION_URL}/api/identify",
             data=payload,
-            headers={"Content-Type": "image/jpeg"},
+            # 🔴 **`ngrok-skip-browser-warning`.** Туннель отдаёт HTML-заглушку
+            # вместо JSON, если этого заголовка нет, — и бот получал бы «не
+            # распознано» вместо ответа модели.
+            headers={
+                "Content-Type": "image/jpeg",
+                "ngrok-skip-browser-warning": "1",
+            },
             timeout=180,
         )
         if response.status_code != 200:
