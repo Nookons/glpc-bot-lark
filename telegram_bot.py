@@ -2788,6 +2788,13 @@ def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
     🔴 Ни журнал, ни Lark, ни база: тестовое фото не должно создавать настоящую
     запись о поломке. Ответ — только в чат.
     """
+    # 🔴 **Топик берём из сообщения здесь же.** В логах 01.11.2026:
+    # `NameError: name 'thread_id' is not defined` — переменная существовала
+    # только в вызывающей функции, а стенд обращался к ней как к локальной.
+    # Падало **после** «Смотрю фото…», поэтому снаружи выглядело как «смотрит и
+    # всё»: единственное сообщение и тишина.
+    thread_id = message.get("message_thread_id")
+
     _send_action(chat_id, "upload_photo")
 
     best, media_kind = _pick_media(message)
