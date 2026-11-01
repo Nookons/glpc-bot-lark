@@ -2910,3 +2910,29 @@ class TestSandboxTopicIsAllowed:
 
         assert allowed is True
         assert reason == "sandbox"
+
+
+class TestSandboxTopicByName:
+    """🔴 Стенд определяется и по имени топика (01.11.2026).
+
+    ## Что было
+
+    Фото уходили в топик `2` (General), и стенд молчал: id не совпадал с
+    настроенным. Человек писал в общий поток, где ничего не происходило, и это
+    читалось как «нихрена не работает».
+
+    🔴 Имя переживает пересоздание топика и понятно в настройке.
+    """
+
+    def test_name_marker_is_recognised(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_SANDBOX_TOPICS", "36752")
+        monkeypatch.setenv("VISION_URL", "http://127.0.0.1:8899")
+
+        import importlib
+
+        import sandbox
+
+        module = importlib.reload(sandbox)
+
+        assert module.handles(2, "🧪 AI Sandbox") is True
+        assert module.handles(2, "Work chat") is False

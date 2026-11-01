@@ -53,9 +53,22 @@ def enabled() -> bool:
     return bool(TOPICS and VISION_URL)
 
 
-def handles(thread_id) -> bool:
-    """Это тестовый топик?"""
-    return bool(TOPICS) and thread_id in TOPICS
+#: Имена топиков, которые тоже считаются стендом (без учёта регистра).
+#:
+#: 🔴 **Зачем имя, а не только id.** 01.11.2026 фото уходили в топик `2`
+#: (General), потому что человек писал в общем потоке, — и стенд молчал, хотя
+#: всё настроено. Имя переживает пересоздание топика и понятно в настройке.
+NAME_MARKERS = ("sandbox", "тест", "test", "ai ")
+
+
+def handles(thread_id, name: str | None = None) -> bool:
+    """Это тестовый топик — по id **или** по имени?"""
+    if thread_id is not None and thread_id in TOPICS:
+        return True
+
+    text = (name or "").strip().lower()
+
+    return bool(text) and any(marker in text for marker in NAME_MARKERS)
 
 
 def identify(photo_path: str) -> dict:

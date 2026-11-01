@@ -1293,7 +1293,7 @@ def _output_topic_allowed(chat_id, thread_id) -> bool:
     # Без этого стенд обрабатывал фото, но **ответ не доходил**: барьер отправки
     # («бот молчит там, где его нет») отбрасывал сообщение в песочницу. Снаружи
     # это выглядело как «бот молчит», хотя вся обработка прошла.
-    if sandbox.handles(thread_id):
+    if sandbox.handles(thread_id, topic_name(chat_id, thread_id)):
         return True
 
     allowed = allowed_output_topics()
@@ -1428,7 +1428,7 @@ def topic_allowed(chat_id, thread_id):
     # Проверка стоит ПЕРВОЙ: без неё сообщение отсекалось общим фильтром топиков
     # (`_handle_wrong_topic`) и до ветки стенда не доходило — бот молчал, хотя
     # всё было настроено. Симптом ровно такой: «отправил фото, молчит».
-    if sandbox.handles(thread_id):
+    if sandbox.handles(thread_id, topic_name(chat_id, thread_id)):
         return True, "sandbox"
 
     # Белый список (тестовый бот) важнее обычных правил: он сужает приём
@@ -5676,7 +5676,7 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         #
         # Проверка **до** фильтра топиков ошибок: песочница им не является, и
         # без этой ветки фото оттуда уходило бы в «здесь не отслеживается».
-        if sandbox.handles(thread_id):
+        if sandbox.handles(thread_id, topic_name(chat_id, thread_id)):
             _handle_sandbox_photo(chat_id, sender, message, message_id)
             return
 
