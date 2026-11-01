@@ -2821,3 +2821,61 @@ class TestChecklistIsPickedFromServerModel:
         from equipment_intake import validation
 
         assert "equipment_type:equipment_type_id(" in validation.EQUIPMENT_SELECT
+
+
+class TestSandboxTopic:
+    """🔴 Тестовый стенд: фото → модель и номер, **без отправок** (01.11.2026).
+
+    **Требование владельца:** «сделать топик новый в телеграмме, пока тестовый,
+    ошибки никуда не отправлять; бот при помощи нейронки понимает, что за модель
+    робота на фото и какой у него номер».
+
+    ## Почему это отдельная ветка, а не общий приём ошибок
+
+    Приём ошибок — это **запись факта поломки**: журнал, карточка в Lark, статусы.
+    Тестовое фото не должно создавать настоящую запись, иначе стенд засорит отчёты.
+    """
+
+    def test_disabled_without_config(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_SANDBOX_TOPICS", raising=False)
+        monkeypatch.delenv("VISION_URL", raising=False)
+
+        import importlib
+
+        import sandbox
+
+        module = importlib.reload(sandbox)
+
+        assert module.enabled() is False
+        assert module.handles(123) is False
+
+    def test_topic_is_recognised(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_SANDBOX_TOPICS", "111, 222")
+        monkeypatch.setenv("VISION_URL", "http://127.0.0.1:8899")
+
+        import importlib
+
+        import sandbox
+
+        module = importlib.reload(sandbox)
+
+        assert module.handles(111) is True
+        assert module.handles(333) is False
+        assert module.enabled() is True
+
+    def test_caption_names_model_and_number(self):
+        import sandbox
+
+        text = sandbox.caption(
+            {"model": "k50h", "model_confidence": 0.9, "number": "3734", "number_exact": True}
+        )
+
+        assert "K50H" in text and "3734" in text
+        assert "никуда не отправлено" in text
+
+    def test_service_failure_is_not_nothing_found(self):
+        import sandbox
+
+        text = sandbox.caption({"error": "timeout"})
+
+        assert "недоступен" in text

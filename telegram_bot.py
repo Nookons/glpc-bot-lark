@@ -69,6 +69,7 @@ from supabase_storage import (
 )
 import keyboard_layout
 import robot_status
+import sandbox
 from sendToDataBase import (
     WAREHOUSE,
     count_robot_errors_in_shift,
@@ -2763,6 +2764,42 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
     )
 
     return False
+
+
+def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
+    """Тестовый стенд: распознать модель и номер, **ничего не отправляя**.
+
+    🔴 Ни журнал, ни Lark, ни база: тестовое фото не должно создавать настоящую
+    запись о поломке. Ответ — только в чат.
+    """
+    _send_action(chat_id, "upload_photo")
+
+    best, media_kind = _pick_media(message)
+
+    if not best:
+        _send(chat_id, "⚠️ Не удалось получить фото", reply_to_message_id=message_id)
+        return
+
+    _send(chat_id, "🔍 Смотрю фото…", reply_to_message_id=message_id, delete_after=30)
+
+    # 🔴 Тот же путь скачивания, что у приёма ошибок (`tg.get_file` +
+    # `tg.download_file`): второй способ качать файлы означал бы вторую ветку,
+    # которая сломается отдельно.
+    file_path = tg.get_file(best["file_id"])
+
+    if not file_path:
+        _send(chat_id, "⚠️ Фото не скачалось", reply_to_message_id=message_id)
+        return
+
+    destination = os.path.join(_IMAGES_DIR, f"sandbox_{best.get('file_unique_id') or best['file_id']}.jpg")
+
+    if not tg.download_file(file_path, destination):
+        _send(chat_id, "⚠️ Фото не сохранилось", reply_to_message_id=message_id)
+        return
+
+    result = sandbox.identify(destination)
+
+    _send(chat_id, sandbox.caption(result), reply_to_message_id=message_id)
 
 
 def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
@@ -5605,6 +5642,15 @@ def _handle_update_inner(update: dict, bot_username: str = None):
         if _inspection_pending(chat_id, sender.get("id")) and _handle_inspection_photo(
             chat_id, sender, message, message_id
         ):
+            return
+
+        # 🔴 **Тестовый стенд** (владелец 01.11.2026): фото в песочнице не
+        # уходит ни в журнал, ни в Lark — только распознавание и ответ.
+        #
+        # Проверка **до** фильтра топиков ошибок: песочница им не является, и
+        # без этой ветки фото оттуда уходило бы в «здесь не отслеживается».
+        if sandbox.handles(thread_id):
+            _handle_sandbox_photo(chat_id, sender, message, message_id)
             return
 
         # Ошибка принимается только из топика ошибок: его склад обязан быть

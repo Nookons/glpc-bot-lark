@@ -35,6 +35,7 @@ from .keyboards import (
     keyboard_with_breadcrumb,
     set_option_page,
 )
+from . import vision
 from .tree_config import CANCEL_LABEL, load_tree
 from .types import NodeType
 
@@ -411,6 +412,39 @@ def start(chat_id, sender, image_path: str, message_id, warehouse: str = "") -> 
         "thread_id": _bot()._reply_thread(chat_id),
         "note": "",
     })
+
+    # 🔴 **Пока смотрит — говорим, что смотрит** (владелец 31.10.2026:
+    # «пока он смотрит, то писал в телеграмме что идёт идентификация»).
+    #
+    # Молчание на 2–3 секунды читается как «бот завис», и человек отправляет
+    # фото второй раз. Сообщение живёт до первого вопроса и удаляется.
+    placeholder = None
+    recognized = None
+
+    if vision.available():
+        placeholder = tg.send_message(
+            chat_id,
+            "🔍 Identifying the unit on the photo…",
+            message_thread_id=session.data["thread_id"],
+        )
+        recognized = vision.identify(image_path)
+
+        if _delivered(placeholder):
+            tg.delete_message(chat_id, placeholder.get("message_id"))
+
+    # 🔴 **Узнали робота — первый вопрос уже не нужен.**
+    #
+    # «Which equipment?» — это тот же ответ, что на фото. Предзаполняем вид и
+    # переходим к номеру: человек подтверждает одно число вместо трёх нажатий.
+    if recognized and recognized.get("kind"):
+        try:
+            session.select(recognized["kind"])
+            session.data["recognized_kind"] = recognized["kind"]
+            if recognized.get("model"):
+                session.data["recognized_model"] = recognized["model"]
+        except EngineError:
+            # Дерево не знает такого вида — идём обычным путём.
+            logger.info("intake: вид %r не принят деревом", recognized.get("kind"))
 
     sent = tg.send_photo(
         chat_id,

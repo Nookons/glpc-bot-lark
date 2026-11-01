@@ -1811,3 +1811,105 @@ class TestRobotModelComesFromRegistry:
         from equipment_intake import flow
 
         assert flow._skip_robot_model_question(session) is False
+
+
+class TestPhotoIsIdentifiedBeforeQuestions:
+    """🔴 Фото распознаётся до первого вопроса (31.10.2026).
+
+    **Требование владельца:** «AI который будет искать маленького робота на фото
+    (K50H = MINI_HAIFLEX), и если получилось найти, то сразу помечать что это
+    робот и спрашивать номер; пока он смотрит — писать, что идёт идентификация».
+
+    ## Почему это экономия, а не игрушка
+
+    Оператор сфотографировал робота и всё равно отвечает «Robot» — ответ уже на
+    снимке. Три нажатия на каждый разбор ошибки умножаются на смену.
+    """
+
+    def test_robot_in_photo_skips_the_type_question(self, monkeypatch):
+        from equipment_intake import flow, vision
+
+        monkeypatch.setattr(vision, "available", lambda: True)
+        monkeypatch.setattr(
+            vision,
+            "identify",
+            lambda path: {"kind": "robot", "model": "RT_KUBOT_MINI_HAIFLEX", "confidence": 0.9},
+        )
+
+        sent = {}
+
+        class FakeTg:
+            def send_message(self, chat_id, text, **kwargs):
+                sent["progress"] = text
+                return {"ok": True, "message_id": 1}
+
+            def delete_message(self, chat_id, message_id):
+                return True
+
+            def send_photo(self, chat_id, path, caption=None, **kwargs):
+                sent["caption"] = caption
+                return {"ok": True, "message_id": 2}
+
+        monkeypatch.setattr(flow, "tg", FakeTg())
+        monkeypatch.setattr(flow, "_active_tree", lambda: __import__(
+            "equipment_intake.tree_config", fromlist=["DEFAULT_TREE"]
+        ).DEFAULT_TREE)
+        monkeypatch.setattr(flow, "put_session", lambda *a, **k: None)
+        monkeypatch.setattr(flow, "_delivered", lambda result: True)
+        monkeypatch.setattr(flow._bot(), "_reply_thread", lambda chat_id: None, raising=False)
+        monkeypatch.setattr(flow._bot(), "_delete_user_message", lambda *a, **k: None, raising=False)
+
+        assert flow.start(1, {"id": 2}, "/tmp/x.jpg", 5, "GLP-C") is True
+
+        # «Идёт идентификация» показано до первого вопроса.
+        assert "Identifying" in sent.get("progress", "")
+        # Первый вопрос — уже номер, а не «Which equipment?».
+        assert "number" in sent.get("caption", "").lower()
+
+    def test_without_key_behaviour_is_unchanged(self, monkeypatch):
+        from equipment_intake import vision
+
+        monkeypatch.delenv("VISION_API_KEY", raising=False)
+
+        assert vision.available() is False
+        assert vision.identify("/tmp/x.jpg") is None
+
+
+class TestVisionParsing:
+    """Разбор ответа модели: не угадываем и не падаем."""
+
+    def _parse(self, payload):
+        from equipment_intake.vision import _parse
+
+        return _parse(payload)
+
+    def test_robot_with_model(self, monkeypatch):
+        monkeypatch.setenv("VISION_MIN_CONFIDENCE", "0.75")
+        result = self._parse('{"kind": "robot", "model": "K50H", "confidence": 0.92}')
+
+        assert result == {
+            "kind": "robot",
+            "model": "RT_KUBOT_MINI_HAIFLEX",
+            "confidence": 0.92,
+        }
+
+    def test_low_confidence_is_not_used(self, monkeypatch):
+        """🔴 Уверенность ниже порога — спрашиваем как раньше."""
+        monkeypatch.setenv("VISION_MIN_CONFIDENCE", "0.75")
+
+        assert self._parse('{"kind": "robot", "model": "K50H", "confidence": 0.4}') is None
+
+    def test_unknown_kind_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("VISION_MIN_CONFIDENCE", "0.5")
+
+        assert self._parse('{"kind": "spaceship", "confidence": 0.99}') is None
+
+    def test_broken_json_is_ignored(self):
+        assert self._parse("I think it is a robot") is None
+
+    def test_unknown_model_keeps_kind_only(self, monkeypatch):
+        monkeypatch.setenv("VISION_MIN_CONFIDENCE", "0.5")
+        result = self._parse('{"kind": "robot", "model": "P1200", "confidence": 0.9}')
+
+        # Вид известен, модель — нет: чек-лист выбирать по ней нельзя.
+        assert result is not None and "model" not in result
