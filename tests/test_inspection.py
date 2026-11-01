@@ -2879,3 +2879,34 @@ class TestSandboxTopic:
         text = sandbox.caption({"error": "timeout"})
 
         assert "недоступен" in text
+
+
+class TestSandboxTopicIsAllowed:
+    """🔴 Тестовый топик проходит фильтр топиков (01.11.2026).
+
+    ## Что было
+
+    Фото в песочнице отсекалось общим фильтром `topic_allowed` **до** ветки
+    стенда: бот молчал, хотя переменные настроены. Симптом — «отправил фото,
+    молчит», и он не указывает на причину.
+
+    🔴 **Проверка должна стоять первой**, иначе любое новое правило фильтрации
+    снова закроет стенд.
+    """
+
+    def test_sandbox_topic_passes_filter(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_SANDBOX_TOPICS", "36752")
+        monkeypatch.setenv("VISION_URL", "http://127.0.0.1:8899")
+
+        import importlib
+
+        import sandbox
+        import telegram_bot
+
+        importlib.reload(sandbox)
+        importlib.reload(telegram_bot)
+
+        allowed, reason = telegram_bot.topic_allowed(-1004306397735, 36752)
+
+        assert allowed is True
+        assert reason == "sandbox"
