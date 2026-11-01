@@ -2815,7 +2815,18 @@ def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
 
     result = sandbox.identify(destination)
 
-    _send(chat_id, sandbox.caption(result), reply_to_message_id=message_id)
+    # 🔴 **Фото сотрудника удаляем, вместо него — обводка от модели**
+    # (владелец 01.11.2026). В чате остаётся одна картинка: размеченная, с
+    # подписью. Иначе на каждое фото висели бы две — исходная и результат.
+    tg.delete_message(chat_id, message_id)
+
+    annotated_path = sandbox.save_annotated(result, destination)
+
+    if annotated_path:
+        tg.send_photo(chat_id, annotated_path, caption=sandbox.caption(result),
+                      message_thread_id=thread_id)
+    else:
+        _send(chat_id, sandbox.caption(result))
 
 
 def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:

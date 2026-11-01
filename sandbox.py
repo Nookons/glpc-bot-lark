@@ -96,6 +96,32 @@ def identify(photo_path: str) -> dict:
         return {"error": str(error)}
 
 
+def save_annotated(result: dict, source_path: str) -> str | None:
+    """Сохраняет размеченное фото рядом с исходным и возвращает путь.
+
+    🔴 **Картинку рисует сервер распознавания**, а не бот: PIL-пайплайн и палитра
+    классов живут там, и второй рисовальщик разошёлся бы с первым при первой
+    правке цветов.
+    """
+    import base64
+    import os
+
+    payload = result.get("annotated")
+
+    if not payload:
+        return None
+
+    try:
+        destination = os.path.splitext(source_path)[0] + "_annotated.jpg"
+        with open(destination, "wb") as handle:
+            handle.write(base64.b64decode(payload))
+
+        return destination
+    except Exception:  # noqa: BLE001 — без картинки ответ всё равно уходит
+        logger.warning("sandbox: не удалось сохранить обводку", exc_info=True)
+        return None
+
+
 def caption(result: dict) -> str:
     """Ответ для человека — короткий и без технического шума."""
     if result.get("error"):
