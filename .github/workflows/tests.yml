@@ -34,7 +34,11 @@ jobs:
       - name: Установить зависимости
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # 🔴 **`requirements-dev.txt`, а не `requirements.txt`:** два набора
+          # используют `pytest`, и без него `unittest discover` падал на
+          # импорте (`ModuleNotFoundError`), а прогон был красным на каждом
+          # push. В образ прода pytest не нужен — поэтому отдельный файл.
+          pip install -r requirements-dev.txt
 
       # unittest-наборы: 6 файлов, 264 проверки (на 04.10.2026).
       #
