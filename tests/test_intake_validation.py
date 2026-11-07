@@ -1414,13 +1414,30 @@ class TestManuallyAddedRobotIsFound:
         # а ручной записи там нет.
         assert _robot_id_from_row(manual) is None
 
-    def test_synced_robot_keeps_robot_id(self) -> None:
-        """У синхронизированного робота `robot_id` остаётся."""
+    def test_synced_robot_takes_legacy_id(self) -> None:
+        """У синхронизированного робота `robot_id` = `legacy_id`, не `id`."""
         from equipment_intake.report_writer import _robot_id_from_row
 
-        synced = {"id": 1437, "in_legacy": True}
+        # 🔴 Значения из живой базы 07.11.2026: `equipment.id` 3026 —
+        # это SMALL-P3 робот 60, а его строка легаси имеет id 3241.
+        # Старый код писал 3026, и FK привязывал ошибку к роботу 2576 (GLP-C1).
+        synced = {"id": 3026, "legacy_id": 3241, "in_legacy": True}
 
-        assert _robot_id_from_row(synced) == 1437
+        assert _robot_id_from_row(synced) == 3241
+
+    def test_synced_robot_without_legacy_id_gets_nothing(self) -> None:
+        """Нет `legacy_id` — `robot_id` пуст, а не `equipment.id`."""
+        from equipment_intake.report_writer import _robot_id_from_row
+
+        synced = {"id": 3026, "legacy_id": None, "in_legacy": True}
+
+        assert _robot_id_from_row(synced) is None
+
+    def test_legacy_fallback_row_uses_id(self) -> None:
+        """Строка из `robots_maintenance_list` — её `id` и есть ключ легаси."""
+        from equipment_intake.report_writer import _robot_id_from_row
+
+        assert _robot_id_from_row({"id": 20306, "in_legacy": True}) == 20306
 
 
 class TestWarehouseFromNumber:

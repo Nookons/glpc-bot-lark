@@ -1012,6 +1012,44 @@ class AnalyticsColumnChecks(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0]["module"], "Lifting")
 
+    def test_robot_link_failure_keeps_the_rest_of_the_analytics(self):
+        """Отказ из-за `robot_id` не должен стирать `module`/`device_number`.
+
+        🔴 Дефект 07.11.2026: ссылка на робота писалась значением из чужой
+        последовательности, вставка падала с `409`, и общий откат снимал вместе
+        с ней **всю** аналитику на 120 секунд для всех следующих отчётов.
+        Проверено на живой базе: 264 записи за 10 дней без `module`,
+        `device_number`, `object_type` и `report_id`.
+        """
+        attempts = []
+
+        def fake_upsert(table, payload, on_conflict):
+            attempts.append(payload)
+
+            # Первая попытка — с `robot_id` — падает; вторая (без него) проходит.
+            return None if len(attempts) == 1 else [{"id": 1}]
+
+        rw.reset_schema_cache()
+
+        with mock.patch("sendToDataBase.rest_get", return_value=[{"id": 1}]), \
+             mock.patch("sendToDataBase.rest_upsert", side_effect=fake_upsert), \
+             mock.patch.object(rw, "canonical_type", return_value=None):
+            self.assertTrue(rw.write_exception(result(), "GLP-C"))
+
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("robot_id", attempts[0])
+        self.assertNotIn("robot_id", attempts[1])
+
+        # 🔴 Главное: остальная аналитика осталась.
+        self.assertEqual(attempts[1]["module"], "Lifting")
+        self.assertEqual(attempts[1]["device_number"], "3490")
+        self.assertIn("object_type", attempts[1])
+        self.assertIn("report_id", attempts[1])
+
+        # И кэш снял только ссылку — следующие отчёты не теряют колонки.
+        self.assertFalse(rw._robot_columns_available())
+        self.assertTrue(rw._analytics_columns_available() is not False)
+
     def test_missing_columns_are_remembered_not_probed_per_report(self):
         """Otherwise every report pays for extra requests and logs an error.
 
@@ -1155,9 +1193,15 @@ class AnalyticsColumnChecks(unittest.TestCase):
              mock.patch.object(rw, "canonical_type", return_value=None):
             self.assertTrue(rw.write_exception(result(), "GLP-C"))
 
-        self.assertEqual(len(attempts), 2)
+        # Теперь попыток три: (1) полная, (2) без ссылки на робота — отказ не
+        # из-за неё, (3) без аналитики. Промежуточная нужна, чтобы отказ по
+        # `robot_id` не стирал остальные колонки (см.
+        # `test_robot_link_failure_keeps_the_rest_of_the_analytics`).
+        self.assertEqual(len(attempts), 3)
         self.assertIn("module", attempts[0])
-        self.assertNotIn("module", attempts[1])
+        self.assertIn("module", attempts[1])
+        self.assertNotIn("robot_id", attempts[1])
+        self.assertNotIn("module", attempts[2])
 
     def test_a_real_duplicate_is_still_success_without_the_columns(self):
         """`ignore_conflict` semantics must survive the fallback path."""

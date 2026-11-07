@@ -179,8 +179,14 @@ DEFAULT_ISSUE_WAREHOUSE = "C2"
 
 #: Склады, у которых есть разбиение на зоны. Для них зона берётся из
 #: `sub_warehouse` устройства, а не из значения по умолчанию.
-#: Проверено на живой базе: `sub_warehouse` заполнен только у SMALL-P3.
-WAREHOUSES_WITH_ZONES = ("SMALL-P3",)
+#:
+#: 🔴 **`GLP-C1` добавлен 07.11.2026.** После разделения GLP-C (29.10.2026) у
+#: второй очереди `sub_warehouse` заполнен значением `C1` — проверено: **1553**
+#: робота. Но склад отсутствовал здесь, поэтому `device_zone()` возвращал `None`
+#: ещё до чтения справочника, зона падала в `DEFAULT_ISSUE_WAREHOUSE` (`C2`), а
+#: `_allowed_zone("GLP-C1", "C2")` её отвергал — и **34** записи бота по C1
+#: остались без зоны, хотя зона известна точно.
+WAREHOUSES_WITH_ZONES = ("SMALL-P3", "GLP-C1")
 
 #: Справочник оборудования роботов — источник `sub_warehouse`.
 ROBOTS_TABLE = "robots_maintenance_list"
@@ -557,12 +563,17 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
     #
     # Проверено: таких роботов **18**, и для бота они все «не существуют».
     #
-    # 🔴 **`equipment` содержит всё нужное:** `id`, `sub_warehouse` (зону) и
-    # `status`. Поиск по `category='robot'` + `equipment_code` + `warehouse`.
+    # 🔴 **`equipment` содержит всё нужное:** `id`, `legacy_id`, `sub_warehouse`
+    # (зону) и `status`. Поиск по `category='robot'` + `equipment_code` +
+    # `warehouse`.
+    #
+    # 🔴 **`legacy_id` обязателен в выборке** (07.11.2026): `robot_id` в
+    # `exceptions` — внешний ключ на **старую** таблицу, и писать туда
+    # `equipment.id` нельзя. Подробности — в `_robot_id_from_row`.
     rows = rest_get(
         "equipment",
         {
-            "select": "id,sub_warehouse,status,legacy_table",
+            "select": "id,legacy_id,sub_warehouse,status,legacy_table",
             "category": "eq.robot",
             "warehouse": f"eq.{warehouse}",
             "equipment_code": f"eq.{number}",
@@ -628,43 +639,61 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
 
 
 def _robot_id_from_row(row: Optional[Dict[str, Any]]) -> Optional[int]:
-    """`id` робота в **старой** таблице — или `None`.
+    """`id` робота в **старой** таблице (`legacy_id`) — или `None`.
 
-    🔴 **Только `robots_maintenance_list`, а не `equipment`** (исправлено
-    27.10.2026).
+    🔴 **Только `robots_maintenance_list`, а не `equipment`.**
 
     ## Почему это важно
 
     `exceptions.robot_id` — внешний ключ на `robots_maintenance_list(id)`
-    (проверено: `exceptions_robot_id_fkey`). Если записать туда `equipment.id`
-    ручного робота, база ответит `23503 foreign key violation`, и **вся запись
-    отчёта потеряется**.
+    (проверено: `exceptions_robot_id_fkey`). Если записать туда `equipment.id`,
+    база ответит `23503 foreign key violation`.
 
-    ## Почему нельзя просто взять `equipment.id`
+    ## 🔴 Почему `equipment.id` — это НЕ то же число (регрессия 07.11.2026)
 
-    `robot_row` теперь читает единый реестр (там есть ручные роботы), но их `id`
-    в легаси **не существует**: у ручной записи `legacy_id = NULL`, и обратной
-    записи не бывает. Проверено: **18** ручных роботов, ни одного в легаси.
+    Исходная проверка 27.10.2026 опиралась на «у синхронизированных записей
+    `id` совпадают: 2088 из 2088». Это было верно **на тот момент**, но не
+    является свойством схемы: `equipment.id` — своя последовательность, а строка
+    легаси живёт по `legacy_id`. Новые единицы (вторая очередь `GLP-C1`) получили
+    `id` из последовательности, и соответствие разъехалось.
 
-    🔴 **У синхронизированных записей id совпадают** (проверено: 2088 из 2088),
-    поэтому для них возврат `id` из реестра корректен. Отличаем по наличию
-    записи в легаси — её даёт `robot_row` при запасном чтении.
+    Проверено на живой базе 07.11.2026:
+
+    * `equipment.id = equipment.legacy_id` — **0 строк** из 2970
+      синхронизированных;
+    * **2088** `equipment.id` совпадают с *каким-то* `robots_maintenance_list.id`,
+      но это **другой робот** (другой номер и склад);
+    * у остальных 882 `equipment.id` в легаси нет вовсе — вставка падала с
+      `409` (`23503`), и отчёт терял **всю** аналитику при откате.
+
+    Поэтому значение берётся из `legacy_id` — колонки, которая и есть ссылка на
+    легаси. Ручные записи (`legacy_id is null`) по-прежнему дают `None`: писать
+    им некуда, а `equipment.id` привязал бы ошибку к чужому роботу.
+
+    Ветка запасного чтения (`robot_row` нашёл робота прямо в
+    `robots_maintenance_list`) `legacy_id` не возвращает — там `id` и есть ключ
+    легаси, и он используется как есть.
     """
     if not row:
         return None
 
-    # `legacy_id` есть только у синхронизированных записей; ручные его не имеют.
     in_legacy = row.get("in_legacy")
-    robot_id = row.get("id")
-
-    if not isinstance(robot_id, int):
-        return None
 
     # 🔴 Ручной робот: `robot_id` писать некуда — колонка ссылается на легаси.
     if in_legacy is False:
         return None
 
-    return robot_id
+    # Строка из единого реестра: единственная верная ссылка — `legacy_id`.
+    # `None` (ручная запись) или отсутствие колонки не дают повода угадывать.
+    if "legacy_id" in row:
+        legacy_id = row.get("legacy_id")
+
+        return legacy_id if isinstance(legacy_id, int) else None
+
+    # Строка из запасного чтения `robots_maintenance_list`: её `id` — легаси-ключ.
+    robot_id = row.get("id")
+
+    return robot_id if isinstance(robot_id, int) else None
 
 
 def robot_id_for(number, warehouse: str = "") -> Optional[int]:
@@ -1643,9 +1672,39 @@ def write_exception(result: Dict[str, Any], warehouse: Optional[str] = None) -> 
     # Проверка схемы только что ответила «колонки есть» и база доступна —
     # значит, отказ почти наверняка из-за колонки. Повтор без них дешёв и
     # спасает отчёт; негативный ответ запоминается, чтобы следующие отчёты не
-    # платили за проверку. Наборы снимаются **по одному**: неприехавшая
-    # миграция `0080` не должна заодно стирать `cause` (именно это и дало
-    # 1663 пустые причины на живой базе).
+    # платили за проверку.
+    #
+    # 🔴 **Первым снимается только `robot_id`** (07.11.2026). Пока ссылка на
+    # робота писалась значением из чужой последовательности, вставка падала с
+    # `409` (`23503`, FK на `robots_maintenance_list`), и старый общий откат
+    # снимал **вместе с ней всю аналитику** — `module`, `device_number`,
+    # `object_type`, `report_id` — на 120 секунд для всех последующих отчётов.
+    # Проверено на живой базе: **264** записи за 10 дней без аналитики, хотя
+    # уникальность и остальные колонки были ни при чём. Один отказ дорожал до
+    # десятков испорченных строк.
+    #
+    # Теперь отказ, вызванный ссылкой, стоит одного лишнего запроса и **не
+    # трогает остальные наборы**. Общий откат остаётся запасным путём — на
+    # случай, если дело не в `robot_id`.
+    if saved is None and include_robot:
+        logger.warning(
+            "Write to %s failed with the robot link (robot_id); "
+            "retrying without it, saving the rest of the analytics",
+            GLPC_TABLE,
+        )
+        _remember_columns("_robot_columns_state", "_robot_columns_checked_at", False)
+
+        rows = build_rows(
+            result, title,
+            include_optional=include_optional,
+            include_split=include_split,
+            include_review=include_review,
+            include_robot=False,
+        )
+        row_numbers = [str(row.get("device_number") or "?") for row in rows]
+        payload = _wire_payload(rows)
+        saved = rest_upsert(GLPC_TABLE, payload, on_conflict="uniq_key")
+
     if saved is None and (include_optional or include_split or include_review or include_robot):
         logger.warning(
             "Write to %s failed with the analytics columns (%s); retrying without them",
