@@ -567,9 +567,9 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
     # (зону) и `status`. Поиск по `category='robot'` + `equipment_code` +
     # `warehouse`.
     #
-    # 🔴 **`legacy_id` обязателен в выборке** (07.11.2026): `robot_id` в
-    # `exceptions` — внешний ключ на **старую** таблицу, и писать туда
-    # `equipment.id` нельзя. Подробности — в `_robot_id_from_row`.
+    # `legacy_id` больше не пишется в `robot_id` (FK переведён на
+    # `equipment(id)`, миграция `0187`), но остаётся в выборке: по нему видно,
+    # синхронизирован робот с легаси или заведён вручную.
     rows = rest_get(
         "equipment",
         {
@@ -601,11 +601,16 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
         if rows:
             rows = [{**rows[0], "in_legacy": True}]
     elif rows:
-        # 🔴 **Ручная запись (`legacy_table = 'manual'`) в легаси отсутствует:**
-        # `robot_id` ссылается на `robots_maintenance_list`, и писать туда
-        # `equipment.id` нельзя — база отвергнет запись целиком.
+        # 🔴 **Метка источника.** `equipment_id` — явный признак «это единица
+        # реестра»: по нему `_robot_id_from_row` отличает её от запасного чтения
+        # легаси. Признак не выводится из наличия случайной колонки — так
+        # проверка не зависит от того, что ещё попало в `select`.
         rows = [
-            {**rows[0], "in_legacy": rows[0].get("legacy_table") != "manual"}
+            {
+                **rows[0],
+                "in_legacy": rows[0].get("legacy_table") != "manual",
+                "equipment_id": rows[0].get("id"),
+            }
         ]
 
     if not rows:
@@ -639,59 +644,34 @@ def robot_row(number, warehouse: str = "") -> Optional[Dict[str, Any]]:
 
 
 def _robot_id_from_row(row: Optional[Dict[str, Any]]) -> Optional[int]:
-    """`id` робота в **старой** таблице (`legacy_id`) — или `None`.
+    """`equipment.id` робота — или `None`.
 
-    🔴 **Только `robots_maintenance_list`, а не `equipment`.**
+    🔴 **`exceptions.robot_id` теперь ссылается на `equipment(id)`**
+    (миграция `0187` в tk-assist-api, 07.11.2026). До неё FK смотрел на
+    `robots_maintenance_list`, и ссылку можно было записать только
+    синхронизированным роботам: у **3 231** ручного робота GLP-C записи в легаси
+    нет, поэтому **51 %** отчётов бота оставались без робота, а карточка
+    оборудования показывала пустую историю ошибок.
 
-    ## Почему это важно
+    ## Почему это не «просто id»
 
-    `exceptions.robot_id` — внешний ключ на `robots_maintenance_list(id)`
-    (проверено: `exceptions_robot_id_fkey`). Если записать туда `equipment.id`,
-    база ответит `23503 foreign key violation`.
+    Раньше здесь стоял `legacy_id`, потому что FK вёл на легаси. После перевода
+    FK на реестр верное значение — `equipment.id`, и оно есть у **всех** единиц,
+    включая ручные. `legacy_id` больше не подходит: это id чужой таблицы.
 
-    ## 🔴 Почему `equipment.id` — это НЕ то же число (регрессия 07.11.2026)
+    ## Когда `None`
 
-    Исходная проверка 27.10.2026 опиралась на «у синхронизированных записей
-    `id` совпадают: 2088 из 2088». Это было верно **на тот момент**, но не
-    является свойством схемы: `equipment.id` — своя последовательность, а строка
-    легаси живёт по `legacy_id`. Новые единицы (вторая очередь `GLP-C1`) получили
-    `id` из последовательности, и соответствие разъехалось.
-
-    Проверено на живой базе 07.11.2026:
-
-    * `equipment.id = equipment.legacy_id` — **0 строк** из 2970
-      синхронизированных;
-    * **2088** `equipment.id` совпадают с *каким-то* `robots_maintenance_list.id`,
-      но это **другой робот** (другой номер и склад);
-    * у остальных 882 `equipment.id` в легаси нет вовсе — вставка падала с
-      `409` (`23503`), и отчёт терял **всю** аналитику при откате.
-
-    Поэтому значение берётся из `legacy_id` — колонки, которая и есть ссылка на
-    легаси. Ручные записи (`legacy_id is null`) по-прежнему дают `None`: писать
-    им некуда, а `equipment.id` привязал бы ошибку к чужому роботу.
-
-    Ветка запасного чтения (`robot_row` нашёл робота прямо в
-    `robots_maintenance_list`) `legacy_id` не возвращает — там `id` и есть ключ
-    легаси, и он используется как есть.
+    * строка пришла из запасного чтения `robots_maintenance_list` — это не
+      единица реестра, и её id в `equipment` не существует (признак — нет ключа
+      `legacy_id`, который `robot_row` выбирает только из `equipment`);
+    * `id` не число (испорченный ответ) — гадать нельзя.
     """
     if not row:
         return None
 
-    in_legacy = row.get("in_legacy")
-
-    # 🔴 Ручной робот: `robot_id` писать некуда — колонка ссылается на легаси.
-    if in_legacy is False:
-        return None
-
-    # Строка из единого реестра: единственная верная ссылка — `legacy_id`.
-    # `None` (ручная запись) или отсутствие колонки не дают повода угадывать.
-    if "legacy_id" in row:
-        legacy_id = row.get("legacy_id")
-
-        return legacy_id if isinstance(legacy_id, int) else None
-
-    # Строка из запасного чтения `robots_maintenance_list`: её `id` — легаси-ключ.
-    robot_id = row.get("id")
+    # Метку ставит `robot_row` только для строки реестра; у запасного чтения
+    # легаси её нет, и его `id` в `equipment` не существует.
+    robot_id = row.get("equipment_id")
 
     return robot_id if isinstance(robot_id, int) else None
 
@@ -1316,7 +1296,16 @@ def build_rows(
             # **Робот зарядки важнее станции** в этом поле: `robot_number` —
             # числовой номер робота. Если робота не спросили (старый путь или
             # API), остаётся прежнее поведение — разбор номера станции.
-            "robot_number": _robot_number(charging_robot or number),
+            # 🔴 **Только робот.** У зарядки — номер робота, который стоял на
+            # станции (если оператор его назвал); у станции и QR — ничего.
+            # Раньше сюда падал номер **станции** (`_robot_number(number)`), и
+            # веб показывал «робот 137» на записи о зарядке: номера станций и
+            # роботов пересекаются (31 из 223 зарядок совпадал с роботом).
+            "robot_number": (
+                _robot_number(number) if category == "robot"
+                else _robot_number(charging_robot) if category == "charging"
+                else None
+            ),
             "handle_by": card_id,
             "device_type": device_type,
             "employee": result.get("employee") or result.get("username") or f"Telegram {user_id}",

@@ -958,6 +958,41 @@ def queue_missing_robot(
     return queued is not None
 
 
+def equipment_id_for_legacy_robot(robot: dict):
+    """`equipment.id` по строке `robots_maintenance_list` — или `None`.
+
+    Нужен там, где робот найден в **легаси** (старый путь приёма), а записать
+    его надо в `exceptions.robot_id`, который с миграции `0187` ссылается на
+    реестр. `None` — робота нет в `equipment` или база недоступна; отчёт при
+    этом не теряется, ссылка просто пустая.
+    """
+    if not isinstance(robot, dict):
+        return None
+
+    legacy_id = robot.get("id")
+
+    if not isinstance(legacy_id, int):
+        return None
+
+    rows = rest_get(
+        "equipment",
+        {
+            "select": "id",
+            "legacy_table": "eq.robots_maintenance_list",
+            "legacy_id": f"eq.{legacy_id}",
+            "limit": "1",
+        },
+        optional=True,
+    )
+
+    if not rows:
+        return None
+
+    value = rows[0].get("id")
+
+    return value if isinstance(value, int) else None
+
+
 def send_to_data_base(
     parsed: dict,
     table_lines: dict,
@@ -1198,7 +1233,11 @@ def send_to_data_base(
     obj = {
         "workstation_id": None,
 
-        "robot_id": robot.get("id"),
+        # 🔴 **`equipment.id`, а не `robot["id"]`** (07.11.2026): FK
+        # `exceptions.robot_id` переведён на канонический реестр (миграция
+        # `0187`). Значение из легаси здесь дало бы либо нарушение FK, либо —
+        # хуже — привязку к роботу, чей `equipment.id` случайно совпал.
+        "robot_id": equipment_id_for_legacy_robot(robot),
 
         "handle_by": employee.get("card_id"),
 

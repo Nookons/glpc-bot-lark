@@ -626,9 +626,12 @@ class RobotIdIsWritten(unittest.TestCase):
     def test_each_split_row_gets_its_own_robot_id(self):
         """У `3544/1234` — **своя** ссылка в каждой строке, не общая."""
         def fake(table, params, optional=False):
-            if table == rw.ROBOTS_TABLE:
-                code = params.get("robot_number", "").replace("eq.", "")
-                return [{"id": 3520}] if code == "3544" else []
+            if table == "equipment":
+                code = params.get("equipment_code", "").replace("eq.", "")
+                return (
+                    [{"id": 4520, "legacy_id": 3520, "legacy_table": "robots_maintenance_list"}]
+                    if code == "3544" else []
+                )
             return None
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake):
@@ -639,7 +642,8 @@ class RobotIdIsWritten(unittest.TestCase):
             )
 
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["robot_id"], 3520)
+        # 🔴 id РЕЕСТРА, а не legacy: FK `exceptions.robot_id` → `equipment(id)`.
+        self.assertEqual(rows[0]["robot_id"], 4520)
         self.assertIsNone(rows[1]["robot_id"], "второй робот не найден -> None")
 
     def test_robot_lookup_is_scoped_to_the_warehouse(self):
@@ -653,9 +657,10 @@ class RobotIdIsWritten(unittest.TestCase):
         calls = []
 
         def fake(table, params, optional=False):
-            if table == rw.ROBOTS_TABLE:
+            if table == "equipment":
                 calls.append(params.get("warehouse"))
-                return [{"id": 1, "sub_warehouse": "E"}]
+                return [{"id": 11, "legacy_id": 1, "sub_warehouse": "E",
+                         "legacy_table": "robots_maintenance_list"}]
             return None
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake):
@@ -681,9 +686,10 @@ class RobotIdIsWritten(unittest.TestCase):
         calls = []
 
         def fake(table, params, optional=False):
-            if table == rw.ROBOTS_TABLE:
-                calls.append(params.get("robot_number"))
-                return [{"id": 3520, "sub_warehouse": "D"}]
+            if table == "equipment":
+                calls.append(params.get("equipment_code"))
+                return [{"id": 4520, "legacy_id": 3520, "sub_warehouse": "D",
+                         "legacy_table": "robots_maintenance_list"}]
             return None
 
         with mock.patch("sendToDataBase.rest_get", side_effect=fake):
@@ -691,7 +697,7 @@ class RobotIdIsWritten(unittest.TestCase):
             robot_id = rw.robot_id_for("3544", "SMALL-P3")
 
         self.assertEqual(zone, "D")
-        self.assertEqual(robot_id, 3520)
+        self.assertEqual(robot_id, 4520)
         self.assertEqual(len(calls), 1, f"справочник прочитан {len(calls)} раза вместо одного")
 
     def test_no_warehouse_means_no_guess(self):
@@ -1404,40 +1410,27 @@ class TestManuallyAddedRobotIsFound:
         # 🔴 Запасной путь в легаси остаётся: записи до 12.10 живут там.
         assert "ROBOTS_TABLE" in source
 
-    def test_manual_robot_gets_no_robot_id(self) -> None:
-        """У ручного робота `robot_id` пуст — иначе FK упадёт."""
+    def test_synced_robot_takes_equipment_id(self) -> None:
+        """`robot_id` = `equipment.id`, а не `legacy_id` (FK переведён на реестр)."""
         from equipment_intake.report_writer import _robot_id_from_row
 
-        manual = {"id": 48963, "in_legacy": False}
+        synced = {"id": 3026, "equipment_id": 3026, "legacy_id": 3241, "in_legacy": True}
 
-        # 🔴 `exceptions.robot_id` ссылается на `robots_maintenance_list`,
-        # а ручной записи там нет.
-        assert _robot_id_from_row(manual) is None
+        assert _robot_id_from_row(synced) == 3026
 
-    def test_synced_robot_takes_legacy_id(self) -> None:
-        """У синхронизированного робота `robot_id` = `legacy_id`, не `id`."""
+    def test_manual_robot_gets_equipment_id(self) -> None:
+        """У ручного робота ссылка тоже есть — в легаси его нет, в реестре есть."""
         from equipment_intake.report_writer import _robot_id_from_row
 
-        # 🔴 Значения из живой базы 07.11.2026: `equipment.id` 3026 —
-        # это SMALL-P3 робот 60, а его строка легаси имеет id 3241.
-        # Старый код писал 3026, и FK привязывал ошибку к роботу 2576 (GLP-C1).
-        synced = {"id": 3026, "legacy_id": 3241, "in_legacy": True}
+        manual = {"id": 48963, "equipment_id": 48963, "legacy_id": None, "in_legacy": True}
 
-        assert _robot_id_from_row(synced) == 3241
+        assert _robot_id_from_row(manual) == 48963
 
-    def test_synced_robot_without_legacy_id_gets_nothing(self) -> None:
-        """Нет `legacy_id` — `robot_id` пуст, а не `equipment.id`."""
+    def test_legacy_fallback_row_gets_nothing(self) -> None:
+        """Строка из `robots_maintenance_list` — не единица реестра: id не тот."""
         from equipment_intake.report_writer import _robot_id_from_row
 
-        synced = {"id": 3026, "legacy_id": None, "in_legacy": True}
-
-        assert _robot_id_from_row(synced) is None
-
-    def test_legacy_fallback_row_uses_id(self) -> None:
-        """Строка из `robots_maintenance_list` — её `id` и есть ключ легаси."""
-        from equipment_intake.report_writer import _robot_id_from_row
-
-        assert _robot_id_from_row({"id": 20306, "in_legacy": True}) == 20306
+        assert _robot_id_from_row({"id": 20306, "in_legacy": True}) is None
 
 
 class TestWarehouseFromNumber:

@@ -2053,6 +2053,30 @@ def test_user_facing_texts_are_english():
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
                 pass
 
+            # Регулярные выражения читают текст **пользователя**, а не пишут
+            # ему: русское слово в шаблоне (`робот`) — данные разбора. Без
+            # этого исключения страж требовал перевести слово, которое бот
+            # должен узнавать во вводе.
+            if isinstance(node, ast.Call):
+                name = _call_name(node)
+
+                if name.startswith("re.") or name.endswith(".match") or name.endswith(".search"):
+                    for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                        for sub in ast.walk(arg):
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                allowed_lines.add(sub.lineno)
+
+            # Таблица транслитерации: ключи — русские буквы, значения —
+            # латиница (`{"а": "a", ...}`). Это преобразование имён файлов, а
+            # не текст для человека; переводить её нельзя.
+            if isinstance(node, ast.Dict):
+                keys = [k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+                values = [v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str)]
+                if keys and values and all(cyrillic.search(k) for k in keys) and not any(cyrillic.search(v) for v in values):
+                    for item in node.keys + node.values:
+                        if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                            allowed_lines.add(item.lineno)
+
             if isinstance(node, ast.Call):
                 name = _call_name(node)
 
@@ -8660,6 +8684,9 @@ def test_last_error_offline_takes_the_note_from_the_error():
        mock.patch.object(bot, "_ask_repair_photo", lambda *a, **k: None), \
        mock.patch.object(bot, "_notify_lark_status", lambda *a, **k: None), \
        mock.patch.object(bot.robot_status, "change_robot_status", fake_change), \
+       mock.patch.object(
+           bot.robot_status, "find_equipment", lambda robot: {"id": 777}
+       ), \
        mock.patch(
            "journal.last_issue_details_for_robot",
            lambda *a, **k: {

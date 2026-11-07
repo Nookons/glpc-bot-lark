@@ -937,9 +937,12 @@ def topic_configuration_problems(chat_id=None) -> list:
             title == DEFAULT_WAREHOUSE and TELEGRAM_TOPIC_ID is not None
         ):
             problems.append(
-                f"Warehouse {title} has no error topic: its issues would be "
-                f"recorded on {DEFAULT_WAREHOUSE}. Set TELEGRAM_TOPIC_ERROR_* "
-                f"for it or remove it from TELEGRAM_WAREHOUSES."
+                f"Warehouse {title} has no error topic. Reports are routed by "
+                f"the device number through the shared topic — this is expected "
+                f"after the 29.10.2026 decision (GLP-C1). If the number is not "
+                f"found, the report falls back to {DEFAULT_WAREHOUSE}; set "
+                f"TELEGRAM_TOPIC_ERROR_* only if this warehouse needs its own "
+                f"topic."
             )
 
     for title in titles:
@@ -2463,7 +2466,13 @@ def start_status_flow(chat_id, direction: str, robot: dict, warehouse: str = Non
     if direction == "offline":
         import journal
 
-        last_issue = journal.last_issue_for_robot(robot.get("id"))
+        # 🔴 `exceptions.robot_id` — это `equipment.id` (0187), а `robot` здесь
+        # строка легаси. Передавать её id нельзя: запрос не найдёт ошибок (или,
+        # при совпадении чисел, возьмёт чужие).
+        equipment = robot_status.find_equipment(robot)
+        last_issue = journal.last_issue_for_robot(
+            (equipment or {}).get("id")
+        )
 
     _send(
         chat_id,
@@ -2613,7 +2622,11 @@ def handle_status_callback(callback: dict):
         # лишний шаг там, где всё уже известно: тип ошибки, модуль и причина
         # лежат в журнале. Теперь статус меняется сразу, а у оператора
         # остаётся **один** необязательный шаг — фото или видео.
-        details = journal.last_issue_details_for_robot((fresh or {}).get("id")) if fresh else None
+        equipment = robot_status.find_equipment(fresh) if fresh else None
+        details = (
+            journal.last_issue_details_for_robot(equipment.get("id"))
+            if equipment else None
+        )
 
         if not details:
             # Ошибку убрали или её не было: кнопка устарела. Честно говорим и не
@@ -2800,10 +2813,10 @@ def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
     best, media_kind = _pick_media(message)
 
     if not best:
-        _send(chat_id, "⚠️ Не удалось получить фото", reply_to_message_id=message_id)
+        _send(chat_id, "⚠️ Could not get the photo", reply_to_message_id=message_id)
         return
 
-    _send(chat_id, "🔍 Смотрю фото…", reply_to_message_id=message_id, delete_after=30)
+    _send(chat_id, "🔍 Looking at the photo…", reply_to_message_id=message_id, delete_after=30)
 
     # 🔴 Тот же путь скачивания, что у приёма ошибок (`tg.get_file` +
     # `tg.download_file`): второй способ качать файлы означал бы вторую ветку,
@@ -2811,13 +2824,13 @@ def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
     file_path = tg.get_file(best["file_id"])
 
     if not file_path:
-        _send(chat_id, "⚠️ Фото не скачалось", reply_to_message_id=message_id)
+        _send(chat_id, "⚠️ The photo was not downloaded", reply_to_message_id=message_id)
         return
 
     destination = os.path.join(_IMAGES_DIR, f"sandbox_{best.get('file_unique_id') or best['file_id']}.jpg")
 
     if not tg.download_file(file_path, destination):
-        _send(chat_id, "⚠️ Фото не сохранилось", reply_to_message_id=message_id)
+        _send(chat_id, "⚠️ The photo was not saved", reply_to_message_id=message_id)
         return
 
     result = sandbox.identify(destination)
