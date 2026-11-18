@@ -248,29 +248,23 @@ def robot_card(number, warehouse: str = WAREHOUSE):
     if cached and now - cached[0] < _CACHE_SECONDS:
         return cached[1]
 
-    rows = rest_get(
-        ROBOTS_TABLE,
-        params={
-            "select": "*",
-            "robot_number": f"eq.{raw}",
-            "warehouse": f"eq.{warehouse}",
-            "order": "updated_at.desc",
-            "limit": "1",
-        },
-    )
+    # 🔴 **Карточка читает тот же реестр, что команды** (18.11.2026).
+    # Сначала `equipment`, затем легаси: у GLP-C в легаси 52 строки из 2 191,
+    # и `/robot 9999` отвечал «нет в списке», хотя единица есть и `online`.
+    import robot_status
 
-    if rows is None:
+    try:
+        robot = robot_status.find_robot(raw, warehouse, strict=True)
+    except robot_status.StatusUnavailable:
         logger.error("Не удалось прочитать робота #%s — база недоступна", raw)
         return None
 
-    if not rows:
+    if not robot:
         return {
             "found": False,
             "number": raw,
             "suggestions": suggest_robot_numbers(raw),
         }
-
-    robot = rows[0]
 
     history = rest_get(
         HISTORY_TABLE,
@@ -356,7 +350,7 @@ def robot_card(number, warehouse: str = WAREHOUSE):
         "last_issues": [],
     }
 
-    if str(robot.get("status") or "") == OFFLINE_STATUS:
+    if str(robot.get("status") or "") in (OFFLINE_STATUS, "维护 | Maintenance"):
         started = robot.get("updated_at")
 
         if started:

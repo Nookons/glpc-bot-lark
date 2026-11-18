@@ -2708,6 +2708,7 @@ def handle_status_callback(callback: dict):
             "direction": direction,
             "robot_number": robot.get("robot_number"),
             "robot_id": robot.get("id"),
+            "robot_source": robot.get("_source") or "legacy",
             "type_problem": label,
             "note": note,
             "prompt_message_id": message_id,
@@ -2891,12 +2892,21 @@ def _attach_photo_to_canonical_repair(
 
     import robot_status
 
-    legacy_id = pending.get("robot_id")
+    robot_id = pending.get("robot_id")
 
-    if not legacy_id:
+    if not robot_id:
         return False
 
-    equipment = robot_status.find_equipment({"id": legacy_id})
+    if pending.get("robot_source") == "equipment":
+        # `robot_id` — это `equipment.id`; второй запрос не нужен.
+        equipment = {
+            "id": robot_id,
+            "equipment_code": pending.get("robot_number"),
+            "warehouse": pending.get("warehouse"),
+        }
+    else:
+        # Старые сессии: `robot_id` — ключ легаси-зеркала.
+        equipment = robot_status.find_equipment({"id": robot_id})
 
     if not equipment:
         # Единицы нет в реестре — пусть решает легаси-ветка.
@@ -3389,6 +3399,7 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
         # Тот же обязательный `robot_id`, что и в ветке выбора причины: путь
         # «Skip — без описания» тоже заводит ремонт и тоже терял фото.
         "robot_id": robot.get("id"),
+        "robot_source": robot.get("_source") or "legacy",
         "type_problem": reason,
         "warehouse": robot.get("warehouse") or current_warehouse(),
         # Момент вывода из работы: простой считается от него, а не от времени,

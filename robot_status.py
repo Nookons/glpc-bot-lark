@@ -91,6 +91,97 @@ REASONS = {
 STATUS_HISTORY_TABLE = "change_status_robots"
 ROBOTS_TABLE = "robots_maintenance_list"
 
+#: Канонический реестр оборудования — **основной источник** для команд.
+#:
+#: 🔴 **Почему** (владелец 18.11.2026: «почему /offline 9999 пишет, что робота
+#: нет»). Команды искали робота в легаси-зеркале `robots_maintenance_list`, а там
+#: у GLP-C всего 52 строки из 2 191: 3 231 единица заведена вручную
+#: (`legacy_table = 'manual'`). Робот 9999 есть в `equipment` и `online`, но в
+#: легаси его нет — и бот отвечал «not found».
+#:
+#: Легаси остаётся запасным путём для строк, которых в реестре почему-то нет.
+EQUIPMENT_TABLE = "equipment"
+EQUIPMENT_TYPES_TABLE = "equipment_types"
+
+#: Канонический статус → подпись, которой живёт бот и старые экраны.
+CANONICAL_TO_LEGACY = {
+    "online": ONLINE,
+    "offline": OFFLINE,
+    "maintenance": MAINTENANCE,
+    "not_in_work": "Not in work",
+    "unknown": "Unknown",
+}
+
+#: Обратное преобразование — только для записи в `equipment`.
+LEGACY_TO_CANONICAL = {
+    ONLINE: "online",
+    OFFLINE: "offline",
+    MAINTENANCE: "maintenance",
+    "在线 | online": "online",
+    "离线 | offline": "offline",
+    "维护 | maintenance": "maintenance",
+    "online": "online",
+    "offline": "offline",
+    "maintenance": "maintenance",
+}
+
+_TYPE_NAMES: dict = {}
+
+
+def display_status(value) -> str:
+    """Статус для человека и старых читателей: `online` → `在线 | Online`."""
+    text = str(value or "").strip()
+
+    if not text:
+        return ""
+
+    return CANONICAL_TO_LEGACY.get(text.casefold(), text)
+
+
+def canonical_status(value) -> str:
+    """Статус для записи в `equipment`. Неизвестное значение не выдумываем."""
+    text = str(value or "").strip()
+
+    return LEGACY_TO_CANONICAL.get(text, LEGACY_TO_CANONICAL.get(text.casefold(), text))
+
+
+def _type_name(type_id):
+    """Название модели по id — маленький кэш, чтобы не дёргать базу на каждый чих."""
+    if not type_id:
+        return None
+
+    if type_id in _TYPE_NAMES:
+        return _TYPE_NAMES[type_id]
+
+    rows = rest_get(
+        EQUIPMENT_TYPES_TABLE,
+        params={"select": "type", "id": f"eq.{type_id}", "limit": "1"},
+        optional=True,
+    )
+    name = (rows[0].get("type") if rows else None)
+    _TYPE_NAMES[type_id] = name
+
+    return name
+
+
+def _equipment_robot(row: dict) -> dict:
+    """Строка `equipment` в форме, которую ждут команды и карточка."""
+    return {
+        "id": row.get("id"),
+        "robot_number": row.get("equipment_code"),
+        "status": display_status(row.get("status")),
+        "warehouse": row.get("warehouse"),
+        "robot_type": _type_name(row.get("equipment_type_id")),
+        "type_problem": row.get("problem_type"),
+        "problem_note": row.get("problem_note"),
+        "updated_at": row.get("updated_at"),
+        "legacy_id": row.get("legacy_id"),
+        "legacy_table": row.get("legacy_table"),
+        # Служебные поля: по ним `change_robot_status` выбирает таблицу записи.
+        "_source": "equipment",
+        "_canonical_status": row.get("status"),
+    }
+
 #: Поручения на ремонт — **каноническая** таблица новой системы.
 #:
 #: 🔴 **Почему бот пишет сюда, а не в легаси** (30.10.2026).
@@ -128,10 +219,15 @@ def reason_label(direction: str, code: str):
 
 def find_robot(robot_number, warehouse: str = WAREHOUSE, strict: bool = False):
     """
-    Строка робота из robots_maintenance_list (или None).
+    Робот склада: строка канонического реестра `equipment` (или легаси).
 
     strict=True — при сбое чтения бросает StatusUnavailable: «робот не
     найден» и «база недоступна» — разные вещи.
+
+    🔴 **Сначала `equipment`, потом легаси.** Команды раньше смотрели только в
+    `robots_maintenance_list`, где у GLP-C 52 строки из 2 191; роботы, заведённые
+    вручную, для бота не существовали. `equipment` — тот же реестр, что у веба и
+    приёма ошибок.
     """
     try:
         number = int(str(robot_number).strip().lstrip("#"))
@@ -139,11 +235,12 @@ def find_robot(robot_number, warehouse: str = WAREHOUSE, strict: bool = False):
         return None
 
     rows = rest_get(
-        ROBOTS_TABLE,
+        EQUIPMENT_TABLE,
         params={
             "select": "*",
-            "robot_number": f"eq.{number}",
             "warehouse": f"eq.{warehouse}",
+            "category": "eq.robot",
+            "equipment_code": f"eq.{number}",
             "order": "updated_at.desc",
             "limit": "1",
         },
@@ -157,19 +254,51 @@ def find_robot(robot_number, warehouse: str = WAREHOUSE, strict: bool = False):
 
         return None
 
-    return rows[0] if rows else None
+    if rows:
+        return _equipment_robot(rows[0])
+
+    # Запасной путь: строки, которых нет в каноническом реестре.
+    legacy = rest_get(
+        ROBOTS_TABLE,
+        params={
+            "select": "*",
+            "robot_number": f"eq.{number}",
+            "warehouse": f"eq.{warehouse}",
+            "order": "updated_at.desc",
+            "limit": "1",
+        },
+    )
+
+    if legacy is None:
+        if strict:
+            raise StatusUnavailable("robot lookup failed")
+
+        return None
+
+    if not legacy:
+        return None
+
+    row = dict(legacy[0])
+    row["_source"] = "legacy"
+
+    return row
 
 
 def find_robot_by_id(robot_id, strict: bool = False):
-    """Строка робота по первичному ключу (нужна для callback-кнопок)."""
+    """Робот по идентификатору из callback-кнопки.
+
+    Новые кнопки несут `equipment.id`; старые (до 18.11.2026) — id легаси-строки.
+    Поэтому сначала ищем по `equipment.id`, затем по `legacy_id`, и только потом
+    в легаси-таблице: иначе кнопка, нажатая до выката, отвечала бы «not found».
+    """
     try:
         key = int(robot_id)
     except (TypeError, ValueError):
         return None
 
     rows = rest_get(
-        ROBOTS_TABLE,
-        params={"select": "*", "id": f"eq.{key}", "limit": "1"},
+        EQUIPMENT_TABLE,
+        params={"select": "*", "id": f"eq.{key}", "category": "eq.robot", "limit": "1"},
     )
 
     if rows is None:
@@ -180,7 +309,40 @@ def find_robot_by_id(robot_id, strict: bool = False):
 
         return None
 
-    return rows[0] if rows else None
+    if rows:
+        return _equipment_robot(rows[0])
+
+    by_legacy = rest_get(
+        EQUIPMENT_TABLE,
+        params={
+            "select": "*",
+            "legacy_id": f"eq.{key}",
+            "legacy_table": "eq.robots_maintenance_list",
+            "limit": "1",
+        },
+    )
+
+    if by_legacy:
+        return _equipment_robot(by_legacy[0])
+
+    legacy = rest_get(
+        ROBOTS_TABLE,
+        params={"select": "*", "id": f"eq.{key}", "limit": "1"},
+    )
+
+    if legacy is None:
+        if strict:
+            raise StatusUnavailable("robot lookup failed")
+
+        return None
+
+    if not legacy:
+        return None
+
+    row = dict(legacy[0])
+    row["_source"] = "legacy"
+
+    return row
 
 
 def find_equipment(robot: dict):
@@ -191,6 +353,17 @@ def find_equipment(robot: dict):
     вернул бы чужую единицу. `legacy_id` — первичный ключ строки зеркала, он
     однозначен.
     """
+    if robot.get("_source") == "equipment":
+        # Строка уже из канонического реестра: возвращаем её же, не делая второй
+        # запрос. `id` здесь — `equipment.id`, `equipment_code` — номер.
+        return {
+            "id": robot.get("id"),
+            "equipment_code": robot.get("robot_number"),
+            "warehouse": robot.get("warehouse"),
+            "status": robot.get("_canonical_status") or canonical_status(robot.get("status")),
+            "category": "robot",
+        }
+
     legacy_id = robot.get("id")
 
     if legacy_id is None:
@@ -363,29 +536,36 @@ def change_robot_status(
     if direction == "online":
         close_repair(robot, employee, type_problem, problem_note)
 
+    source = robot.get("_source") or "legacy"
     old_status = str(robot.get("status") or "")
     new_status = spec["new_status"]
     changed_at = datetime.now(timezone.utc).isoformat()
     card_id = (employee or {}).get("card_id")
 
+    # В `equipment` статусы канонические (`maintenance`), в легаси — подписи
+    # (`维护 | Maintenance`). Пишем в ту таблицу, откуда пришла строка.
     payload = {
-        "status": new_status,
+        "status": canonical_status(new_status) if source == "equipment" else new_status,
         "updated_at": changed_at,
         "updated_by": card_id,
     }
 
+    problem_field = "problem_type" if source == "equipment" else "type_problem"
+
     if direction == "offline":
         # Дашборд показывает «CURRENT ISSUE» из самой карточки робота,
         # поэтому тип проблемы и заметку пишем и сюда, а не только в журнал.
-        payload["type_problem"] = type_problem
+        payload[problem_field] = type_problem
         payload["problem_note"] = problem_note or ""
     else:
         # Робот вернулся в работу — текущая проблема больше не актуальна.
-        payload["type_problem"] = None
+        payload[problem_field] = None
         payload["problem_note"] = None
 
+    table = EQUIPMENT_TABLE if source == "equipment" else ROBOTS_TABLE
+
     updated = rest_patch(
-        ROBOTS_TABLE,
+        table,
         params={"id": f"eq.{robot['id']}"},
         payload=payload,
     )
