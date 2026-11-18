@@ -1045,6 +1045,14 @@ def _close_draft_on_server(session) -> bool:
             int(inspection_id),
             reason=f"Cancelled in Telegram by {session.employee_name or 'the operator'}",
         )
+    except InspectionApiUnavailable as error:
+        # Сеть/сервис: черновик действительно остался, человек должен знать.
+        logger.warning(
+            "Осмотр %s: сервер недоступен, черновик остался: %s",
+            inspection_id,
+            error,
+        )
+        return False
     except InspectionApiError as error:
         # 404 — осмотр уже удалили, 409 — его уже закрыли (например, с веба).
         # В обоих случаях закрывать нечего, и пугать человека «черновик остался»
@@ -1059,13 +1067,6 @@ def _close_draft_on_server(session) -> bool:
 
         logger.warning(
             "Осмотр %s: не удалось закрыть черновик на сервере: %s",
-            inspection_id,
-            error,
-        )
-        return False
-    except InspectionApiUnavailable as error:
-        logger.warning(
-            "Осмотр %s: сервер недоступен, черновик остался: %s",
             inspection_id,
             error,
         )
