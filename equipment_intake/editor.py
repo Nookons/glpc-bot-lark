@@ -1527,7 +1527,10 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
     role = editor_role(sender)
 
     if role == ROLE_NONE:
-        return False
+        # Молчание здесь читается как мёртвая кнопка: `/tree` отвечает текстом
+        # «Maintainers only», а кнопки того же экрана — ничем. Отвечаем тостом.
+        _answer(callback_id, "Maintainers only")
+        return True
 
     action = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""

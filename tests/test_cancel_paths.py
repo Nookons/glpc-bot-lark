@@ -77,3 +77,78 @@ def test_drop_session_returns_the_session() -> None:
 
     assert dropped is not None
     assert flow.drop_session(CHAT_ID, USER_ID) is None
+
+
+def test_cancel_clears_editor_pending(sent) -> None:
+    """`/cancel` снимает ожидание текста редактора `/tree`.
+
+    Иначе следующее сообщение человека молча применяется к узлу дерева
+    (например, переименовывает вопрос для всех операторов).
+    """
+    import equipment_intake.editor as editor
+
+    editor.put_pending(CHAT_ID, USER_ID, "robot_type", 888, kind="node_title")
+
+    try:
+        bot._handle_cancel(CHAT_ID, {"id": USER_ID}, None)
+
+        assert editor.get_pending(CHAT_ID, USER_ID) is None
+        assert (CHAT_ID, 888) in sent["deleted"]
+    finally:
+        editor.drop_pending(CHAT_ID, USER_ID)
+        editor.drop_view(CHAT_ID, USER_ID)
+
+
+def test_cancel_stops_the_robot_fix_prompt(sent) -> None:
+    """Отменённая подсказка «номер верный?» не должна дослать ошибку по TTL."""
+    bot.set_pending_robot_fix(CHAT_ID, USER_ID, {
+        "sender": {"id": USER_ID},
+        "employee_name": "Test",
+        "parsed": {"robot": "9999"},
+        "prompt_message_id": 999,
+    })
+
+    try:
+        bot._handle_cancel(CHAT_ID, {"id": USER_ID}, None)
+
+        assert bot.peek_pending_robot_fix(CHAT_ID, USER_ID) is None
+        assert (CHAT_ID, 999) in sent["deleted"]
+    finally:
+        bot.take_pending_robot_fix(CHAT_ID, USER_ID)
+
+
+def test_cancel_clears_the_error_menu_and_choice(sent) -> None:
+    """`/cancel` убирает меню типа ошибки, выбранный тип и «описать самому»."""
+    bot.put_error_menu(CHAT_ID, USER_ID, {"menu_message_id": 1001})
+    bot.set_pending_error_choice(CHAT_ID, USER_ID, {"menu_message_id": 1002})
+    bot.set_pending_custom_text(CHAT_ID, USER_ID, {"prompt_message_id": 1003})
+
+    try:
+        bot._handle_cancel(CHAT_ID, {"id": USER_ID}, None)
+
+        assert bot.take_error_menu(CHAT_ID, USER_ID) is None
+        assert bot.peek_pending_error_choice(CHAT_ID, USER_ID) is None
+        assert bot.peek_pending_custom_text(CHAT_ID, USER_ID) is None
+        for message_id in (1001, 1002, 1003):
+            assert (CHAT_ID, message_id) in sent["deleted"]
+    finally:
+        bot.take_error_menu(CHAT_ID, USER_ID)
+        bot.clear_pending_error_choice(CHAT_ID, USER_ID)
+        bot.clear_pending_custom_text(CHAT_ID, USER_ID)
+
+
+def test_cancel_closes_inspection_and_intake_together(sent, monkeypatch) -> None:
+    """Осмотр не должен «съедать» отмену: второй диалог тоже закрывается."""
+    import inspection as insp
+
+    calls = []
+    monkeypatch.setattr(insp, "cancel", lambda chat_id, sender: calls.append(sender) or True)
+
+    _intake_session()
+
+    bot._handle_cancel(CHAT_ID, {"id": USER_ID}, None)
+
+    assert calls == [{"id": USER_ID}]
+    assert flow.get_session(CHAT_ID, USER_ID) is None
+    # Осмотр сам сказал «Inspection cancelled» — второй строки не шлём.
+    assert not any("Nothing to cancel" in m["text"] for m in sent["messages"])

@@ -1613,9 +1613,46 @@ class TestCancelAndTtl:
 
         assert "still open on the server" in rec.sent[-1]["text"]
 
+    def test_cancel_of_already_closed_inspection_is_not_a_warning(
+        self, rec, monkeypatch
+    ) -> None:
+        """409/404 — осмотр уже закрыт или удалён: пугать «черновик остался» нельзя."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        def already_closed(*args, **kwargs):
+            raise inspection_api.InspectionApiError("Inspection is closed", status=409)
+
+        monkeypatch.setattr(insp, "cancel_inspection", already_closed)
+
+        insp.cancel(CHAT_ID, {"id": USER_ID})
+
+        assert "still open on the server" not in rec.sent[-1]["text"]
+
     def test_cancel_without_dialogue_reports_nothing(self, rec, monkeypatch) -> None:
         """Без диалога `/cancel` не считает себя обработанным."""
         assert insp.cancel(CHAT_ID, {"id": USER_ID}) is False
+
+    def test_expired_draft_is_closed_on_the_server(self, rec, monkeypatch) -> None:
+        """Уборка просроченных сессий закрывает их черновики, а не бросает."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        insp._SESSIONS[insp._key(CHAT_ID, USER_ID)]["expires"] = 0
+
+        assert insp.sweep_sessions() == 1
+        assert rec.cancelled, "просроченный черновик остался на сервере"
+        assert rec.cancelled[-1]["inspection_id"] == 77
+
+    def test_repeat_inspection_closes_the_previous_draft(self, rec, monkeypatch) -> None:
+        """Повторный `/inspection` не теряет id прошлого черновика."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+
+        assert rec.cancelled, "прошлый черновик остался в «In progress»"
+        assert rec.cancelled[-1]["inspection_id"] == 77
 
     def test_expired_session_is_dropped(self, rec, monkeypatch) -> None:
         """Истёкший по TTL диалог не принимает ответ."""

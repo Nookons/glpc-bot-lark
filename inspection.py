@@ -295,14 +295,33 @@ def drop_session(chat_id, user_id) -> Optional[Session]:
 
 
 def sweep_sessions() -> int:
-    """Убирает просроченные сессии, чтобы словарь не рос."""
+    """Убирает просроченные сессии **и закрывает их черновики на сервере**.
+
+    🔴 **Почему не просто выбросить.** Осмотр создаётся на сервере сразу, и
+    брошенный диалог (ушёл на обед, закрыл Telegram, бот перезапустился) до
+    18.11.2026 оставлял `draft` навсегда: в вебе он висел «In progress», хотя
+    человек уже не мог его продолжить из Telegram (проверено на базе: две
+    такие записи от 31.10 и 16.11).
+
+    Уборка идёт в фоновом потоке; если API недоступен, `_close_draft_on_server`
+    пишет предупреждение, а сессия всё равно удаляется — иначе просроченный
+    диалог блокировал бы следующий.
+    """
     now = time.time()
 
     with _LOCK:
-        stale = [key for key, entry in _SESSIONS.items() if entry["expires"] < now]
+        stale = [
+            entry["session"]
+            for entry in _SESSIONS.values()
+            if entry["expires"] < now
+        ]
+        keys = [key for key, entry in _SESSIONS.items() if entry["expires"] < now]
 
-        for key in stale:
+        for key in keys:
             _SESSIONS.pop(key, None)
+
+    for session in stale:
+        _close_draft_on_server(session)
 
     return len(stale)
 
@@ -823,6 +842,32 @@ def start(chat_id, sender, reply_to=None) -> bool:
         )
         return True
 
+    # **Явная команда сильнее забытого диалога приёма.**
+    #
+    # Осмотр и приём ошибок могут быть открыты одновременно (разные топики,
+    # один чат). Тогда текст уходил осмотру, а карточка приёма оставалась
+    # висеть с рабочими на вид кнопками. `/offline` уже закрывает приём так же;
+    # здесь тот же порядок, иначе `/inspection` оставлял второй диалог живым.
+    try:
+        import equipment_intake.flow as intake_flow
+
+        dropped_intake = intake_flow.drop_session(chat_id, sender.get("id"))
+
+        if dropped_intake is not None:
+            bot._delete_quiet(chat_id, dropped_intake.data.get("menu_message_id"))
+    except Exception:  # noqa: BLE001 — приём не должен ломать осмотр
+        logger.warning("Осмотр: не удалось закрыть сессию приёма", exc_info=True)
+
+    # **Повторный /inspection закрывает прошлый черновик.**
+    #
+    # Иначе `put_session` ниже просто перезаписывает сессию: id прошлого
+    # осмотра теряется, и он навсегда остаётся `draft` в вебе.
+    previous = get_session(chat_id, sender.get("id"))
+
+    if previous is not None:
+        _close_draft_on_server(previous)
+        _close_session(previous)
+
     session = Session(
         chat_id=chat_id,
         user_id=sender.get("id"),
@@ -1000,9 +1045,27 @@ def _close_draft_on_server(session) -> bool:
             int(inspection_id),
             reason=f"Cancelled in Telegram by {session.employee_name or 'the operator'}",
         )
-    except (InspectionApiUnavailable, InspectionApiError) as error:
+    except InspectionApiError as error:
+        # 404 — осмотр уже удалили, 409 — его уже закрыли (например, с веба).
+        # В обоих случаях закрывать нечего, и пугать человека «черновик остался»
+        # нельзя: это была бы ложная тревога.
+        if error.status in (404, 409):
+            logger.info(
+                "Осмотр %s уже закрыт или удалён (HTTP %s) — отмена не нужна",
+                inspection_id,
+                error.status,
+            )
+            return True
+
         logger.warning(
             "Осмотр %s: не удалось закрыть черновик на сервере: %s",
+            inspection_id,
+            error,
+        )
+        return False
+    except InspectionApiUnavailable as error:
+        logger.warning(
+            "Осмотр %s: сервер недоступен, черновик остался: %s",
             inspection_id,
             error,
         )

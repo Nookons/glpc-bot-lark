@@ -535,6 +535,12 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
 
             session.back()
         elif action == CB_CANCEL:
+            # Без ответа на callback Telegram держит «часики» до таймаута, а
+            # если сообщение уже не удалить (старше 48 ч) — кнопка выглядит
+            # мёртвой. Отвечаем до удаления.
+            if callback_id:
+                tg.answer_callback_query(callback_id, "Cancelled")
+
             dropped = drop_session(chat_id, sender.get("id"))
 
             # Карточка дерева могла быть не тем сообщением, на котором нажали

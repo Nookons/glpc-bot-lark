@@ -2434,7 +2434,12 @@ def _handle_status_command(chat_id, sender, direction, args, message_id):
     try:
         import equipment_intake.flow as intake_flow
 
-        intake_flow.drop_session(chat_id, sender.get("id"))
+        dropped_intake = intake_flow.drop_session(chat_id, sender.get("id"))
+
+        # Карточку дерева тоже убираем: иначе в чате остаётся сообщение с
+        # кнопками, которые уже ничего не делают.
+        if dropped_intake is not None:
+            _delete_quiet(chat_id, dropped_intake.data.get("menu_message_id"))
     except Exception:  # noqa: BLE001 — приём не должен ломать смену статуса
         logger.warning("Не удалось закрыть сессию приёма ошибок", exc_info=True)
 
@@ -2750,6 +2755,13 @@ def handle_status_callback(callback: dict):
 
     tg.answer_callback_query(callback_id, f"Reason: {label}")
 
+    # 🔴 **Кнопки Skip и Cancel остаются после выбора причины.**
+    #
+    # Раньше правка шла без `reply_markup`: Telegram снимал клавиатуру, а текст
+    # продолжал говорить «press «Skip»» — кнопки, которой уже нет. Человек
+    # оказывался в тупике: описание требовать нельзя (Skip задуман), а выйти
+    # можно было только `/cancel`, который статус не меняет. Проверено
+    # 18.11.2026.
     tg.edit_message_text(
         chat_id,
         message_id,
@@ -2764,6 +2776,18 @@ def handle_status_callback(callback: dict):
         f"✍️ Describe the reason in one message, press «Skip» to "
         f"{'take it offline' if direction == 'offline' else 'return it to service'} "
         "without a description, or /cancel.",
+        reply_markup={
+            "inline_keyboard": [
+                [{
+                    "text": "⏭️ Skip — no description",
+                    "callback_data": f"st:{direction}:{robot.get('id')}:skip",
+                }],
+                [{
+                    "text": "✖️ Cancel",
+                    "callback_data": f"st:{direction}:{robot.get('id')}:cancel",
+                }],
+            ]
+        },
         message_thread_id=_reply_thread(chat_id, thread_id),
     )
 
@@ -3241,57 +3265,112 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
 
 
 def _handle_cancel(chat_id, sender, reply_to):
-    # **Осмотр отменяется первым.**
-    #
-    # Если у человека открыт диалог осмотра, `/cancel` относится к нему, а не к
-    # смене статуса: обе ветки могут быть активны одновременно (осмотр идёт в
-    # том же рабочем топике). Отмена осмотра сама сообщает о результате, поэтому
-    # дальше отвечать «Nothing to cancel» не нужно.
+    """Отменяет **все** диалоги человека, а не первый найденный.
+
+    🔴 **Почему так.** Раньше команда останавливалась на первом найденном
+    диалоге: осмотр отменён — и `return`, хотя рядом мог быть живой приём
+    ошибки; редактор `/tree` и подсказка по номеру не отменялись вовсе, и
+    следующее сообщение молча применяло их (переименовывало узел дерева,
+    отправляло ошибку с неверным номером). Проверено 18.11.2026.
+
+    Каждый диалог убирается вместе со своим сообщением: иначе в чате остаются
+    рабочие на вид кнопки, которые уже ничего не делают.
+    """
+    inspection_cancelled = False
+
+    # 1. Осмотр: он живёт на сервере, поэтому закрывается запросом, а не только
+    #    очисткой памяти.
     try:
         import inspection as inspection_module
 
         if inspection_module.cancel(chat_id, sender):
-            return
+            inspection_cancelled = True
     except Exception:
         logger.exception("Не удалось отменить осмотр")
 
-    # **Приём ошибки тоже отменяется `/cancel`.**
-    #
-    # До 18.11.2026 команда чистила осмотр, смену статуса и фото, но не дерево
-    # приёма: бот отвечал «Nothing to cancel», а следующий текст продолжал
-    # старый отчёт — то есть Cancel не отменял. У приёма нет серверной записи
-    # до Confirm, поэтому достаточно убрать сессию и карточку из чата.
-    intake_session = None
+    cancelled = False
+    user_id = sender.get("id")
 
+    # 2. Дерево приёма ошибок: сессия в памяти + карточка в чате.
     try:
         import equipment_intake.flow as intake_flow
 
-        intake_session = intake_flow.drop_session(chat_id, sender.get("id"))
+        intake_session = intake_flow.drop_session(chat_id, user_id)
+
+        if intake_session is not None:
+            _delete_quiet(chat_id, intake_session.data.get("menu_message_id"))
+            cancelled = True
     except Exception:  # noqa: BLE001 — приём не должен ломать отмену
         logger.warning("Не удалось отменить приём ошибки", exc_info=True)
 
-    if intake_session is not None:
-        _delete_quiet(chat_id, intake_session.data.get("menu_message_id"))
+    # 3. Редактор `/tree`: ожидание текста («Rename …»). Без этого следующее
+    #    сообщение человека молча переписало бы узел боевого дерева.
+    try:
+        import equipment_intake.editor as intake_editor
 
-    pending = clear_pending_status(chat_id, sender.get("id"))
+        pending_edit = intake_editor.get_pending(chat_id, user_id)
+
+        if pending_edit is not None:
+            _delete_quiet(chat_id, pending_edit.get("menu_message_id"))
+            intake_editor.drop_pending(chat_id, user_id)
+            intake_editor.drop_view(chat_id, user_id)
+            cancelled = True
+    except Exception:  # noqa: BLE001 — редактор не должен ломать отмену
+        logger.warning("Не удалось отменить правку дерева", exc_info=True)
+
+    # 4. Подсказка «номер верный?». Если её просто бросить, фоновый досыл через
+    #    TTL отправит ошибку с неверным номером — то есть Cancel не отменит.
+    robot_fix = take_pending_robot_fix(chat_id, user_id)
+
+    if robot_fix is not None:
+        _delete_quiet(chat_id, robot_fix.get("prompt_message_id"))
+        cancelled = True
+
+    # 5. Меню выбора типа ошибки, выбранный тип и режим «описать самому».
+    menu = take_error_menu(chat_id, user_id)
+
+    if menu is not None:
+        _delete_quiet(chat_id, menu.get("menu_message_id"))
+        cancelled = True
+
+    choice = clear_pending_error_choice(chat_id, user_id)
+
+    if choice is not None:
+        _delete_quiet(chat_id, choice.get("menu_message_id"))
+        cancelled = True
+
+    custom_text = clear_pending_custom_text(chat_id, user_id)
+
+    if custom_text is not None:
+        _delete_quiet(chat_id, custom_text.get("prompt_message_id"))
+        _delete_quiet(chat_id, custom_text.get("menu_message_id"))
+        cancelled = True
+
+    # 6. Смена статуса: причина ещё не выбрана, на сервере ничего не менялось.
+    pending = clear_pending_status(chat_id, user_id)
 
     if pending:
         _delete_quiet(chat_id, pending.get("prompt_message_id"))
+        cancelled = True
 
     waiting_photo = (
-        take_pending_photo(chat_id, sender.get("id"))
+        take_pending_photo(chat_id, user_id)
         if PHOTO_ATTACH_ENABLED
         else None
     )
 
     if waiting_photo:
         # Фото ждало текст ошибки, но его отменили — пересылаем как есть.
-        flush_pending_photo(chat_id, sender.get("id"), waiting_photo)
+        flush_pending_photo(chat_id, user_id, waiting_photo)
+        return
+
+    if inspection_cancelled:
+        # Осмотр уже сказал «Inspection cancelled»; второй строки не нужно.
         return
 
     _send(
         chat_id,
-        "✖️ Cancelled." if (pending or intake_session) else "Nothing to cancel.",
+        "✖️ Cancelled." if cancelled else "Nothing to cancel.",
         reply_to_message_id=reply_to,
         delete_after=CONFIRM_TTL_SECONDS,
     )
@@ -4265,6 +4344,20 @@ def _handle_error_menu_callback(chat_id, sender, parts, message_id, callback_id)
             tg.answer_callback_query(callback_id, "Cancelled")
 
         take_error_menu(chat_id, sender.get("id"))
+
+        # 🔴 **Отмена снимает и выбранный тип, и «описать самому».**
+        # Раньше чистилось только меню: следующее число подхватывалось как
+        # номер робота и дописывало отчёт, который человек отменил.
+        choice = clear_pending_error_choice(chat_id, sender.get("id"))
+
+        if choice is not None:
+            _delete_quiet(chat_id, choice.get("menu_message_id"))
+
+        custom_text = clear_pending_custom_text(chat_id, sender.get("id"))
+
+        if custom_text is not None:
+            _delete_quiet(chat_id, custom_text.get("prompt_message_id"))
+
         _delete_quiet(chat_id, message_id)
         return
 
@@ -5549,6 +5642,16 @@ def _handle_update_inner(update: dict, bot_username: str = None):
             handle_status_callback(callback)
         except Exception:
             logger.exception("Не удалось обработать нажатие кнопки")
+
+            # Кнопка не должна выглядеть мёртвой: без ответа на callback
+            # Telegram держит «часики» до таймаута, а человек не понимает,
+            # нажалось ли что-то. Сама ошибка уже в логе.
+            try:
+                tg.answer_callback_query(
+                    callback.get("id"), "Something went wrong — try again"
+                )
+            except Exception:
+                logger.debug("Не удалось ответить на callback после ошибки", exc_info=True)
 
         return
 
