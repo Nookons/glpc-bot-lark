@@ -581,9 +581,13 @@ def downtime_metrics(shift_date: str, shift_name: str, warehouse: str = None) ->
     }
 
 
-def _journal_last_entry() -> str:
+def _journal_last_entry(warehouse: str = None) -> str:
     """
     Дата последней записи в журнале смен статуса — `ДД.ММ.ГГГГ` или пустая строка.
+
+    `warehouse` обязателен в отчёте: без него строка называла **чужую** дату.
+    Проверено 17.11.2026: отчёт GLP-C говорил «записей нет с 17.11», хотя это
+    была запись SMALL-P3, а журнал GLP-C пуст с 08.11.
 
     🔴 **Зачем это в отчёте.** Строка про MTTR должна называть **причину**, по
     которой цифры нет. Без даты читатель не может отличить «журнал сломан» от
@@ -592,10 +596,12 @@ def _journal_last_entry() -> str:
     `None`/`""` при сбое чтения — тогда отчёт скажет просто «журнал пуст», не
     выдумывая дату.
     """
-    rows = rest_get(
-        HISTORY_TABLE,
-        params={"select": "created_at", "order": "created_at.desc", "limit": "1"},
-    )
+    params = {"select": "created_at", "order": "created_at.desc", "limit": "1"}
+
+    if warehouse:
+        params["warehouse"] = f"eq.{warehouse}"
+
+    rows = rest_get(HISTORY_TABLE, params=params)
 
     if not rows:
         return ""
@@ -644,7 +650,7 @@ def downtime_line(metrics: dict) -> str:
         # Поэтому вместо ложного спокойствия печатается факт с датой последней
         # записи и подсказка, чем это лечится (команды `/offline` и `/online`
         # работают и пишут в журнал — ими просто не пользуются).
-        since = _journal_last_entry()
+        since = _journal_last_entry(metrics.get("warehouse"))
 
         if since:
             return (

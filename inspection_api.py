@@ -410,6 +410,26 @@ def complete_inspection(auth_id: str, inspection_id: int, comment: str | None = 
     )
 
 
+def cancel_inspection(
+    auth_id: str, inspection_id: int, reason: str | None = None
+) -> dict:
+    """Отменяет незавершённый осмотр на сервере.
+
+    🔴 **Зачем.** Осмотр создаётся на сервере сразу при выборе шаблона, поэтому
+    `Cancel` в боте обязан закрыть его здесь. Иначе `draft` остаётся в списке
+    «In progress» и выглядит как незаконченная работа (владелец, 18.11.2026).
+
+    Повторная отмена идемпотентна: API возвращает уже отменённый осмотр, а не
+    `409`, — ретрай после обрыва связи не покажет ложную ошибку.
+    """
+    return _request(
+        "POST",
+        f"/v1/inspections/{inspection_id}/cancel",
+        auth_id,
+        json_body={"reason": reason},
+    )
+
+
 def get_inspection(auth_id: str, inspection_id: int) -> dict:
     """Осмотр с пунктами — нужен, чтобы показать итог."""
     return _request("GET", f"/v1/inspections/{inspection_id}", auth_id)

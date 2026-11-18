@@ -93,6 +93,7 @@ from inspection_api import (
     InspectionApiError,
     InspectionApiUnavailable,
     api_configured,
+    cancel_inspection,
     complete_inspection,
     create_inspection,
     ensure_session_on,
@@ -969,6 +970,47 @@ def _warehouse_choices() -> List[str]:
 # CALLBACK-КНОПКИ
 # ============================================================
 
+def _close_draft_on_server(session) -> bool:
+    """Закрывает незавершённый осмотр на сервере. True — осмотра нет или он закрыт.
+
+    🔴 **Почему это обязательный шаг отмены.** Осмотр создаётся на сервере при
+    выборе шаблона, а `Cancel` раньше чистил только диалог в памяти: на сервере
+    оставался `draft` и висел в «In progress» (владелец, 18.11.2026:
+    «если юзер нажимает cancel на инспекции то на сервере она не заканчивается»).
+
+    **Ошибку не проглатываем.** Если сервер недоступен, человек должен знать,
+    что черновик остался в вебе, — иначе он считает осмотр отменённым, а тот
+    продолжает числиться незаконченным. Возвращаем False и показываем текст.
+    """
+    inspection = (session.inspection or {}) if session else {}
+    inspection_id = inspection.get("id")
+
+    if not inspection_id:
+        # Осмотр ещё не создан (отмена на шаге склада/типа/номера) — на сервере
+        # закрывать нечего.
+        return True
+
+    if not session.auth_id or not api_configured():
+        # Локальный стенд без API: осмотра на сервере тоже нет.
+        return True
+
+    try:
+        cancel_inspection(
+            session.auth_id,
+            int(inspection_id),
+            reason=f"Cancelled in Telegram by {session.employee_name or 'the operator'}",
+        )
+    except (InspectionApiUnavailable, InspectionApiError) as error:
+        logger.warning(
+            "Осмотр %s: не удалось закрыть черновик на сервере: %s",
+            inspection_id,
+            error,
+        )
+        return False
+
+    return True
+
+
 def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
     """Кнопки осмотра. False — это не наша кнопка."""
     if not parts or parts[0] != CB_PREFIX:
@@ -983,7 +1025,10 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
 
     if action == CB_CANCEL:
         session = drop_session(chat_id, sender.get("id"))
+        # Сначала гасим «часики» у кнопки: серверный вызов ниже может занять
+        # секунды, а Telegram ждёт ответ на callback недолго.
         answer("Cancelled")
+        closed = _close_draft_on_server(session) if session else True
 
         if session:
             # 🔴 **Убираем ВСЁ, что бот отправил по этому осмотру.**
@@ -1005,6 +1050,15 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
             # Само нажатие тоже убираем: иначе в чате остаётся сообщение с
             # кнопками, которые уже ничего не делают.
             _delete_quiet(chat_id, message_id)
+
+            if not closed:
+                _send_tracked(
+                    session,
+                    "⚠️ The inspection was closed here, but the draft on the "
+                    "server is still open (the service is unavailable). "
+                    "Close it on the web version.",
+                    delete_after=_bot().CONFIRM_TTL_SECONDS,
+                )
 
         return True
 
@@ -2007,13 +2061,20 @@ def cancel(chat_id, sender) -> bool:
     """
     `/cancel` внутри диалога. True — было что отменять.
 
-    Незакрытый осмотр **не удаляем**: он остаётся черновиком в базе и виден на
-    веб-версии. Удаление скрыло бы работу, которую человек уже сделал.
+    Осмотр закрывается **и на сервере** — статусом `cancelled`, а не удалением:
+    удаление стёрло бы подписанный след, а незакрытый `draft` висел бы в
+    «In progress» как незаконченная работа. Владелец 18.11.2026: «если юзер
+    нажимает cancel на инспекции то на сервере она не заканчивается».
+
+    Если сервер недоступен, человек видит честное предупреждение: локально
+    диалог закрыт, черновик в вебе остался.
     """
     session = drop_session(chat_id, sender.get("id"))
 
     if session is None:
         return False
+
+    closed = _close_draft_on_server(session)
 
     _delete_quiet(chat_id, session.data.get("example_message_id"))
     _delete_quiet(chat_id, session.data.get("prompt_message_id"))
@@ -2025,9 +2086,10 @@ def cancel(chat_id, sender) -> bool:
     bot = _bot()
     text = "✖️ Inspection cancelled."
 
-    if session.inspection.get("id"):
+    if not closed:
         text += (
-            "\nThe draft is kept — you can finish it on the web version."
+            "\n⚠️ The draft is still open on the server (the service is "
+            "unavailable). Close it on the web version."
         )
 
     _send_tracked(session, text, delete_after=bot.CONFIRM_TTL_SECONDS)

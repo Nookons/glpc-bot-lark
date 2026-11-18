@@ -82,9 +82,17 @@ def get_session(chat_id, user_id) -> Optional[Session]:
     return entry["session"]
 
 
-def drop_session(chat_id, user_id) -> None:
+def drop_session(chat_id, user_id):
+    """Убирает сессию и возвращает её (или None).
+
+    Возврат нужен отмене: без объекта нельзя удалить карточку дерева из чата, и
+    после `/cancel` в чате остаётся сообщение с рабочими на вид кнопками.
+    Вызывающие, которым объект не нужен, просто игнорируют результат.
+    """
     with _LOCK:
-        _SESSIONS.pop(_key(chat_id, user_id), None)
+        entry = _SESSIONS.pop(_key(chat_id, user_id), None)
+
+    return entry["session"] if entry else None
 
 
 def sweep_sessions() -> int:
@@ -527,7 +535,14 @@ def handle_callback(chat_id, sender, parts, message_id, callback_id) -> bool:
 
             session.back()
         elif action == CB_CANCEL:
-            drop_session(chat_id, sender.get("id"))
+            dropped = drop_session(chat_id, sender.get("id"))
+
+            # Карточка дерева могла быть не тем сообщением, на котором нажали
+            # Cancel (после перерисовки это один и тот же id, но полагаться на
+            # это нельзя): убираем обе, иначе в чате остаются живые кнопки.
+            if dropped is not None:
+                _bot()._delete_quiet(chat_id, dropped.data.get("menu_message_id"))
+
             _bot()._delete_quiet(chat_id, message_id)
             return True
         elif action == CB_CONFIRM:

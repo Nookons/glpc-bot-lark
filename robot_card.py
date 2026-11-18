@@ -418,15 +418,49 @@ def robot_card(number, warehouse: str = WAREHOUSE):
     return card
 
 
-def format_robot_card(card) -> str:
-    """Текст карточки для Telegram (без Markdown — его нельзя ломать)."""
+#: Человеческие названия статусов. В справочнике они лежат в двух словарях
+#: (`在线 | Online` и канонический `online`), и показывать оператору сырую
+#: двуязычную строку — значит заставлять его угадывать смысл.
+STATUS_LABELS = {
+    "在线 | online": "Online",
+    "离线 | offline": "Offline",
+    "维护 | maintenance": "Maintenance",
+    "在线": "Online",
+    "离线": "Offline",
+    "维护": "Maintenance",
+    "online": "Online",
+    "offline": "Offline",
+    "maintenance": "Maintenance",
+    "not_in_work": "Not in work",
+    "unknown": "Unknown",
+}
+
+
+def status_label(value) -> str:
+    """Читаемое название статуса; неизвестное значение не выдумываем."""
+    text = str(value or "").strip()
+
+    if not text:
+        return "-"
+
+    return STATUS_LABELS.get(text.casefold(), text)
+
+
+def format_robot_card(card, warehouse: str = None) -> str:
+    """Текст карточки для Telegram (без Markdown — его нельзя ломать).
+
+    `warehouse` — склад **команды**, а не константа модуля: в отказе «робота
+    нет» раньше всегда стоял склад по умолчанию, и `/robot 9999` в SMALL-P3
+    отвечал «not in the GLP-C list» (найдено аудитом 17.11.2026).
+    """
     if card is None:
         return "⚠️ Can't read the robot right now (database error)."
 
     number = card.get("number")
+    warehouse = warehouse or card.get("warehouse") or WAREHOUSE
 
     if not card.get("found"):
-        lines = [f"⚠️ Robot #{number} is not in the {WAREHOUSE} list."]
+        lines = [f"⚠️ Robot #{number} is not in the {warehouse} list."]
 
         suggestions = card.get("suggestions") or []
 
@@ -442,8 +476,8 @@ def format_robot_card(card) -> str:
     lines = [
         f"🔧 Robot {robot.get('robot_number')} · "
         f"{robot.get('robot_type') or '-'} · "
-        f"{robot.get('warehouse') or WAREHOUSE}",
-        f"Status: {robot.get('status') or '-'}",
+        f"{robot.get('warehouse') or warehouse}",
+        f"Status: {status_label(robot.get('status'))}",
     ]
 
     if card.get("offline_for"):

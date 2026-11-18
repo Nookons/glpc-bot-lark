@@ -169,6 +169,8 @@ class Recorder:
         self.deleted: list[tuple] = []
         self.answered: list[dict] = []
         self.api: list[dict] = []
+        #: Вызовы отмены осмотра на сервере (18.11.2026).
+        self.cancelled: list[dict] = []
         self.sequence = 0
 
     def next_id(self) -> int:
@@ -245,6 +247,19 @@ def rec(monkeypatch) -> Recorder:
         }
 
     monkeypatch.setattr(telegram_store, "get_employee_context", fake_context)
+
+    # Отмена осмотра закрывает черновик на сервере. Без этой заглушки тест
+    # отмены ушёл бы в живой API (сторож наружу поймал бы), а проверять надо
+    # именно факт вызова и текст для человека.
+    def fake_cancel_inspection(auth_id, inspection_id, reason=None):
+        recorder.cancelled.append({
+            "auth_id": auth_id,
+            "inspection_id": inspection_id,
+            "reason": reason,
+        })
+        return {"id": inspection_id, "status": "cancelled"}
+
+    monkeypatch.setattr(insp, "cancel_inspection", fake_cancel_inspection)
 
     # По умолчанию устройство находится, шаблоны есть.
     monkeypatch.setattr(
@@ -1538,8 +1553,13 @@ class TestCancelAndTtl:
         assert _session() is None
         assert rec.answered[-1]["text"] == "Cancelled"
 
-    def test_cancel_keeps_the_draft(self, rec, monkeypatch) -> None:
-        """`/cancel` не удаляет незакрытый осмотр — он остаётся черновиком."""
+    def test_cancel_closes_the_draft_on_the_server(self, rec, monkeypatch) -> None:
+        """`/cancel` закрывает осмотр на сервере, а не оставляет его черновиком.
+
+        🔴 Владелец 18.11.2026: «если юзер нажимает cancel на инспекции то на
+        сервере она не заканчивается». Проверяем именно вызов API: локальная
+        очистка диалога была и раньше, а серверный `draft` оставался.
+        """
         _start(rec, monkeypatch)
         _choose_template(rec, monkeypatch)
 
@@ -1547,7 +1567,51 @@ class TestCancelAndTtl:
 
         assert handled is True
         assert _session() is None
-        assert "draft is kept" in rec.sent[-1]["text"]
+        assert rec.cancelled, "осмотр не закрыт на сервере"
+        assert rec.cancelled[-1]["inspection_id"] == 77
+        assert rec.cancelled[-1]["auth_id"] == AUTH_ID
+        assert "Cancelled" in rec.cancelled[-1]["reason"]
+        assert "cancelled" in rec.sent[-1]["text"].lower()
+        assert "draft is kept" not in rec.sent[-1]["text"]
+
+    def test_cancel_button_closes_the_draft(self, rec, monkeypatch) -> None:
+        """Кнопка Cancel тоже закрывает осмотр на сервере."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_CANCEL], 9, "cb9"
+        )
+
+        assert _session() is None
+        assert rec.cancelled and rec.cancelled[-1]["inspection_id"] == 77
+
+    def test_cancel_before_the_inspection_is_created_makes_no_api_call(
+        self, rec, monkeypatch
+    ) -> None:
+        """Отмена на шаге склада/типа/номера не дёргает API: осмотра ещё нет."""
+        insp.start(CHAT_ID, {"id": USER_ID}, None)
+        insp.handle_callback(
+            CHAT_ID, {"id": USER_ID}, ["ins", insp.CB_CANCEL], 9, "cb9"
+        )
+
+        assert rec.cancelled == []
+
+    def test_cancel_reports_when_the_server_is_unavailable(
+        self, rec, monkeypatch
+    ) -> None:
+        """Сбой API не скрывается: человек знает, что черновик остался в вебе."""
+        _start(rec, monkeypatch)
+        _choose_template(rec, monkeypatch)
+
+        def fail(*args, **kwargs):
+            raise inspection_api.InspectionApiUnavailable("API is down")
+
+        monkeypatch.setattr(insp, "cancel_inspection", fail)
+
+        insp.cancel(CHAT_ID, {"id": USER_ID})
+
+        assert "still open on the server" in rec.sent[-1]["text"]
 
     def test_cancel_without_dialogue_reports_nothing(self, rec, monkeypatch) -> None:
         """Без диалога `/cancel` не считает себя обработанным."""

@@ -2343,7 +2343,7 @@ def _show_robot_card(chat_id, number, warehouse, reply_to=None) -> bool:
         )
         return False
 
-    text = robot_card.format_robot_card(card)
+    text = robot_card.format_robot_card(card, warehouse=warehouse)
 
     if not card.get("found"):
         text += _warehouse_hint("robot", warehouse)
@@ -3255,6 +3255,24 @@ def _handle_cancel(chat_id, sender, reply_to):
     except Exception:
         logger.exception("Не удалось отменить осмотр")
 
+    # **Приём ошибки тоже отменяется `/cancel`.**
+    #
+    # До 18.11.2026 команда чистила осмотр, смену статуса и фото, но не дерево
+    # приёма: бот отвечал «Nothing to cancel», а следующий текст продолжал
+    # старый отчёт — то есть Cancel не отменял. У приёма нет серверной записи
+    # до Confirm, поэтому достаточно убрать сессию и карточку из чата.
+    intake_session = None
+
+    try:
+        import equipment_intake.flow as intake_flow
+
+        intake_session = intake_flow.drop_session(chat_id, sender.get("id"))
+    except Exception:  # noqa: BLE001 — приём не должен ломать отмену
+        logger.warning("Не удалось отменить приём ошибки", exc_info=True)
+
+    if intake_session is not None:
+        _delete_quiet(chat_id, intake_session.data.get("menu_message_id"))
+
     pending = clear_pending_status(chat_id, sender.get("id"))
 
     if pending:
@@ -3273,7 +3291,7 @@ def _handle_cancel(chat_id, sender, reply_to):
 
     _send(
         chat_id,
-        "✖️ Cancelled." if pending else "Nothing to cancel.",
+        "✖️ Cancelled." if (pending or intake_session) else "Nothing to cancel.",
         reply_to_message_id=reply_to,
         delete_after=CONFIRM_TTL_SECONDS,
     )
@@ -3893,7 +3911,7 @@ def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -
         return True
 
     if command == "digest":
-        _handle_digest(chat_id, reply_to)
+        _handle_digest(chat_id, args, reply_to)
         return True
 
     if command == "topics":
@@ -3909,7 +3927,7 @@ def _handle_command_inner(chat_id, sender, command, args, reply_to, chat=None) -
         return True
 
     if command == "week":
-        _handle_week(chat_id, reply_to)
+        _handle_week(chat_id, args, reply_to)
         return True
 
     if command in STATUS_DIRECTIONS:
@@ -4780,9 +4798,14 @@ def _handle_downtime(chat_id, args, reply_to):
     )
 
 
-def _handle_week(chat_id, reply_to):
-    """Предпросмотр недельного отчёта (в Lark он уходит по расписанию)."""
-    text = analytics.weekly_text(warehouse=current_warehouse())
+def _handle_week(chat_id, args, reply_to):
+    """Предпросмотр недельного отчёта (в Lark он уходит по расписанию).
+
+    🔴 Склад принимается аргументом, как у `/stats` и `/top`: до 18.11.2026
+    `/week sp3` молча отвечал отчётом GLP-C, потому что аргументы не читались.
+    """
+    explicit, _rest = warehouse_from_args(args)
+    text = analytics.weekly_text(warehouse=explicit or current_warehouse())
 
     _send(
         chat_id,
@@ -4791,9 +4814,13 @@ def _handle_week(chat_id, reply_to):
     )
 
 
-def _handle_digest(chat_id, reply_to):
-    """Предпросмотр дайджеста обслуживания (та же сводка, что уходит в личку)."""
-    text = digests.build_digest(warehouse=current_warehouse())
+def _handle_digest(chat_id, args, reply_to):
+    """Предпросмотр дайджеста обслуживания (та же сводка, что уходит в личку).
+
+    🔴 Склад — аргументом: `/digest sp3` раньше молча показывал GLP-C.
+    """
+    explicit, _rest = warehouse_from_args(args)
+    text = digests.build_digest(warehouse=explicit or current_warehouse())
 
     _send(
         chat_id,

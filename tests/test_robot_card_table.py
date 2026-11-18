@@ -87,3 +87,31 @@ class TestRobotCardTable:
             "склад обязан переводиться в числовой id: название в bigint-колонку "
             "не сравняется, и карточка покажет ноль ошибок"
         )
+
+
+# ── Отказы и статусы не должны вводить в заблуждение (18.11.2026) ────────────
+
+def test_not_found_names_the_requested_warehouse() -> None:
+    """`/robot` в SMALL-P3 не может отвечать «not in the GLP-C list»."""
+    from robot_card import format_robot_card
+
+    text = format_robot_card(
+        {"found": False, "number": "9999", "suggestions": []},
+        warehouse="SMALL-P3",
+    )
+
+    assert "SMALL-P3" in text
+    assert "GLP-C" not in text
+
+
+def test_status_is_translated_to_one_language() -> None:
+    """Оператор видит `Online`, а не `在线 | Online`."""
+    from robot_card import status_label
+
+    assert status_label("在线 | Online") == "Online"
+    assert status_label("离线 | Offline") == "Offline"
+    assert status_label("维护 | Maintenance") == "Maintenance"
+    assert status_label("maintenance") == "Maintenance"
+    # Неизвестное значение не выдумываем.
+    assert status_label("weird") == "weird"
+    assert status_label(None) == "-"
