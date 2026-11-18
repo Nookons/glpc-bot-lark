@@ -2068,11 +2068,10 @@ def reasons_keyboard(direction: str, robot_id, last_issue: str = None) -> dict:
     # объяснять». На практике причина уже выбрана кнопкой («Solved without
     # changing», «Replaced Spare Parts»), и текст — необязательное дополнение.
     # Требовать его значит держать робота вне работы ради формулировки.
-    rows.append([{
-        "text": "⏭️ Skip — no description",
-        "callback_data": f"st:{direction}:{robot_id}:skip",
-    }])
-
+    # 🔴 **Кнопки Skip больше нет** (владелец 18.11.2026: «должны требовать
+    # описание ошибки»). Она позволяла вывести робота из работы без единого
+    # слова о причине — журнал получал `type_problem` без объяснения, а ремонт
+    # оставался без описания. Теперь после выбора причины бот ждёт текст.
     rows.append([{
         "text": "✖️ Cancel",
         "callback_data": f"st:{direction}:{robot_id}:cancel",
@@ -2642,34 +2641,14 @@ def handle_status_callback(callback: dict):
         label = details["issue"]
         note = details["note"]
     elif code == "skip":
-        # 🔴 **`skip` — не причина из справочника, а решение «без описания».**
-        #
-        # Дефект 18.10.2026 («/online тоже не работает»): кнопка Skip не проходила
-        # проверку `reason_label`, потому что кода `skip` в справочнике причин
-        # **нет** — и бот отвечал «Unknown reason», ничего не делая. У офлайна
-        # это не всплывало только потому, что кнопки там не было.
-        #
-        # Причина при этом **уже выбрана** предыдущим нажатием и лежит в
-        # состоянии флоу (`pending["type_problem"]`) — её и записываем. Если
-        # состояния нет (кнопка устарела, чат чистили), честно говорим.
-        pending_now = peek_pending_status(chat_id, sender.get("id")) or {}
-        label = pending_now.get("type_problem")
-
-        if not label:
-            # Skip виден и на экране причин, но без причины он ничего не
-            # означает: журнал и ремонт требуют `type_problem`. Вместо
-            # «Pick a reason first» объясняем, что кнопка делает дальше, —
-            # иначе она выглядит сломанной.
-            action = (
-                "take the robot offline"
-                if direction == "offline"
-                else "return it to service"
-            )
-            tg.answer_callback_query(
-                callback_id,
-                f"Choose a reason first — then Skip will {action} without a description",
-            )
-            return
+        # Кнопка Skip удалена (18.11.2026): описание обязательно. Старые
+        # сообщения могут её ещё показывать — честно объясняем и не меняем
+        # статус.
+        tg.answer_callback_query(
+            callback_id,
+            "A description is required — pick a reason and describe the issue",
+        )
+        return
     else:
         label = robot_status.reason_label(direction, code)
 
@@ -2721,32 +2700,26 @@ def handle_status_callback(callback: dict):
     # одно и то же — меняют статус и просят снимок; разница только в тексте
     # заметки. Две копии разошлись бы, как только в одном из них поменяли бы
     # порядок вызовов.
-    if code == "skip" or (code == "last_issue" and direction == "offline"):
-        result = robot_status.change_robot_status(robot, direction, label, note if code == "last_issue" else "", employee)
-
-        if not result:
-            tg.answer_callback_query(
-                callback_id, "Could not change the status — try again"
-            )
-            return
+    if code == "last_issue" and direction == "offline":
+        # 🔴 **Статус меняется только после медиа** (владелец 18.11.2026).
+        # Описание уже есть — оно взято из последней ошибки; остаётся фото или
+        # видео, и до него запись в журнале не создаётся.
+        pending = {
+            "direction": direction,
+            "robot_number": robot.get("robot_number"),
+            "robot_id": robot.get("id"),
+            "type_problem": label,
+            "note": note,
+            "prompt_message_id": message_id,
+            "warehouse": robot.get("warehouse") or current_warehouse(),
+        }
+        set_pending_status(chat_id, sender.get("id"), pending)
 
         tg.answer_callback_query(
-            callback_id,
-            f"{spec['label']} — from the last error" if code == "last_issue"
-            else f"{spec['label']} — no description",
+            callback_id, f"{spec['label']} — from the last error"
         )
         _delete_quiet(chat_id, message_id)
-        _send(
-            chat_id,
-            "\n".join([
-                robot_status.status_title(direction, robot),
-                f"Reason: {label}",
-                # Для последней ошибки заметка не пустая: в ней модуль и причина.
-                f"Note: {note if code == 'last_issue' else '—'}",
-            ]),
-        )
         _ask_repair_photo(chat_id, sender, direction, robot, label, message_id)
-        _notify_lark_status(direction, result, employee.get("user_name"))
         return
 
     set_pending_status(chat_id, sender.get("id"), {
@@ -2767,13 +2740,12 @@ def handle_status_callback(callback: dict):
 
     tg.answer_callback_query(callback_id, f"Reason: {label}")
 
-    # 🔴 **Кнопки Skip и Cancel остаются после выбора причины.**
+    # 🔴 **После выбора причины остаётся только Cancel.**
     #
     # Раньше правка шла без `reply_markup`: Telegram снимал клавиатуру, а текст
-    # продолжал говорить «press «Skip»» — кнопки, которой уже нет. Человек
-    # оказывался в тупике: описание требовать нельзя (Skip задуман), а выйти
-    # можно было только `/cancel`, который статус не меняет. Проверено
-    # 18.11.2026.
+    # продолжал говорить «press «Skip»» — кнопки, которой уже нет. Теперь Skip
+    # удалён вовсе (описание обязательно), и на экране остаётся осознанная
+    # отмена. Проверено 18.11.2026.
     tg.edit_message_text(
         chat_id,
         message_id,
@@ -2785,33 +2757,41 @@ def handle_status_callback(callback: dict):
         # офлайн», для возврата в работу — «вернётся в работу». Копия фразы про
         # офлайн в ветке `/online` прямо противоречила кнопке, которую человек
         # только что нажал.
-        f"✍️ Describe the reason in one message, press «Skip» to "
-        f"{'take it offline' if direction == 'offline' else 'return it to service'} "
-        "without a description, or /cancel.",
+        # 🔴 **Описание обязательно** (владелец 18.11.2026). Кнопки Skip
+        # больше нет: без текста о причине журнал и ремонт получали запись,
+        # которую нельзя разобрать. Остаётся только осознанная отмена.
+        f"✍️ Describe the reason in one message — it is required. Then send a "
+        "photo or video of the robot. /cancel aborts.",
         reply_markup={
-            "inline_keyboard": [
-                [{
-                    "text": "⏭️ Skip — no description",
-                    "callback_data": f"st:{direction}:{robot.get('id')}:skip",
-                }],
-                [{
-                    "text": "✖️ Cancel",
-                    "callback_data": f"st:{direction}:{robot.get('id')}:cancel",
-                }],
-            ]
+            "inline_keyboard": [[{
+                "text": "✖️ Cancel",
+                "callback_data": f"st:{direction}:{robot.get('id')}:cancel",
+            }]]
         },
         message_thread_id=_reply_thread(chat_id, thread_id),
     )
 
 
-def _notify_lark_status(direction, result, employee_name) -> bool:
+def _notify_lark_status(
+    direction,
+    result,
+    employee_name,
+    media_url: str = None,
+    media_kind: str = "photo",
+) -> bool:
     """Карточка о смене статуса в Lark-группе склада (с откатом на текст)."""
     robot = result.get("robot") or {}
     target = lark_hooks.status_hook(
         robot.get("warehouse") or current_warehouse()
     )
 
-    card = robot_status.build_status_card(direction, result, employee_name)
+    card = robot_status.build_status_card(
+        direction,
+        result,
+        employee_name,
+        media_url=media_url,
+        media_kind=media_kind,
+    )
     hook_result = send_card_via_hook(target, card)
 
     if hook_ok(hook_result):
@@ -2823,10 +2803,13 @@ def _notify_lark_status(direction, result, employee_name) -> bool:
 
     logger.warning("Карточка статуса не прошла (%s) — отправляю текстом", hook_result)
 
-    send_text_via_hook(
-        target,
-        robot_status.build_status_text(direction, result, employee_name),
-    )
+    text = robot_status.build_status_text(direction, result, employee_name)
+
+    if media_url:
+        label = "Video" if media_kind == "video" else "Photo"
+        text += f"\n{label}: {media_url}"
+
+    send_text_via_hook(target, text)
 
     return False
 
@@ -2885,7 +2868,13 @@ def _handle_sandbox_photo(chat_id, sender, message, message_id) -> None:
         _send(chat_id, sandbox.caption(result))
 
 
-def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
+def _attach_photo_to_canonical_repair(
+    sender,
+    pending: dict,
+    url: str,
+    kind: str = "photo",
+    create_if_missing: bool = True,
+) -> bool:
     """Кладёт фото в `repair_attachments` канонического ремонта.
 
     Возвращает `True`, если файл записан (или ремонт уже имеет его).
@@ -2925,7 +2914,22 @@ def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
         optional=True,
     )
 
-    if not open_rows:
+    if not open_rows and not create_if_missing:
+        # `/online` закрывает ремонт; прикладывать медиа к **новому** открытому
+        # ремонту нельзя — это завело бы ремонт роботу, который только что
+        # вернулся в работу. Ищем последний (уже закрытый) и кладём туда.
+        closed_rows = rest_get(
+            "repair_assignments",
+            {
+                "select": "id",
+                "equipment_id": f"eq.{equipment.get('id')}",
+                "order": "assigned_at.desc",
+                "limit": "1",
+            },
+            optional=True,
+        )
+        repair_id = closed_rows[0].get("id") if closed_rows else None
+    elif not open_rows:
         # 🔴 Ремонта ещё нет — заводим его тем же кодом, что и `/offline`, чтобы
         # у фото была запись. Это не дубль: открытого поручения не существовало.
         repair_id = robot_status.open_repair(
@@ -2944,7 +2948,7 @@ def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
         "repair_attachments",
         {
             "repair_id": repair_id,
-            "kind": "photo",
+            "kind": kind,
             "url": url,
             "card_id": (get_employee(sender.get("id")) or {}).get("card_id"),
             "caption": str(pending.get("type_problem") or "") or None,
@@ -2953,6 +2957,48 @@ def _attach_photo_to_canonical_repair(sender, pending: dict, url: str) -> bool:
     )
 
     return created is not None
+
+
+def _handle_status_media(
+    chat_id, sender, photo_path, pending: dict, message_id, kind: str
+) -> bool:
+    """Медиа для смены статуса: загружает файл и только потом меняет статус.
+
+    🔴 **Почему статус меняется здесь, а не после описания.** Владелец
+    18.11.2026: «должны требовать описание ошибки и так же фото или видео».
+    Пока медиа нет, запись статуса не создаётся, карточка в Lark не уходит, а
+    `/cancel` не оставляет робота в офлайне без доказательства.
+
+    `kind` — `photo` или `video`: база различает их в `repair_attachments`.
+    """
+    from supabase_storage import upload_photo_and_get_url
+
+    url = upload_photo_and_get_url(
+        photo_path, object_name=os.path.basename(photo_path)
+    )
+
+    if not url:
+        _send(
+            chat_id,
+            "⚠️ Can't upload the photo/video right now. The status is NOT "
+            "changed — send the file again in a moment.",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return True
+
+    changed = _apply_status_change(
+        chat_id,
+        sender,
+        pending,
+        pending.get("note") or "",
+        media_url=url,
+        media_kind=kind,
+    )
+
+    if changed:
+        _delete_quiet(chat_id, message_id)
+
+    return True
 
 
 def _attach_photo_to_repair(chat_id, sender, photo_path, pending: dict) -> bool:
@@ -3181,6 +3227,94 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
         )
         return False
 
+    # 🔴 **Статус пока НЕ меняем** (владелец 18.11.2026: «должны требовать
+    # описание ошибки и фото или видео»). Сначала описание (оно уже есть) и
+    # медиа, и только потом запись статуса. Иначе `/cancel` после описания
+    # оставлял робота в офлайне без фото, а карточка уходила в Lark до того,
+    # как появилось доказательство.
+    accepted = dict(pending)
+    accepted["note"] = note
+    set_pending_status(chat_id, sender.get("id"), accepted)
+
+    _ask_repair_photo(
+        chat_id,
+        sender,
+        direction,
+        robot,
+        accepted.get("type_problem"),
+        message_id,
+    )
+
+    return True
+
+
+def _apply_status_change(
+    chat_id,
+    sender,
+    pending: dict,
+    note: str,
+    media_url: str = None,
+    media_kind: str = "photo",
+) -> bool:
+    """Меняет статус после того, как получены описание и медиа.
+
+    Порядок важен:
+    * для `/online` медиа прикладывается к **открытому** ремонту до закрытия —
+      после смены статуса поручение уже закрыто, и прикладывать некуда;
+    * для `/offline` сначала меняется статус (база открывает ремонт), затем
+      файл кладётся в `repair_attachments`.
+
+    Возвращает True только при реальной смене статуса. При ошибке состояние
+    диалога возвращается: человек не должен терять описание и медиа.
+    """
+    direction = pending["direction"]
+
+    employee = get_employee(sender.get("id"))
+
+    if not employee:
+        clear_pending_status(chat_id, sender.get("id"))
+        _send(chat_id, NOT_REGISTERED_HINT)
+        return False
+
+    try:
+        robot, _robot_warehouse = find_robot_in_warehouse(
+            pending["robot_number"],
+            pending.get("warehouse"),
+        )
+    except robot_status.StatusUnavailable:
+        set_pending_status(chat_id, sender.get("id"), pending)
+        _send(chat_id, DB_UNAVAILABLE_HINT, delete_after=CONFIRM_TTL_SECONDS)
+        return False
+
+    if not robot:
+        clear_pending_status(chat_id, sender.get("id"))
+        _send(
+            chat_id,
+            f"⚠️ Robot {pending['robot_number']} not found in "
+            f"{pending.get('warehouse') or current_warehouse()}.",
+        )
+        return False
+
+    if robot_status.is_in_status(robot, direction):
+        clear_pending_status(chat_id, sender.get("id"))
+        _delete_quiet(chat_id, pending.get("prompt_message_id"))
+        _send(
+            chat_id,
+            f"ℹ️ Robot {robot.get('robot_number')} is already {robot.get('status')}.",
+            delete_after=CONFIRM_TTL_SECONDS,
+        )
+        return False
+
+    if direction == "online" and media_url:
+        # До закрытия ремонта: после `change_robot_status` он уже закрыт.
+        _attach_photo_to_canonical_repair(
+            sender,
+            pending,
+            media_url,
+            kind=media_kind,
+            create_if_missing=False,
+        )
+
     result = robot_status.change_robot_status(
         robot,
         direction,
@@ -3190,25 +3324,27 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
     )
 
     if not result:
-        # Ничего не изменилось: возвращаем флоу, чтобы сотрудник просто
-        # повторил сообщение с причиной (его текст остаётся в чате).
         set_pending_status(chat_id, sender.get("id"), pending)
-
         _send(
             chat_id,
             "⚠️ Can't change the robot status right now (database error).\n"
-            "Send the reason again in a moment.",
-            reply_to_message_id=message_id,
+            "Send the photo or video again in a moment.",
             delete_after=CONFIRM_TTL_SECONDS,
         )
         return False
 
-    clear_pending_status(chat_id, sender.get("id"))
+    if direction == "offline" and media_url:
+        _attach_photo_to_canonical_repair(
+            sender,
+            pending,
+            media_url,
+            kind=media_kind,
+            create_if_missing=True,
+        )
 
-    # Убираем свои сообщения: в чате остаётся только сообщение сотрудника.
+    clear_pending_status(chat_id, sender.get("id"))
     _delete_quiet(chat_id, pending.get("prompt_message_id"))
 
-    # Информация о смене статуса остаётся в чате — её видят все.
     _send(
         chat_id,
         "\n".join([
@@ -3218,9 +3354,13 @@ def finish_status_change(chat_id, sender, note, message_id, pending: dict) -> bo
         ]),
     )
 
-    _ask_repair_photo(chat_id, sender, direction, robot, pending.get("type_problem"), message_id)
-
-    _notify_lark_status(direction, result, employee.get("user_name"))
+    _notify_lark_status(
+        direction,
+        result,
+        employee.get("user_name"),
+        media_url=media_url,
+        media_kind=media_kind,
+    )
 
     return True
 
@@ -3232,17 +3372,15 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
     офлайн, нужно чтобы он ещё просил фотографию и потом сохранял и приписывал к
     ремонту».
 
-    **Только для офлайна.** Возврат в работу фотографировать незачем: т��м нечего
-    показывать, а лишний шаг задерживал бы постановку робота на линию.
+    **Требование владельца 18.11.2026:** «/offline и /online должны требовать
+    описание ошибки и фото или видео». Раньше медиа просили только для офлайна,
+    а описание можно было пропустить кнопкой Skip.
 
     **Почему `awaiting_photo`, а не отдельное состояние.** Ожидание живёт в том
     же `pending`, что и описание причины, и удаляется вместе с ним. Два
     независимых словаря пришлось бы чистить согласованно — а рассинхрон дал бы
     либо потерянное фото, либо вечное «пришлите фото».
     """
-    if direction != "offline":
-        return
-
     pending = peek_pending_status(chat_id, sender.get("id")) or {}
 
     pending.update({
@@ -3254,8 +3392,9 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
         "type_problem": reason,
         "warehouse": robot.get("warehouse") or current_warehouse(),
         # Момент вывода из работы: простой считается от него, а не от времени,
-        # когда прислали снимок.
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        # когда прислали снимок. Для возврата в работу поле безвредно.
+        "started_at": pending.get("started_at")
+        or datetime.now(timezone.utc).isoformat(),
         # Флаг, по которому ветка фото понимает, что снимок относится к ремонту.
         "awaiting_photo": True,
     })
@@ -3264,13 +3403,11 @@ def _ask_repair_photo(chat_id, sender, direction, robot, reason, message_id) -> 
 
     _send(
         chat_id,
-        # 🔴 **Фото ИЛИ видео, и можно пропустить** (владелец 18.10.2026:
-        # «всё только фото или видео просила с возможностью пропустить»).
-        # Пропуск — `/cancel`: робот уже выведен из работы, и держать его из-за
-        # отсутствия снимка нельзя.
-        "📷 Send a photo or a video of the fault — it will be attached to the "
-        "repair record.\n"
-        "Skip with /cancel: the robot stays offline either way.",
+        # 🔴 **Фото или видео обязательно** (владелец 18.11.2026). Раньше
+        # снимок можно было пропустить, и ремонт оставался без доказательства.
+        "📷 Send a photo or video of the robot / the fault — it is required "
+        "and will be attached to the status record.\n"
+        "Nothing is changed yet: status is updated only after the media.",
         reply_to_message_id=message_id,
         delete_after=CONFIRM_TTL_SECONDS,
     )
@@ -5465,6 +5602,22 @@ def handle_photo(chat_id, sender, message, message_id):
         # 🔴 **Только если ожидание осталось.** После обнуления выше фото идёт
         # обычным путём приёма ошибок — там своя запись и свой ответ.
         if repair_pending is not None:
+            # 🔴 **Новый порядок:** описание → медиа → смена статуса.
+            # `note` есть только у нового флоу; старые подвисшие сессии (без
+            # него) идут прежним путём — статус уже изменён, нужно лишь
+            # приложить файл.
+            if repair_pending.get("note"):
+                kind = (
+                    "video"
+                    if (message.get("video") or message.get("video_note")
+                        or message.get("animation"))
+                    else "photo"
+                )
+                _handle_status_media(
+                    chat_id, sender, destination, repair_pending, message_id, kind
+                )
+                return
+
             attached = _attach_photo_to_repair(
                 chat_id, sender, destination, repair_pending
             )

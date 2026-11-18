@@ -3430,39 +3430,32 @@ class RepairOfflineChecks(unittest.TestCase):
         # Кнопка добавляется под условием: у возврата в работу её быть не должно.
         assert 'if direction == "offline":' in source
 
-    def test_skip_changes_status_without_note(self):
-        """`skip` меняет статус с пустой заметкой, а не просит описание.
+    def test_skip_is_rejected_because_description_is_required(self):
+        """Skip больше не меняет статус: описание обязательно (18.11.2026).
 
-        ⚠️ Проверка переписана 18.10.2026. Раньше она искала буквальную строку
-        `if code == "skip":` — и падала от **безобидного** объединения условий,
-        хотя поведение не менялось. Теперь проверяется смысл: в этой ветке
-        вызывается смена статуса, и заметка передаётся **пустой**.
-
-        Ветка `skip` и «последняя ошибка» идут одним путём: разница только в
-        тексте заметки (у последней ошибки она собрана из записи об ошибке).
+        Раньше кнопка позволяла вывести робота из работы без причины, и журнал
+        получал запись, которую нельзя разобрать.
         """
         source = self._bot_source()
 
-        assert 'code == "skip"' in source, "ветка skip пропала"
-        # Пустая заметка для `skip` — осознанно: `""`, а не пропуск вызова.
-        assert 'change_robot_status(robot, direction, label' in source
-        # У последней ошибки заметка НЕ пустая: она собрана из самой ошибки.
-        assert "details[\"note\"]" in source or "note if code ==" in source, (
-            "описание последней ошибки не передаётся в заметку"
-        )
+        assert "A description is required" in source
+        # В ветке Skip нет смены статуса: она только объясняет требование.
+        skip_branch = source[source.index('elif code == "skip":'):]
+        skip_branch = skip_branch[:skip_branch.index("return") + len("return")]
+        assert "change_robot_status" not in skip_branch
 
-    def test_photo_is_requested_after_offline(self):
-        """После вывода из работы бот просит фото."""
+    def test_media_is_required_for_both_directions(self):
+        """Фото/видео требуется и для офлайна, и для возврата в работу."""
         source = self._bot_source()
 
         assert "def _ask_repair_photo" in source
         assert "awaiting_photo" in source
-        # Фото просят только у офлайна: возврат в работу фотографировать незачем.
-        assert 'if direction != "offline":' in source
-        # Функция вызывается в обоих путях: и после описания, и после skip.
-        assert source.count("_ask_repair_photo(") >= 3, (
-            "вызов должен быть и в skip-пути, и в обычном: " + str(source.count("_ask_repair_photo("))
-        )
+        # Раньше медиа просили только у офлайна; теперь требование общее.
+        assert 'if direction != "offline":' not in source
+        assert "it is required" in source
+        # Вызовы: после описания, после последней ошибки и в медиа-ветке.
+        assert source.count("_ask_repair_photo(") >= 2
+        assert "_handle_status_media" in source
 
     def test_photo_is_attached_to_repair_record(self):
         """Присланное фото дописывается к записи ремонта, а не теряется."""

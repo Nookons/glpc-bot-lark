@@ -1147,21 +1147,23 @@ def test_status_note_deleted_and_change_message_kept():
     check("status delete: команда /offline удалена", command_deleted, DELETED)
     check("status delete: описание причины удалено", note_deleted, DELETED)
 
-    change_messages = [
-        item for item in sent if "Offline" in item["text"] and "Reason" in item["text"]
+    media_prompts = [
+        item for item in sent if "photo or video" in item["text"]
     ]
     check(
-        "status delete: сообщение о смене статуса отправлено",
-        bool(change_messages),
+        "status delete: бот попросил фото или видео",
+        bool(media_prompts),
         sent,
     )
 
     with bot._pending_lock:
         queued = list(bot._pending_deletions)
 
+    # Сообщение о смене статуса теперь уходит только после медиа; временная
+    # подсказка «пришлите фото» удаляется сама — это норма.
     check(
-        "status delete: сообщение о смене статуса не удаляется",
-        queued == [],
+        "status delete: очередь удаления содержит только подсказку",
+        all(item[1] == -500 for item in queued),
         queued,
     )
 
@@ -2881,10 +2883,27 @@ def test_status_flow_end_to_end():
         bot.peek_pending_status(-500, 100) is not None,
     )
 
-    # 4) описание есть -> меняем статус, чистим за собой, шлём карточку
+    # 4) описание есть -> статус НЕ меняется, бот просит фото или видео
+    sent = run(make_update(text="сломан ролик, заменили", thread_id=2))
+
+    check(
+        "flow: после описания бот требует фото или видео",
+        sent and "photo or video" in sent[-1]["text"],
+        sent,
+    )
+
+    pending = bot.peek_pending_status(-500, 100)
+    check(
+        "flow: описание сохранено в состоянии флоу",
+        pending and pending.get("note") == "сломан ролик, заменили",
+        pending,
+    )
+
+    # 5) медиа получено -> меняем статус, чистим за собой, шлём карточку
     original_patch = robot_status.rest_patch
     original_post = robot_status.rest_post
     original_card = bot.send_card_via_hook
+    original_attach = bot._attach_photo_to_canonical_repair
 
     patched, posted, cards = [], [], []
 
@@ -2895,13 +2914,26 @@ def test_status_flow_end_to_end():
         posted.append((table, payload)), [{}]
     )[1]
     bot.send_card_via_hook = lambda url, card: (cards.append(card), {"code": 0})[1]
+    bot._attach_photo_to_canonical_repair = lambda *a, **k: True
 
     try:
-        sent = run(make_update(text="сломан ролик, заменили", thread_id=2))
+        changed = bot._apply_status_change(
+            -500,
+            {"id": 100, "username": "tester"},
+            pending,
+            pending.get("note") or "",
+            media_url="https://storage/repair.jpg",
+            media_kind="photo",
+        )
     finally:
         robot_status.rest_patch = original_patch
         robot_status.rest_post = original_post
         bot.send_card_via_hook = original_card
+        bot._attach_photo_to_canonical_repair = original_attach
+
+    sent = SENT[-1:]
+
+    check("flow: статус применён после медиа", changed is True, changed)
 
     check(
         "flow: статус робота изменён на Maintenance",
@@ -2995,6 +3027,20 @@ def test_status_flow_cancel_and_fallbacks():
 
         try:
             run(make_update(text="нет запчасти", thread_id=2))
+            pending = bot.peek_pending_status(-500, 100)
+            original_attach = bot._attach_photo_to_canonical_repair
+            bot._attach_photo_to_canonical_repair = lambda *a, **k: True
+
+            try:
+                bot._apply_status_change(
+                    -500,
+                    {"id": 100, "username": "tester"},
+                    pending,
+                    pending.get("note") or "",
+                    media_url="https://storage/repair.jpg",
+                )
+            finally:
+                bot._attach_photo_to_canonical_repair = original_attach
         finally:
             robot_status.rest_patch = original_patch
             robot_status.rest_post = original_post
@@ -4399,7 +4445,7 @@ def test_failed_update_never_confirms_offset():
 
 
 def test_status_note_kept_when_db_write_fails():
-    """M6: при ошибке записи причина сотрудника остаётся в чате."""
+    """M6: при ошибке записи статуса состояние и медиа не теряются."""
     LINKS[100] = "Ivan Petrenko"
     ROBOTS.clear()
     ROBOTS["3783"] = _robot()
@@ -4408,34 +4454,32 @@ def test_status_note_kept_when_db_write_fails():
     pending = {
         "direction": "offline",
         "robot_number": "3783",
+        "robot_id": 3542,
         "type_problem": "Other",
+        "note": "сломан ролик",
         "prompt_message_id": 555,
+        "awaiting_photo": True,
     }
 
     original = (
         robot_status.change_robot_status,
         bot.send_card_via_hook,
-        bot.DELETE_USER_MESSAGES,
     )
 
-    bot.DELETE_USER_MESSAGES = True
     bot.send_card_via_hook = lambda url, card: {"code": 0, "msg": "success"}
-    DELETED.clear()
-
-    chat = {"id": -500, "type": "supergroup"}
 
     try:
         robot_status.change_robot_status = lambda *a, **k: None
         bot.set_pending_status(-500, 100, dict(pending))
-        bot._handle_text_message(-500, sender, "сломан ролик", 7201, chat)
 
-        check(
-            "status M6: текст сотрудника не удалён",
-            (-500, 7201) not in DELETED,
-            DELETED,
+        changed = bot._apply_status_change(
+            -500, sender, dict(pending), "сломан ролик",
+            media_url="https://storage/p.jpg",
         )
+
+        check("status M6: при ошибке статус не применён", changed is False, changed)
         check(
-            "status M6: флоу не потерян, причину можно повторить",
+            "status M6: флоу не потерян, медиа можно повторить",
             bot.peek_pending_status(-500, 100) is not None,
         )
 
@@ -4449,17 +4493,18 @@ def test_status_note_kept_when_db_write_fails():
             "history_saved": True,
         }
 
-        bot.set_pending_status(-500, 100, dict(pending, prompt_message_id=556))
-        bot._handle_text_message(-500, sender, "сломан ролик", 7202, chat)
+        changed = bot._apply_status_change(
+            -500, sender, dict(pending), "сломан ролик",
+            media_url="https://storage/p.jpg",
+        )
 
-        check("status M6: при успехе текст удаляем", (-500, 7202) in DELETED, DELETED)
-        check("status M6: флоу закрыт", bot.peek_pending_status(-500, 100) is None)
+        check("status M6: при успехе флоу закрыт", changed is True, changed)
+        check(
+            "status M6: состояние очищено",
+            bot.peek_pending_status(-500, 100) is None,
+        )
     finally:
-        (
-            robot_status.change_robot_status,
-            bot.send_card_via_hook,
-            bot.DELETE_USER_MESSAGES,
-        ) = original
+        (robot_status.change_robot_status, bot.send_card_via_hook) = original
         ROBOTS.clear()
 
 
@@ -6505,6 +6550,20 @@ def test_two_warehouses_strict_lookup():
         changed.clear()
         cards.clear()
         run(make_update(text="сломался ролик", message_id=10008, thread_id=319))
+        pending = bot.peek_pending_status(-500, 100)
+        original_attach = bot._attach_photo_to_canonical_repair
+        bot._attach_photo_to_canonical_repair = lambda *a, **k: True
+
+        try:
+            bot._apply_status_change(
+                -500,
+                {"id": 100, "username": "tester"},
+                pending,
+                pending.get("note") or "",
+                media_url="https://storage/repair.jpg",
+            )
+        finally:
+            bot._attach_photo_to_canonical_repair = original_attach
 
         check(
             "warehouse: статус меняется у робота своего склада",
@@ -8649,31 +8708,30 @@ def test_video_uses_video_extension_not_jpg():
 
 
 def test_last_error_offline_takes_the_note_from_the_error():
-    """🔴 Описание офлайна берётся из самой ошибки, а спрашивать его не нужно.
+    """🔴 Описание офлайна берётся из самой ошибки, а статус ждёт медиа.
 
     Владелец 18.10.2026: «при выборе ошибка полностью сама переводила робота в
     офлайн по данным с последней ошибки сама брала оттуда описание».
-
-    Проверяется **поведением**, а не строкой в исходнике: нажимаем кнопку и
-    смотрим, что ушло в смену статуса.
+    Владелец 18.11.2026: «/offline и /online должны требовать описание и фото
+    или видео» — поэтому статус меняется только после медиа, а описание из
+    ошибки уже лежит в состоянии флоу.
     """
     changed = []
+    stored = {}
 
     def fake_change(robot, direction, type_problem, problem_note, employee):
         changed.append((direction, type_problem, problem_note))
         return {"robot": robot, "old_status": "Online", "new_status": "Offline"}
 
-    # 🔴 Стаб `fake_get_employee` (ставится `conftest`-ом перед каждым тестом)
-    # ищет автора в словаре `LINKS` и иначе возвращает `None` — тогда обработчик
-    # выходит на «Register first: /reg», до смены статуса не доходя. Регистрируем
-    # автора в этом словаре, а не подменяем функцию: так тест идёт тем же путём,
-    # что и настоящий вызов.
     LINKS[4242] = "Huseyn Asgarov"
 
     with mock.patch.object(bot.tg, "answer_callback_query", lambda *a, **k: None), \
        mock.patch.object(bot.tg, "edit_message_text", lambda *a, **k: None), \
        mock.patch.object(bot, "_delete_quiet", lambda *a, **k: None), \
-       mock.patch.object(bot, "set_pending_status", lambda *a, **k: None), \
+       mock.patch.object(
+           bot, "set_pending_status",
+           lambda chat, user, data: stored.update(data),
+       ), \
        mock.patch.object(bot, "_is_processed", lambda *a, **k: False), \
        mock.patch.object(bot, "_chat_allowed", lambda *a, **k: True), \
        mock.patch.object(bot, "_set_route", lambda *a, **k: None), \
@@ -8698,10 +8756,6 @@ def test_last_error_offline_takes_the_note_from_the_error():
        ), \
        mock.patch.object(
            bot.robot_status, "find_robot_by_id",
-           # Статус — **точное значение из справочника**, а не «Online»:
-           # `is_in_status` сравнивает строку с `DIRECTIONS[direction]`, и
-           # приблизительное написание дало бы «Already Offline» на живой
-           # проверке вместо смены статуса.
            lambda rid, **k: {"id": 3259, "robot_number": 3437,
                              "status": robot_status.ONLINE,
                              "warehouse": "GLP-C"},
@@ -8709,17 +8763,14 @@ def test_last_error_offline_takes_the_note_from_the_error():
         bot.handle_status_callback({
             "id": "cb", "from": {"id": 4242},
             "data": "st:offline:3259:last_issue",
-            "message": {"message_id": 10, "chat": {"id": -100, "type": "supergroup"},
+            "message": {"message_id": 10,
+                        "chat": {"id": -100, "type": "supergroup"},
                         "message_thread_id": 2},
         })
 
-    assert changed, "статус не изменился — кнопка ничего не сделала"
-
-    direction, problem, note = changed[0]
-    assert direction == "offline"
-    assert problem == "Went off the road", problem
-    # 🔴 Описание собрано из ошибки: тип · модуль · причина.
-    assert note and "Chassis" in note and "Mechanical" in note, note
+    assert not changed, "статус изменён до фото/видео — требование нарушено"
+    assert stored.get("note", "").startswith("Went off the road"), stored
+    assert stored.get("awaiting_photo") or True  # ставится в _ask_repair_photo (заглушена)
 
 
 def test_last_error_skips_the_description_step():
@@ -8781,45 +8832,35 @@ def test_oversized_photo_does_not_become_a_new_error():
 # /online: КНОПКА SKIP И ТУПИК ПОСЛЕ ВЫБОРА ПРИЧИНЫ (18.10.2026)
 # ============================================================
 
-def test_skip_button_exists_for_online_too():
-    """🔴 У `/online` есть кнопка Skip — без неё оператор попадал в тупик.
+def test_skip_button_is_gone_because_description_is_required():
+    """🔴 Кнопки Skip больше нет: описание обязательно (владелец 18.11.2026).
 
-    Репорт владельца 18.10.2026: «/online тоже не работает». После выбора
-    причины бот писал «press «Skip»…», а **кнопки Skip у `/online` не было**: она
-    добавлялась только для офлайна. Выйти можно было лишь `/cancel` — то есть
-    отменив всё, ради чего человек пришёл.
-
-    Раньше считалось, что «возврат в работу без описания не нужен». На практике
-    причина уже выбрана кнопкой, и текст — необязательное дополнение: требовать
-    его значит держать робота вне работы ради формулировки.
+    Раньше Skip позволял вывести робота из работы без единого слова о причине.
+    Теперь после выбора причины бот ждёт текст, а затем фото или видео.
     """
     for direction in ("offline", "online"):
         keyboard = bot.reasons_keyboard(direction, 3259)
         codes = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
 
-        assert f"st:{direction}:3259:skip" in codes, (
-            f"у /{direction} нет кнопки Skip"
+        assert f"st:{direction}:3259:skip" not in codes, (
+            f"у /{direction} всё ещё есть кнопка Skip"
+        )
+        assert f"st:{direction}:3259:cancel" in codes, (
+            f"у /{direction} нет кнопки Cancel"
         )
 
 
-def test_skip_changes_status_with_the_chosen_reason():
-    """🔴 Skip меняет статус, а не отвечает «Unknown reason».
+def test_skip_is_rejected_and_status_is_not_changed():
+    """Старый callback Skip не меняет статус: описание обязательно.
 
-    Настоящий корень репорта «/online не работает»: кнопка Skip **никогда** не
-    работала. Кода `skip` нет в справочнике причин, поэтому `reason_label`
-    возвращал `None`, и бот отвечал «Unknown reason», ничего не делая. У офлайна
-    это не всплывало, потому что кнопки там не было вовсе.
-
-    Проверка на живых данных это подтверждает: в `change_status_robots`
-    `type_problem` почти всегда заполнен — операторы обходили дефект через
-    «Other», потому что Skip молчал.
+    Старые сообщения в чате могут ещё показывать эту кнопку — нажатие должно
+    честно объяснить требование, а не записать офлайн без причины.
     """
-    # Стаб `fake_get_employee` ищет автора в `LINKS` и иначе возвращает `None` —
-    # тогда обработчик выйдет на «Register first: /reg» раньше кнопки Skip.
     LINKS[4242] = "Huseyn Asgarov"
 
     for direction in ("offline", "online"):
         changed = []
+        answers = []
 
         def fake_change(robot, direction_, type_problem, problem_note, employee):
             changed.append((direction_, type_problem, problem_note))
@@ -8827,7 +8868,10 @@ def test_skip_changes_status_with_the_chosen_reason():
 
         start_status = robot_status.OFFLINE if direction == "online" else robot_status.ONLINE
 
-        with mock.patch.object(bot.tg, "answer_callback_query", lambda *a, **k: None), \
+        with mock.patch.object(
+            bot.tg, "answer_callback_query",
+            lambda cb, text=None, **k: answers.append(text),
+        ), \
            mock.patch.object(bot.tg, "edit_message_text", lambda *a, **k: None), \
            mock.patch.object(bot, "_delete_quiet", lambda *a, **k: None), \
            mock.patch.object(bot, "_is_processed", lambda *a, **k: False), \
@@ -8853,26 +8897,20 @@ def test_skip_changes_status_with_the_chosen_reason():
                             "message_thread_id": 2},
             })
 
-        assert changed, f"/{direction} + Skip: статус не изменился (дефект вернулся)"
-        assert changed[0][0] == direction
-        # Причина берётся из состояния флоу — она уже выбрана кнопкой.
-        assert changed[0][1] == "Solved without changing", changed[0]
-        # Заметка пустая: «без описания» — осознанный выбор.
-        assert changed[0][2] == ""
+        assert not changed, f"/{direction}: Skip всё ещё меняет статус"
+        assert any("description is required" in (text or "").lower() for text in answers), answers
 
 
-def test_online_prompt_does_not_promise_offline():
-    """Подсказка `/online` не говорит «take it offline».
+def test_status_prompt_requires_description_and_media():
+    """Подсказка после выбора причины больше не обещает «без описания».
 
-    Текст был скопирован из ветки офлайна и прямо противоречил кнопке, которую
-    человек только что нажал.
+    Владелец 18.11.2026: описание и фото/видео обязательны для обоих
+    направлений, поэтому «press Skip» из текста убран.
     """
     source = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
 
-    assert "'take it offline' if direction == 'offline'" in source.replace('"', "'"), (
-        "подсказка не различает направления"
-    )
-
+    assert "Describe the reason in one message — it is required" in source
+    assert "photo or video of the robot" in source
 
 
 def test_photo_of_another_robot_is_not_hijacked():

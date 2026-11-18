@@ -508,13 +508,21 @@ def build_status_card(
     direction: str,
     result: dict,
     employee_name: str,
+    media_url: str = None,
+    media_kind: str = "photo",
 ) -> dict:
-    """Карточка для Lark-группы."""
+    """Карточка для Lark-группы.
+
+    `media_url` — фото или видео, которое оператор прислал вместе со сменой
+    статуса. Ссылка идёт кнопкой: Lark принимает в карточке только свой
+    `img_key`, а файл лежит в нашем Storage, поэтому кнопка честнее
+    неработающей картинки.
+    """
     spec = DIRECTIONS[direction]
     robot = result["robot"]
     note = truncate(result.get("problem_note") or "—", VALUE_LIMIT)
 
-    return {
+    card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": spec["color"],
@@ -559,6 +567,23 @@ def build_status_card(
             },
         ],
     }
+
+    if media_url:
+        label = "🎬 Open video" if media_kind == "video" else "📷 Open photo"
+        card["elements"].insert(
+            -1,
+            {
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "primary",
+                    "url": media_url,
+                }],
+            },
+        )
+
+    return card
 
 
 def build_status_text(direction: str, result: dict, employee_name: str) -> str:
