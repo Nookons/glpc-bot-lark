@@ -2656,7 +2656,19 @@ def handle_status_callback(callback: dict):
         label = pending_now.get("type_problem")
 
         if not label:
-            tg.answer_callback_query(callback_id, "Pick a reason first")
+            # Skip виден и на экране причин, но без причины он ничего не
+            # означает: журнал и ремонт требуют `type_problem`. Вместо
+            # «Pick a reason first» объясняем, что кнопка делает дальше, —
+            # иначе она выглядит сломанной.
+            action = (
+                "take the robot offline"
+                if direction == "offline"
+                else "return it to service"
+            )
+            tg.answer_callback_query(
+                callback_id,
+                f"Choose a reason first — then Skip will {action} without a description",
+            )
             return
     else:
         label = robot_status.reason_label(direction, code)
